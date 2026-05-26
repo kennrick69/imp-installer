@@ -28,10 +28,11 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 760,
+    width: 1400,
+    height: 900,
     minWidth: 900,
     minHeight: 640,
+    show: false, // só exibe depois de maximize pra evitar flash
     backgroundColor: '#0E1015',
     title: PRODUCT,
     autoHideMenuBar: true,
@@ -44,6 +45,10 @@ function createWindow() {
   });
   Menu.setApplicationMenu(null);
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.maximize();
+    mainWindow.show();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
