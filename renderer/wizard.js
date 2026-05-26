@@ -514,7 +514,44 @@
       btn.disabled = false;
       btn.textContent = '🛡 Reabrir como administrador';
     }
+    // Limpa status/countdown de tentativa anterior
+    if (typeof hideElevateStatus === 'function') {
+      try { hideElevateStatus(); } catch (_) {}
+    }
     openModal('modal-elevate');
+  }
+
+  // ─── status helpers do modal-elevate (Camila v0.2.6) ─────────
+  let _elevateCountdownTimer = null;
+  function showElevateStatus(text, tone = 'info') {
+    const el = $('#elevate-status');
+    const txt = $('#elevate-status-text');
+    if (!el || !txt) return;
+    el.hidden = false;
+    el.dataset.tone = tone;
+    txt.textContent = text;
+  }
+  function hideElevateStatus() {
+    const el = $('#elevate-status');
+    const cd = $('#elevate-countdown');
+    if (el) el.hidden = true;
+    if (cd) cd.textContent = '';
+    if (_elevateCountdownTimer) { clearInterval(_elevateCountdownTimer); _elevateCountdownTimer = null; }
+  }
+  function startElevateCountdown() {
+    const cd = $('#elevate-countdown');
+    if (!cd) return;
+    let seconds = 0;
+    cd.textContent = ' (0s)';
+    if (_elevateCountdownTimer) clearInterval(_elevateCountdownTimer);
+    _elevateCountdownTimer = setInterval(() => {
+      seconds++;
+      cd.textContent = ` (${seconds}s)`;
+      if (seconds > 60) {
+        clearInterval(_elevateCountdownTimer);
+        _elevateCountdownTimer = null;
+      }
+    }, 1000);
   }
 
   function bindElevateModal() {
@@ -523,7 +560,7 @@
       const manualBtn = $('#btn-elevate-manual');
       const cancelBtn = $('#btn-elevate-cancel');
       btn.disabled = true;
-      btn.textContent = 'Aguardando UAC…';
+      btn.innerHTML = '<span class="imp-spinner"></span> Aguardando UAC…';
       // Eduardo blocker fix v0.2.5: troca botões pra permitir cancelar
       // se JOs clicar Não no UAC (ou demorar pra abrir popup).
       if (manualBtn) manualBtn.hidden = true;
@@ -531,18 +568,27 @@
         cancelBtn.textContent = 'Cancelei o UAC — voltar';
         cancelBtn.dataset.cancelRelaunch = '1';
       }
+      // Mostra área de status dentro do modal
+      showElevateStatus('Aguardando você aceitar no UAC do Windows…');
+
       try {
         const r = api.relaunchAsAdmin ? await api.relaunchAsAdmin() : null;
-        if (r && r.ok) {
-          toast('Aguardando você aceitar no UAC (até 8s)…', 'info', 7000);
-          // backend agenda quit em 8s; se JOs cancelar UAC, click "Cancelei"
+        if (r && r.ok && r.monitoring) {
+          // UAC disparou, backend está monitorando lock. Começa countdown visual local.
+          startElevateCountdown();
+        } else if (r && r.error === 'UAC_CANCELLED') {
+          resetElevateModalButtons();
+          showElevateStatus('Você cancelou o UAC. Tente de novo ou faça manual.', 'warn');
+        } else if (r && !r.ok) {
+          resetElevateModalButtons();
+          showElevateStatus(`Erro: ${r.error || 'desconhecido'}. Tenta de novo.`, 'error');
         } else {
           resetElevateModalButtons();
-          toast('Não consegui solicitar elevação: ' + ((r && r.error) || 'erro'), 'error');
+          showElevateStatus('Não consegui solicitar elevação.', 'error');
         }
       } catch (e) {
         resetElevateModalButtons();
-        toast('Erro ao elevar: ' + (e?.message || ''), 'error');
+        showElevateStatus('Erro: ' + (e?.message || ''), 'error');
       }
     });
 
@@ -553,13 +599,10 @@
 
     $('#btn-elevate-cancel').addEventListener('click', async () => {
       const cancelBtn = $('#btn-elevate-cancel');
-      // Se está em modo "Cancelei o UAC", cancela o quit pendente do main
       if (cancelBtn && cancelBtn.dataset.cancelRelaunch === '1') {
-        try {
-          if (api.cancelRelaunch) await api.cancelRelaunch();
-        } catch (_) {}
+        try { if (api.cancelRelaunch) await api.cancelRelaunch(); } catch (_) {}
         resetElevateModalButtons();
-        toast('Cancelado. Você pode tentar de novo ou fazer manual.', 'info', 5000);
+        showElevateStatus('Cancelado. Pode tentar de novo ou fazer manual.', 'warn');
         return;
       }
       closeModal('modal-elevate');
@@ -573,6 +616,7 @@
     if (btn) { btn.disabled = false; btn.textContent = '🛡 Reabrir como administrador'; }
     if (manualBtn) manualBtn.hidden = false;
     if (cancelBtn) { cancelBtn.textContent = 'Cancelar'; delete cancelBtn.dataset.cancelRelaunch; }
+    hideElevateStatus();
   }
 
   // ───────────────────────────────────────────────────────────
@@ -1268,6 +1312,12 @@
     // Bruno v0.2.5 — backend pede UAC quando steps 1/2/3 detectam falta de admin
     api.onNeedsAdmin && api.onNeedsAdmin((payload) => {
       showElevateModal(payload);
+    });
+
+    // Bruno v0.2.6 — backend avisa que 60s passaram sem detectar lock file
+    api.onElevateTimeout && api.onElevateTimeout((payload) => {
+      resetElevateModalButtons();
+      showElevateStatus('Esperei 1 minuto mas o UAC não respondeu. Tente de novo ou abra manualmente como administrador.', 'error');
     });
 
     api.onComplete && api.onComplete((summary) => {

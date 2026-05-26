@@ -46,6 +46,7 @@ const installer = {
   onManualPrompt: on('installer:onManualPrompt'),
   onError: on('installer:onError'),
   onNeedsAdmin: on('installer:onNeedsAdmin'),
+  onElevateTimeout: on('installer:onElevateTimeout'),
   onComplete: on('installer:onComplete'),
   onState: on('installer:onState'),
   onScreen: on('installer:onScreen'),

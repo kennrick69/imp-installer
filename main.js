@@ -13,6 +13,10 @@ const { enrichError } = require('./src/error-catalog');
 
 const PRODUCT = 'IMP Squad Instalador';
 const STATE_DIR = path.join(os.homedir(), '.imp-installer');
+// Lock file usado pra coordenar quit/spawn entre instâncias (não-elevada → elevada).
+// O processo elevado escreve este lock ao boot; o velho monitora e só morre
+// quando vê o lock fresco — assim se UAC for negado, ninguém mata o velho.
+const ELEVATED_LOCK = path.join(STATE_DIR, '.elevated.lock');
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -61,11 +65,43 @@ app.whenReady().then(() => {
       runner.markRebootDone();
     }
   } catch (_) { /* state not initialized yet — ok */ }
+
+  // Bruno v0.2.6: se esta instância está rodando ELEVADA, escreve o lock.
+  // O processo antigo (não-elevado) está monitorando este lock pra saber
+  // que pode morrer com segurança. Síncrono e best-effort — se PS falhar
+  // detectando privilégio, simplesmente não escreve o lock (e o velho
+  // espera 60s e desiste, mantendo-se vivo).
+  try {
+    const isAdm = require('child_process').execSync(
+      `powershell -NoProfile -Command "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"`,
+      { timeout: 5000, encoding: 'utf8', windowsHide: true }
+    );
+    if (/true/i.test(isAdm)) {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.writeFileSync(
+        ELEVATED_LOCK,
+        JSON.stringify({ pid: process.pid, startedAt: Date.now() })
+      );
+    }
+  } catch (_) { /* não-fatal: lock só facilita o velho fechar */ }
 });
 
 app.on('window-all-closed', () => {
   runner.shutdown();
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Bruno v0.2.6: limpa o lock de elevação ANTES de sair — mas só se o lock
+// foi criado por ESTA instância (PID match). Assim evitamos race onde o
+// processo novo elevado escreveu lock e o velho, ao sair, deletaria.
+app.on('before-quit', () => {
+  try {
+    const data = fs.readFileSync(ELEVATED_LOCK, 'utf8');
+    const parsed = JSON.parse(data);
+    if (parsed && parsed.pid === process.pid) {
+      fs.unlinkSync(ELEVATED_LOCK);
+    }
+  } catch (_) { /* lock ausente/corrompido — nada a limpar */ }
 });
 
 // ───────────────────────────────────────────────────────────────────────
@@ -464,29 +500,94 @@ safeHandle('installer:isElevated', async () => {
   return { ok: true, elevated: await isElevated() };
 }, { emitOnError: false });
 
-// Pending quit timer (Eduardo blocker fix v0.2.5): se JOs cancelar o UAC,
-// não queremos matar o instalador velho. Mantém referência pra cancelar.
-let _pendingQuitTimer = null;
+// Bruno v0.2.6 — lock-file coordination em vez de setTimeout cego.
+//
+// PROBLEMA v0.2.5: setTimeout(app.quit, 8000) matava o instalador velho
+// independente do UAC ter sido aceito. Se PORTABLE_EXECUTABLE_FILE não
+// estivesse setado, o Start-Process apontava pro %TEMP%\...exe que ou
+// sumia ou era rejeitado pelo Windows — UAC NUNCA aparecia, e em 8s o
+// instalador morria silenciosamente. JOs ficava sem nada na tela.
+//
+// SOLUÇÃO: relaunchAsAdmin (shell.js) agora aguarda PowerShell fechar e
+// retorna {ok:false, error:'UAC_CANCELLED'|'UAC_FAILED'|...} se algo deu
+// errado. Se ok=true, monitoramos `.elevated.lock` — só matamos o velho
+// quando o novo (elevado) escreve o lock ao boot. Em 60s sem lock, mantém
+// velho vivo e emite onElevateTimeout pra UI mostrar erro.
+let _elevateMonitor = null;
 
 safeHandle('installer:relaunchAsAdmin', async () => {
-  const exePath = process.execPath;
-  const r = await relaunchAsAdmin(exePath);
-  if (r.ok) {
-    // 8s dá tempo confortável do UAC popup aparecer + JOs aceitar.
-    // Se ele cancelar o UAC, wizard pode chamar installer:cancelRelaunch.
-    if (_pendingQuitTimer) clearTimeout(_pendingQuitTimer);
-    _pendingQuitTimer = setTimeout(() => {
-      _pendingQuitTimer = null;
-      app.quit();
-    }, 8000);
+  // Remove lock antigo (de tentativas anteriores) pra detecção limpa.
+  try { fs.unlinkSync(ELEVATED_LOCK); } catch (_) {}
+
+  const r = await relaunchAsAdmin();
+  if (!r.ok) {
+    // UAC negado, falha de spawn, ou path inválido — NÃO mata o velho.
+    // UI fica viva pra mostrar o erro (e o logFile pra JOs mandar pro Bruno).
+    return r;
   }
-  return r;
+
+  // UAC aceito (Start-Process retornou um PID). Agora monitora o lock até 60s.
+  // Quando o novo processo elevado escrever o lock no boot, sabemos que
+  // está vivo e podemos matar o velho com segurança.
+  if (_elevateMonitor) clearInterval(_elevateMonitor);
+  const startedAt = Date.now();
+  let lastLogElapsedBucket = -1;
+  _elevateMonitor = setInterval(() => {
+    const elapsed = Date.now() - startedAt;
+
+    // Heartbeat log (a cada ~5s) pra UI poder mostrar "Aguardando UAC… Ns".
+    const bucket = Math.floor(elapsed / 5000);
+    if (bucket !== lastLogElapsedBucket && bucket > 0) {
+      lastLogElapsedBucket = bucket;
+      sendToRenderer('installer:onLog', {
+        ts: new Date().toISOString(),
+        level: 'info',
+        component: 'elevate',
+        message: `Aguardando processo elevado iniciar… ${Math.floor(elapsed / 1000)}s`,
+      });
+    }
+
+    try {
+      if (fs.existsSync(ELEVATED_LOCK)) {
+        const data = JSON.parse(fs.readFileSync(ELEVATED_LOCK, 'utf8'));
+        // Lock tem que ser FRESCO (criado depois que pedimos elevação).
+        // 10s de janela passada pra cobrir clock skew/IO lag.
+        if (data && data.startedAt && data.startedAt > startedAt - 10000) {
+          clearInterval(_elevateMonitor);
+          _elevateMonitor = null;
+          sendToRenderer('installer:onLog', {
+            ts: new Date().toISOString(),
+            level: 'info',
+            component: 'elevate',
+            message: 'Processo elevado detectado — fechando instalador atual…',
+          });
+          // 500ms pra UI mostrar a mensagem antes do quit.
+          setTimeout(() => app.quit(), 500);
+          return;
+        }
+      }
+    } catch (_) { /* lock corrompido/parcial — ignora, próxima iteração */ }
+
+    if (elapsed > 60_000) {
+      clearInterval(_elevateMonitor);
+      _elevateMonitor = null;
+      sendToRenderer('installer:onElevateTimeout', { elapsedMs: elapsed, logFile: r.logFile });
+      sendToRenderer('installer:onLog', {
+        ts: new Date().toISOString(),
+        level: 'error',
+        component: 'elevate',
+        message: `Timeout (60s) aguardando processo elevado. Instalador atual NÃO foi fechado. Log: ${r.logFile}`,
+      });
+    }
+  }, 500);
+
+  return { ok: true, monitoring: true, target: r.target, elevatedPid: r.elevatedPid, logFile: r.logFile };
 }, { emitOnError: false });
 
 safeHandle('installer:cancelRelaunch', async () => {
-  if (_pendingQuitTimer) {
-    clearTimeout(_pendingQuitTimer);
-    _pendingQuitTimer = null;
+  if (_elevateMonitor) {
+    clearInterval(_elevateMonitor);
+    _elevateMonitor = null;
     return { ok: true, cancelled: true };
   }
   return { ok: true, cancelled: false };

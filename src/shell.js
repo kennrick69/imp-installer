@@ -283,20 +283,106 @@ async function isElevated() {
   }
 }
 
-async function relaunchAsAdmin(exePath) {
-  try {
-    const escaped = (exePath || '').replace(/'/g, "''");
-    const cmd = `Start-Process -FilePath '${escaped}' -Verb RunAs`;
-    // spawn em vez de execFile pra não esperar (Start-Process retorna rápido,
-    // mas o UAC bloqueia o exit code se aguardar; melhor fire-and-forget)
-    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], {
-      detached: true,
-      stdio: 'ignore'
-    }).unref();
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message };
+// relaunchAsAdmin — Bruno live-test v0.2.5 → v0.2.6
+//
+// CAUSA RAIZ (confirmada via doc electron-builder + repro JOs):
+// O .exe portable do electron-builder, ao ser duplo-clicado, EXTRAI o app
+// em `%TEMP%\<random>\IMP Squad Instalador.exe` e roda dali. `process.execPath`
+// aponta pra ESSE temp — NÃO pro .exe portable que JOs tem no Desktop.
+// Ao chamar `Start-Process -Verb RunAs $tempExe`:
+//   - O temp some quando o pai morre (limpeza do portable wrapper)
+//   - Windows pode rejeitar elevar exe em pasta temporária
+//   - Resultado: UAC NÃO aparece e o processo elevado nasce zumbi.
+//
+// Fix: usar `process.env.PORTABLE_EXECUTABLE_FILE` — env var setada pelo
+// electron-builder portable que aponta pro PATH ORIGINAL do .exe
+// (documentado em https://www.electron.build/configuration/nsis#portable).
+// Em dev (`electron .`) essa var NÃO existe, então cai no fallback execPath.
+//
+// Também — substituímos `spawn detached + unref` (que engolia stderr e fazia
+// quit silencioso) por `spawn` com pipe de stdout/stderr e PROMISE que só
+// resolve quando o PowerShell fecha (com sucesso ou erro detectável).
+async function relaunchAsAdmin(opts = {}) {
+  const fs = require('node:fs');
+  const pathMod = require('node:path');
+  const os = require('node:os');
+
+  // PORTABLE_EXECUTABLE_FILE é env var setada pelo electron-builder portable
+  // apontando pro .exe ORIGINAL (não o extraído em %TEMP%). Em dev não existe.
+  const portableExe = process.env.PORTABLE_EXECUTABLE_FILE;
+  const fallbackExe = (opts && opts.exePath) || process.execPath;
+  const target = portableExe || fallbackExe;
+
+  // Log diagnóstico EM ARQUIVO pra capturar falha silenciosa
+  // (JOs pode mandar esse log se UAC não aparecer).
+  const logFile = pathMod.join(
+    os.homedir(),
+    '.imp-installer',
+    'logs',
+    `elevate-${Date.now()}.log`
+  );
+  try { fs.mkdirSync(pathMod.dirname(logFile), { recursive: true }); } catch (_) {}
+  const log = (msg) => {
+    try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`); } catch (_) {}
+  };
+  log(`relaunchAsAdmin called. portableExe=${portableExe || '(undefined)'}, execPath=${fallbackExe}, target=${target}`);
+
+  if (!target || !fs.existsSync(target)) {
+    log(`target não existe no FS — abortando`);
+    return { ok: false, error: 'caminho do .exe não encontrado pra elevar', target, logFile };
   }
+
+  // Comando PowerShell que dispara UAC. -PassThru retorna o Process pra
+  // saber se foi spawnado. Capturamos stderr pra detectar falha.
+  // -Verb RunAs faz o UAC popup aparecer.
+  const escapedTarget = target.replace(/'/g, "''");
+  const psCmd = `try {
+    $p = Start-Process -FilePath '${escapedTarget}' -Verb RunAs -PassThru -ErrorAction Stop;
+    if ($p) { Write-Output "SPAWNED:$($p.Id)" } else { Write-Output 'SPAWN_NO_PROCESS' }
+  } catch {
+    Write-Error "UAC_FAILED:$($_.Exception.Message)"
+    exit 1
+  }`;
+
+  return new Promise((resolve) => {
+    const ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    let stdout = '', stderr = '';
+    ps.stdout.on('data', (d) => { stdout += d.toString(); });
+    ps.stderr.on('data', (d) => { stderr += d.toString(); });
+    ps.on('error', (err) => {
+      log(`spawn error: ${err.message}`);
+      resolve({ ok: false, error: 'spawn falhou: ' + err.message, target, logFile });
+    });
+    ps.on('close', (code) => {
+      log(`powershell closed code=${code} stdout=${stdout.trim()} stderr=${stderr.trim()}`);
+      if (code === 0 && stdout.includes('SPAWNED:')) {
+        const pidMatch = stdout.match(/SPAWNED:(\d+)/);
+        const elevatedPid = pidMatch ? parseInt(pidMatch[1], 10) : null;
+        resolve({ ok: true, elevatedPid, target, logFile });
+      } else if (stderr.includes('UAC_FAILED') || /cancel[ae]d|cancelad[ao]/i.test(stderr)) {
+        // Usuário negou UAC ou outra falha. Windows retorna
+        // EN: "The operation was canceled by the user"
+        // pt-BR: "A operação foi cancelada pelo usuário"
+        // pt-PT: "Operação cancelada pelo utilizador"
+        // (Fix Eduardo v0.2.6 #1: regex cobre pt-BR/pt-PT também.)
+        const userCancelledPattern = /(canceled|cancelled) by the user|cancelad[ao] pel[oa] (usuário|utilizador)/i;
+        const reason = userCancelledPattern.test(stderr) ? 'UAC_CANCELLED' : 'UAC_FAILED';
+        resolve({ ok: false, error: reason, stderr: stderr.trim(), target, logFile });
+      } else {
+        resolve({
+          ok: false,
+          error: `falha desconhecida (code=${code})`,
+          stderr: stderr.trim(),
+          stdout: stdout.trim(),
+          target,
+          logFile,
+        });
+      }
+    });
+  });
 }
 
 // Schedule the .exe to relaunch via HKCU\...\RunOnce after reboot.
