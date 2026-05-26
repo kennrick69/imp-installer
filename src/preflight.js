@@ -133,10 +133,35 @@ async function checkAntivirus() {
   }
 }
 
+// Normaliza um resultado de check pra sempre ter formato canônico.
+// Mesmo se o check retornar undefined/null/string solta, devolvemos objeto válido.
+// (Bruno — defensiva pós primeiro live-test, onde "checks is not iterable" derrubou tudo.)
+function normalizeCheck(name, raw) {
+  if (raw && typeof raw === 'object' && typeof raw.name === 'string') {
+    // Ainda preenche detail se faltar.
+    return {
+      name: raw.name,
+      ok: !!raw.ok,
+      value: raw.value,
+      warning: !!raw.warning,
+      detail: typeof raw.detail === 'string' ? raw.detail : '(sem detalhe)',
+    };
+  }
+  // Check devolveu algo estranho — converte em erro tratado, NÃO derruba.
+  return {
+    name: name || 'unknown',
+    ok: false,
+    warning: false,
+    detail: `check retornou tipo inesperado (${typeof raw}) — tratando como falha`,
+  };
+}
+
 // Run all preflight checks. Returns { ok, blocking, warnings, results }.
+// CONTRATO INVIOLÁVEL: SEMPRE retorna objeto com .results = Array<{name,ok,detail,warning?}>.
+// Nunca undefined, nunca null, nunca array vazio sem motivo. Cada check individual
+// pode falhar (throw, retornar undefined, retornar não-objeto) que normalizamos aqui.
 async function runAll(opts = {}) {
   const results = [];
-  // Run in parallel — each is independent and cheap.
   const fns = [
     checkWindowsBuild,
     checkAdmin,
@@ -146,17 +171,39 @@ async function runAll(opts = {}) {
     checkAntivirus,
     checkOtherDistros,
   ];
-  const settled = await Promise.allSettled(fns.map(f => f()));
+
+  // Promise.allSettled em vez de Promise.all — uma reject não derruba o conjunto.
+  let settled;
+  try {
+    settled = await Promise.allSettled(fns.map(f => {
+      try { return Promise.resolve(f()); }
+      catch (e) { return Promise.reject(e); }
+    }));
+  } catch (e) {
+    // allSettled "nunca" rejeita, mas se algo MUITO inesperado acontecer
+    // (ex.: out-of-memory), preservamos o contrato e devolvemos objeto válido.
+    return { ok: false, blocking: [], warnings: [], results: [
+      { name: 'preflight_internal', ok: false, detail: `erro interno no runAll: ${(e && e.message) || e}` }
+    ] };
+  }
+
   for (let i = 0; i < settled.length; i++) {
     const r = settled[i];
-    if (r.status === 'fulfilled') results.push(r.value);
-    else results.push({ name: fns[i].name, ok: false, detail: `falhou: ${r.reason && r.reason.message}` });
+    const fnName = (fns[i] && fns[i].name) || `check_${i}`;
+    if (r.status === 'fulfilled') {
+      results.push(normalizeCheck(fnName, r.value));
+    } else {
+      const reasonMsg = (r.reason && r.reason.message) || String(r.reason || 'erro desconhecido');
+      results.push({ name: fnName, ok: false, detail: `falhou: ${reasonMsg}` });
+    }
   }
+
   const blocking = results.filter(r => !r.ok && !r.warning);
   const warnings = results.filter(r => r.warning);
-  if (opts.logger) {
+  if (opts.logger && typeof opts.logger.info === 'function') {
     for (const r of results) {
-      opts.logger.info('preflight', `${r.name}: ${r.detail}`);
+      try { opts.logger.info('preflight', `${r.name}: ${r.detail}`); }
+      catch (_) { /* logger malformado não derruba preflight */ }
     }
   }
   return {

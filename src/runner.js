@@ -74,9 +74,27 @@ function makeContext(events = {}, opts = {}) {
   };
 }
 
+// Aplica events recebidos no _ctx existente. Patrícia BLOCKER #2: re-bind
+// precisa atualizar requestSudoPassword TAMBÉM (não só events). Sem isso, no
+// fluxo pós-reboot (markRebootDone faz startWizard({}) sem events; depois o
+// user clica "Começar" e o handler chama startWizard(realEvents) que cai no
+// early-return), o _ctx.requestSudoPassword ficava undefined e step_05/10
+// quebravam com "sudo: senha exigida e UI não forneceu passwordPromise".
+function _applyEvents(ctx, events = {}, opts = {}) {
+  ctx.events = events;
+  // requestSudoPassword pode vir tanto em opts (jeito antigo de makeContext)
+  // quanto em events (jeito que main.js usa via buildRunnerEvents).
+  // Atualiza SE veio nova; preserva a antiga se não veio (não pode regredir
+  // pra undefined caso re-bind seja chamado sem events.requestSudoPassword).
+  const next = (opts && opts.requestSudoPassword) || (events && events.requestSudoPassword);
+  if (typeof next === 'function') {
+    ctx.requestSudoPassword = next;
+  }
+}
+
 function startWizard(events = {}, opts = {}) {
   if (_ctx) {
-    _ctx.events = events; // re-bind callbacks (e.g., after reload)
+    _applyEvents(_ctx, events, opts); // re-bind callbacks + requestSudoPassword
     _ctx.logger.info('runner', 'startWizard re-bind');
     return _ctx.state;
   }
@@ -135,29 +153,71 @@ async function pauseGate(ctx) {
 }
 
 // Run one step. Returns { id, status, skipped, error }.
+//
+// Patrícia HIGH #5: validações early (step inexistente, reboot pendente) tinham
+// `throw` CRU antes do try/catch interno → bypassavam o catch e o handler
+// retornava rejection genérica pro renderer (toast cinza em vez de tela de
+// erro estruturada). Agora retornamos `{id, status:'error', error}` igual o
+// caminho normal de falha, e o handler safeHandle do main.js emite onError
+// enriquecido como esperado.
 async function runStep(stepId, events) {
   if (!_ctx) startWizard(events || {});
-  if (events) _ctx.events = events;
+  if (events) _applyEvents(_ctx, events);
+
   const step = ALL_STEPS.find(s => s.id === stepId);
-  if (!step) throw new Error(`step não encontrado: ${stepId}`);
+  if (!step) {
+    // Não throw — devolve shape padrão. Emite onError pra UI ter feedback.
+    const msg = `step não encontrado: ${stepId}`;
+    if (_ctx && _ctx.events && typeof _ctx.events.onError === 'function') {
+      try { _ctx.events.onError({ stepId, error: msg }); } catch (_) {}
+    }
+    return { id: stepId, status: 'error', error: msg };
+  }
 
   await pauseGate(_ctx);
 
   // Reboot gate: step 03 sets rebootRequired=true. Subsequent steps cannot run
   // until rebootDone is also true. main.js flips rebootDone on next launch.
   if (_ctx.state.rebootRequired && !_ctx.state.rebootDone && step.id !== 'step_03_wsl_install') {
-    const err = new Error('Reboot pendente — reinicie o Windows antes de continuar.');
+    const msg = 'Reboot pendente — reinicie o Windows antes de continuar.';
     emitStepUpdate(_ctx, step, 'blocked_user_action', { reason: 'reboot_pending' });
-    throw err;
+    if (_ctx.events && typeof _ctx.events.onError === 'function') {
+      try { _ctx.events.onError({ stepId: step.id, error: msg, reason: 'reboot_pending' }); } catch (_) {}
+    }
+    return { id: step.id, status: 'error', error: msg, reason: 'reboot_pending' };
   }
 
   emitStepUpdate(_ctx, step, 'running');
   stateLib.setStepStatus(_ctx.state, step.id, 'running');
   _ctx.save();
 
+  // Bruno (live-test #1): garante que detect/execute/validate SEMPRE rodam dentro
+  // de try/catch e convertem throws estranhos (string solta, null, número) em Error
+  // proper, pra que `err.message` e `err.stderr` existam consistentemente.
+  const safeCall = async (kind, fn) => {
+    try {
+      return await fn();
+    } catch (raw) {
+      if (raw instanceof Error) throw raw;
+      // throw 'string' / throw null / throw {code:5} — normaliza.
+      const wrapped = new Error(
+        typeof raw === 'string' ? raw :
+        (raw && raw.message) ? raw.message :
+        `${kind} lançou valor não-Error: ${JSON.stringify(raw)}`
+      );
+      // preserva campos comuns se vierem em objeto
+      if (raw && typeof raw === 'object') {
+        if (raw.stderr) wrapped.stderr = raw.stderr;
+        if (raw.code) wrapped.code = raw.code;
+        if (raw.enriched) wrapped.enriched = raw.enriched;
+      }
+      throw wrapped;
+    }
+  };
+
   try {
     _ctx.logger.info(step.id, `detect ${step.title}`);
-    const already = await step.detect(_ctx);
+    const already = await safeCall('detect', () => step.detect(_ctx));
     if (already) {
       stateLib.setStepStatus(_ctx.state, step.id, 'skipped', { reason: 'detected' });
       _ctx.save();
@@ -167,10 +227,10 @@ async function runStep(stepId, events) {
     }
 
     _ctx.logger.info(step.id, `execute ${step.title}`);
-    await step.execute(_ctx);
+    await safeCall('execute', () => step.execute(_ctx));
 
     _ctx.logger.info(step.id, `validate ${step.title}`);
-    const ok = await step.validate(_ctx);
+    const ok = await safeCall('validate', () => step.validate(_ctx));
     if (!ok) {
       throw new Error('validação pós-execução falhou');
     }
@@ -188,7 +248,12 @@ async function runStep(stepId, events) {
     emitStepUpdate(_ctx, step, 'error', { error: msg });
     _ctx.logger.error(step.id, `falhou: ${msg}`, { stderr: err.stderr });
     if (_ctx.events && typeof _ctx.events.onError === 'function') {
-      try { _ctx.events.onError({ stepId: step.id, error: msg, stderr: err.stderr }); } catch (_) {}
+      try {
+        // Anexa enriched se o executor já preparou (step_11 faz isso).
+        const payload = { stepId: step.id, error: msg, stderr: err.stderr };
+        if (err.enriched) payload.enriched = err.enriched;
+        _ctx.events.onError(payload);
+      } catch (_) {}
     }
     return { id: step.id, status: 'error', error: msg };
   }
@@ -197,7 +262,7 @@ async function runStep(stepId, events) {
 // Run all steps in order. Stops on reboot gate or first error.
 async function runAll(events) {
   if (!_ctx) startWizard(events || {});
-  if (events) _ctx.events = events;
+  if (events) _applyEvents(_ctx, events);
   const results = [];
   for (const step of ALL_STEPS) {
     // Pause check antes de CADA step (não-bloqueante se nunca foi pausado).
@@ -314,6 +379,17 @@ function shutdown() {
   _ctx = null;
 }
 
+// Test-only inspector. NÃO usar em produção. Retorna snapshot raso do _ctx
+// pra smoke tests poderem verificar requestSudoPassword/events sem reflection.
+function _debugCtx() {
+  if (!_ctx) return null;
+  return {
+    hasRequestSudoPassword: typeof _ctx.requestSudoPassword === 'function',
+    requestSudoPasswordRef: _ctx.requestSudoPassword,
+    eventsKeys: _ctx.events ? Object.keys(_ctx.events) : [],
+  };
+}
+
 module.exports = {
   startWizard,
   runStep,
@@ -329,4 +405,5 @@ module.exports = {
   isPaused,
   resetState,
   CRITICAL_STEPS,
+  _debugCtx,
 };

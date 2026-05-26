@@ -226,30 +226,50 @@ const GENERIC = {
 };
 
 function enrichError(stepId, errorMessage) {
-  const msg = String(errorMessage || '');
-  for (const e of ENTRIES) {
-    if (e.stepId !== '*' && e.stepId !== stepId) continue;
-    if (e.match instanceof RegExp ? e.match.test(msg) : (typeof e.match === 'function' && e.match(msg))) {
-      return {
-        stepId,
-        headline: e.headline,
-        what: e.what,
-        suggestions: e.suggestions.slice(),
-        canRetry: e.canRetry !== false,
-        canSkip: e.canSkip === true,
-        raw: msg.slice(0, 500),
-      };
+  // Defensiva (Bruno — live-test #1): enrichError é chamado em catch handlers
+  // críticos, ele MESMO nunca pode lançar. Qualquer falha aqui = silent fallback.
+  try {
+    const msg = String(errorMessage == null ? '' : errorMessage);
+    for (const e of ENTRIES) {
+      try {
+        if (e.stepId !== '*' && e.stepId !== stepId) continue;
+        const hit = e.match instanceof RegExp
+          ? e.match.test(msg)
+          : (typeof e.match === 'function' && e.match(msg));
+        if (hit) {
+          return {
+            stepId: stepId || null,
+            headline: e.headline,
+            what: e.what,
+            suggestions: Array.isArray(e.suggestions) ? e.suggestions.slice() : [],
+            canRetry: e.canRetry !== false,
+            canSkip: e.canSkip === true,
+            raw: msg.slice(0, 500),
+          };
+        }
+      } catch (_) { /* entrada malformada — pula */ }
     }
+    return {
+      stepId: stepId || null,
+      headline: GENERIC.headline,
+      what: msg ? `${GENERIC.what}\n\nDetalhe técnico: ${msg.slice(0, 300)}` : GENERIC.what,
+      suggestions: GENERIC.suggestions.slice(),
+      canRetry: GENERIC.canRetry,
+      canSkip: GENERIC.canSkip,
+      raw: msg.slice(0, 500),
+    };
+  } catch (_) {
+    // Fallback ABSOLUTO — nunca propaga.
+    return {
+      stepId: stepId || null,
+      headline: 'Erro desconhecido',
+      what: 'Algo deu errado e nem o enriquecimento do erro funcionou.',
+      suggestions: ['Exporte os logs e mande pro JOs.'],
+      canRetry: true,
+      canSkip: true,
+      raw: '',
+    };
   }
-  return {
-    stepId,
-    headline: GENERIC.headline,
-    what: msg ? `${GENERIC.what}\n\nDetalhe técnico: ${msg.slice(0, 300)}` : GENERIC.what,
-    suggestions: GENERIC.suggestions.slice(),
-    canRetry: GENERIC.canRetry,
-    canSkip: GENERIC.canSkip,
-    raw: msg.slice(0, 500),
-  };
 }
 
 module.exports = { enrichError, ENTRIES };

@@ -50,13 +50,24 @@ const MIGRATIONS = {
 };
 
 function migrate(state) {
-  let s = state;
+  let s = state || {};
   let v = s.schema_version || 0;
   while (MIGRATIONS[v]) {
     s = MIGRATIONS[v](s);
     v = s.schema_version;
   }
   if (!s.schema_version) s.schema_version = SCHEMA_VERSION;
+
+  // Patrícia BLOCKER #3: state.json salvo em versão antiga (ou editado à mão)
+  // pode chegar sem `decisions`, `steps`, `stepDetails`. Step_13 lia
+  // `ctx.state.decisions.escritorio3dStrategy` direto → NPE. Garantir shape
+  // mínimo no migrate (defaults preenchem campos ausentes; campos presentes
+  // sobrevivem).
+  const def = emptyState();
+  s.steps       = { ...def.steps,       ...(s.steps       || {}) };
+  s.stepDetails = { ...def.stepDetails, ...(s.stepDetails || {}) };
+  s.decisions   = { ...def.decisions,   ...(s.decisions   || {}) };
+
   return s;
 }
 

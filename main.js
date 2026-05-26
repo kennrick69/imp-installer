@@ -166,90 +166,167 @@ const PREFLIGHT_NAME_MAP = {
   other_distros: 'other_distros',
 };
 
-ipcMain.handle('installer:start', async () => {
+// ───────────────────────────────────────────────────────────────────────
+// Wrapper defensivo pra TODO handler installer:*. (Live-test #1 — Bruno)
+//
+// Garantias:
+//   1. Erro NUNCA volta cru pro renderer — sempre {ok:false, error:<msg humana>}.
+//   2. Emite `installer:onError` com payload enriquecido (headline/what/suggestions)
+//      pra UI mostrar onde travou.
+//   3. Log no console pra Claudio inspecionar durante .exe build.
+//
+// Use `safeHandle('installer:foo', async (e, args) => { ... })` em vez de
+// `ipcMain.handle('installer:foo', ...)`.
+// ───────────────────────────────────────────────────────────────────────
+function safeHandle(channel, handler, opts = {}) {
+  const { stepId = null, emitOnError = true } = opts;
+  ipcMain.handle(channel, async (event, args) => {
+    try {
+      return await handler(event, args);
+    } catch (e) {
+      const rawMsg = (e && e.message) || String(e);
+      const stderr = (e && e.stderr) || '';
+      console.error(`[main.js] handler ${channel} falhou:`, rawMsg);
+      if (stderr) console.error(`[main.js] stderr:`, stderr.slice(0, 800));
+
+      if (emitOnError) {
+        try {
+          const enriched = e && e.enriched
+            ? e.enriched
+            : enrichError(stepId, `${rawMsg}\n${stderr}`);
+          sendToRenderer('installer:onError', {
+            stepId: enriched.stepId || stepId,
+            headline: enriched.headline,
+            what: enriched.what,
+            suggestions: enriched.suggestions,
+            canRetry: enriched.canRetry,
+            canSkip: enriched.canSkip,
+            raw: enriched.raw,
+          });
+        } catch (_) { /* enrichError mesmo defensivo — não pode quebrar */ }
+      }
+      return { ok: false, error: rawMsg };
+    }
+  });
+}
+
+safeHandle('installer:start', async () => {
   runner.startWizard(buildRunnerEvents());
   sendToRenderer('installer:onScreen', { screen: 'preflight' });
 
-  const checks = await preflight.runAll();
-  for (const c of checks) {
+  // Bug #1 do primeiro live-test: runAll retorna {ok, blocking, warnings, results},
+  // não Array. Iterar direto dava "checks is not iterable". Agora usamos .results,
+  // E temos guarda dupla — se vier qualquer coisa quebrada, normalizamos pra [].
+  let pre;
+  try {
+    pre = await preflight.runAll({ logger: runner.getState && runner.getState() ? null : null });
+  } catch (e) {
+    console.error('[main.js] preflight.runAll explodiu (não deveria — runAll usa allSettled):', e);
+    pre = { ok: false, blocking: [], warnings: [], results: [] };
+  }
+  if (!pre || typeof pre !== 'object') {
+    console.error('[main.js] preflight.runAll retornou tipo inesperado:', typeof pre);
+    pre = { ok: false, blocking: [], warnings: [], results: [] };
+  }
+  const list = Array.isArray(pre.results) ? pre.results : [];
+  for (const c of list) {
+    if (!c || typeof c !== 'object') continue;
     sendToRenderer('installer:onPreflight', {
-      checkId: PREFLIGHT_NAME_MAP[c.name] || c.name,
+      checkId: PREFLIGHT_NAME_MAP[c.name] || c.name || 'unknown',
       state: c.ok ? 'ok' : (c.warning ? 'warn' : 'err'),
-      message: c.detail,
+      message: c.detail || '(sem detalhe)',
     });
   }
-  return { ok: true, checks };
-});
+  return { ok: true, checks: list, preflight: { ok: !!pre.ok, blocking: pre.blocking || [], warnings: pre.warnings || [] } };
+}, { stepId: 'step_00_preflight' });
 
 // installer:resume — handler ÚNICO definido mais abaixo (linha ~292) — pause/resume reais.
 
-ipcMain.handle('installer:runStep', async (_e, { stepId }) => {
+safeHandle('installer:runStep', async (_e, { stepId } = {}) => {
+  if (!stepId) throw new Error('runStep: stepId obrigatório');
   return runner.runStep(stepId, buildRunnerEvents());
-});
+}, { /* stepId vem de args */ });
 
-ipcMain.handle('installer:runAll', async () => {
+safeHandle('installer:runAll', async () => {
+  // Fire-and-forget: já retornamos {ok:true} imediato pra UI mostrar progresso.
+  // Erros do runAll viram eventos onError, NÃO promise rejection (defensiva extra).
   runner.runAll(buildRunnerEvents()).then((results) => {
-    const allDone = results.every(r => r.status === 'done' || r.status === 'skipped');
+    const safeResults = Array.isArray(results) ? results : [];
+    // Patrícia HIGH #4: `[].every(...)` é VACUOSAMENTE true. Se runAll quebra
+    // antes do primeiro push (ex.: reboot-gate throw, lock collision), results
+    // fica [] e onComplete disparava prematuro — UI mostrava tela "Tudo pronto"
+    // sem ter feito nada. Agora exigimos length === ALL_STEPS.length E todos
+    // em terminal positivo (done|skipped).
+    const allTerminalPositive = safeResults.every(r => r && (r.status === 'done' || r.status === 'skipped'));
+    const allDone = safeResults.length === ALL_STEPS.length && allTerminalPositive;
     if (allDone) {
+      const st = runner.getState();
+      const sala3dDone = !!(st && st.steps && st.steps['step_13_sala3d'] === 'done');
       sendToRenderer('installer:onComplete', {
         durationSeconds: 0,
-        sala3dInstalled: runner.getState().steps['step_13_sala3d'] === 'done',
+        sala3dInstalled: sala3dDone,
       });
     }
   }).catch((e) => {
+    console.error('[main.js] runAll explodiu:', e);
+    const enriched = enrichError(null, (e && e.message) || String(e));
     sendToRenderer('installer:onError', {
       stepId: null,
-      headline: 'Falha geral',
-      what: e.message,
-      suggestions: ['Veja os logs detalhados', 'Tente retomar'],
+      headline: enriched.headline,
+      what: enriched.what,
+      suggestions: enriched.suggestions,
       canRetry: true,
       canSkip: false,
+      raw: enriched.raw,
     });
   });
   return { ok: true };
 });
 
-ipcMain.handle('installer:markManualDone', async (_e, { stepId }) => {
+safeHandle('installer:markManualDone', async (_e, { stepId } = {}) => {
+  if (!stepId) throw new Error('markManualDone: stepId obrigatório');
   return runner.markManualDone(stepId);
 });
 
-ipcMain.handle('installer:retry', async (_e, { stepId }) => {
+safeHandle('installer:retry', async (_e, { stepId } = {}) => {
+  if (!stepId) throw new Error('retry: stepId obrigatório');
   return runner.runStep(stepId, buildRunnerEvents());
 });
 
-ipcMain.handle('installer:skip', async (_e, { stepId, reason }) => {
+safeHandle('installer:skip', async (_e, { stepId, reason } = {}) => {
+  if (!stepId) throw new Error('skip: stepId obrigatório');
   runner.skipStep(stepId, reason);
   return { ok: true };
 });
 
-ipcMain.handle('installer:getState', async () => {
+safeHandle('installer:getState', async () => {
   return runner.getState();
-});
+}, { emitOnError: false }); // getState falhar não merece toast
 
-ipcMain.handle('installer:listSteps', async () => {
+safeHandle('installer:listSteps', async () => {
   return runner.listSteps();
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:openTerminal', async (_e, { cmd }) => {
-  try {
-    await openInteractiveTerminal(cmd);
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-});
-
-ipcMain.handle('installer:openBrowser', async (_e, { url }) => {
-  if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'url inválida' };
-  shell.openExternal(url);
+safeHandle('installer:openTerminal', async (_e, { cmd } = {}) => {
+  if (!cmd) throw new Error('openTerminal: cmd obrigatório');
+  await openInteractiveTerminal(cmd);
   return { ok: true };
 });
 
-ipcMain.handle('installer:exportLogs', async () => {
+safeHandle('installer:openBrowser', async (_e, { url } = {}) => {
+  if (!url || !/^https?:\/\//i.test(url)) {
+    throw new Error('url inválida (precisa começar com http:// ou https://)');
+  }
+  shell.openExternal(url);
+  return { ok: true };
+}, { emitOnError: false });
+
+safeHandle('installer:exportLogs', async () => {
   const logDir = path.join(STATE_DIR, 'logs');
   try { fs.mkdirSync(logDir, { recursive: true }); } catch (_) {}
   const target = path.join(logDir, `installer-${Date.now()}.log`);
-  const state = runner.getState();
+  let state = null;
+  try { state = runner.getState(); } catch (_) { state = { error: 'state indisponível' }; }
   const dump = [
     `IMP Squad Instalador — log export`,
     `gerado: ${new Date().toISOString()}`,
@@ -259,14 +336,14 @@ ipcMain.handle('installer:exportLogs', async () => {
   ].join('\n');
   fs.writeFileSync(target, dump);
   return { ok: true, path: target };
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:installSala3D', async () => {
+safeHandle('installer:installSala3D', async () => {
   return runner.runStep('step_13_sala3d', buildRunnerEvents());
-});
+}, { stepId: 'step_13_sala3d' });
 
 // Fix Eduardo 2.5: passo 15 cria Desktop/Squad Comando.lnk + %LOCALAPPDATA%\IMP-Squad\IMP-Squad.exe
-ipcMain.handle('installer:openInterface', async () => {
+safeHandle('installer:openInterface', async () => {
   const candidates = [
     path.join(os.homedir(), 'Desktop', 'Squad Comando.lnk'),
     path.join(process.env.LOCALAPPDATA || '', 'IMP-Squad', 'IMP-Squad.exe'),
@@ -279,14 +356,14 @@ ipcMain.handle('installer:openInterface', async () => {
     }
   }
   return { ok: false, error: 'imp-interface.exe não encontrado — instale o passo 15 primeiro' };
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:pause', async () => {
+safeHandle('installer:pause', async () => {
   // Eduardo 2.6: pause REAL agora — flag em _ctx.state.paused, checada por pauseGate.
   return runner.pause();
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:resume', async () => {
+safeHandle('installer:resume', async () => {
   // Antes era alias de start; agora separa: resume real é flip da flag pause.
   // Mantemos compat: se ainda não há _ctx, faz startWizard.
   if (!runner.getState() || !runner.isPaused()) {
@@ -297,24 +374,24 @@ ipcMain.handle('installer:resume', async () => {
   return runner.resume();
 });
 
-ipcMain.handle('installer:reset', async () => {
+safeHandle('installer:reset', async () => {
   // Eduardo 2.7: reset REAL — apaga state.json (preservando backup) e zera _ctx.
   // Wizard chama em btn-fresh.
   return runner.resetState();
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:closeApp', async () => {
+safeHandle('installer:closeApp', async () => {
   app.quit();
   return { ok: true };
-});
+}, { emitOnError: false });
 
-ipcMain.handle('installer:pickFolder', async () => {
+safeHandle('installer:pickFolder', async () => {
   if (!mainWindow) return { ok: false };
   const r = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory', 'createDirectory'],
   });
   if (r.canceled || !r.filePaths[0]) return { ok: false };
   return { ok: true, path: r.filePaths[0] };
-});
+}, { emitOnError: false });
 
 ipcMain.handle('app:getVersion', async () => app.getVersion());

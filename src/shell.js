@@ -154,29 +154,72 @@ async function sudoInWsl(bashCmd, opts = {}) {
 
 // Open an interactive Windows Terminal (or fallback) running a bash command.
 // Used for `claude login` and `gh auth login --web`.
+//
+// Patrícia HIGH #8: a versão anterior resolvia a Promise em DOIS caminhos
+// (linha final incondicional + fallback dentro do on('error')). Pior — também
+// "rejeitava" no fallback.on('error') mesmo após resolver. Resultado: handler
+// SEMPRE retornava {ok:true} mesmo quando wt.exe falhava E o fallback
+// cmd /c start nem tinha conseguido executar. step_09 (claude login) e
+// step_10 (gh login) ficavam esperando 15min de polling silenciosamente
+// porque o terminal não tinha aberto de verdade.
+//
+// Fix: flag `resolved` única; ESPERA o `spawn` real disparar antes de
+// resolver com sucesso (`on('spawn')`); fallback é tentado quando wt falha
+// e ele também só resolve no `on('spawn')` dele; se AMBOS falham, resolve
+// UMA vez com {ok:false, error}.
 function openInteractiveTerminal(bashCmd, opts = {}) {
   const distro = opts.distro || process.env.IMP_DISTRO || 'Ubuntu-22.04';
   const title = opts.title || 'IMP installer';
-  // wt.exe inherits no profile if --profile is missing; we set explicitly.
-  // Spawn detached so the installer process doesn't block on the terminal.
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = (payload) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(payload);
+    };
+
     const trailing = `${bashCmd}; ec=$?; echo ""; echo "[IMP] terminei (exit $ec). Pressione Enter pra fechar."; read`;
     const wtArgs = [
       'new-tab', '--profile', distro, '--title', title,
       'wsl.exe', '-d', distro, '--', 'bash', '-lc', trailing,
     ];
-    const child = spawn('wt.exe', wtArgs, { detached: true, stdio: 'ignore', windowsHide: false });
-    child.on('error', () => {
-      // Fallback: spawn wsl.exe directly with cmd /c start to get a console window.
-      const fallback = spawn('cmd.exe', ['/c', 'start', '""', 'wsl.exe', '-d', distro, '--', 'bash', '-lc', trailing],
-        { detached: true, stdio: 'ignore' });
-      fallback.on('error', reject);
-      fallback.unref();
-      resolve({ stdout: '', stderr: '', code: 0, fallback: true });
+
+    let child;
+    try {
+      child = spawn('wt.exe', wtArgs, { detached: true, stdio: 'ignore', windowsHide: false });
+    } catch (e) {
+      // spawn síncrono falhou — vai direto pro fallback.
+      return tryFallback(e);
+    }
+
+    child.on('spawn', () => {
+      // wt.exe abriu — sucesso real.
+      try { child.unref(); } catch (_) {}
+      done({ stdout: '', stderr: '', code: 0 });
     });
-    child.unref();
-    // We don't await terminal close — UI will poll the validate() callback.
-    resolve({ stdout: '', stderr: '', code: 0 });
+    child.on('error', (err) => {
+      // wt.exe não pôde iniciar (ex.: Windows Terminal não instalado).
+      tryFallback(err);
+    });
+
+    function tryFallback(wtErr) {
+      if (resolved) return;
+      let fallback;
+      try {
+        fallback = spawn('cmd.exe',
+          ['/c', 'start', '""', 'wsl.exe', '-d', distro, '--', 'bash', '-lc', trailing],
+          { detached: true, stdio: 'ignore' });
+      } catch (e) {
+        return done({ ok: false, stdout: '', stderr: '', code: 1, error: `wt: ${wtErr && wtErr.message}; cmd: ${e && e.message}` });
+      }
+      fallback.on('spawn', () => {
+        try { fallback.unref(); } catch (_) {}
+        done({ stdout: '', stderr: '', code: 0, fallback: true });
+      });
+      fallback.on('error', (e) => {
+        done({ ok: false, stdout: '', stderr: '', code: 1, error: `wt: ${wtErr && wtErr.message}; cmd: ${e && e.message}` });
+      });
+    }
   });
 }
 

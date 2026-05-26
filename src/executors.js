@@ -608,7 +608,11 @@ const step13Sala3D = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
-    if (ctx.state.decisions.escritorio3dStrategy === 'skip') {
+    // Patrícia BLOCKER #3: defensiva extra mesmo com state.migrate garantindo
+    // decisions:{}. Se algum executor rodar com ctx.state vindo de origem não
+    // migrada (ex.: testes diretos), não crashar.
+    const strategy = (ctx.state.decisions && ctx.state.decisions.escritorio3dStrategy) || 'release-asset-on-demand';
+    if (strategy === 'skip') {
       ctx.logger.info('sala3d', 'pulado por decisão do usuário');
       ctx.state.sala3dSkipped = true;
       ctx.state.sala3dSkipReason = 'usuario_pulou';
@@ -680,7 +684,8 @@ const step13Sala3D = {
     }
   },
   async validate(ctx) {
-    if (ctx.state.decisions.escritorio3dStrategy === 'skip') return true;
+    const strategy = (ctx.state.decisions && ctx.state.decisions.escritorio3dStrategy) || 'release-asset-on-demand';
+    if (strategy === 'skip') return true;
     if (ctx.state.sala3dSkipped) return true; // skip aceitável (release indisponível)
     return this.detect(ctx);
   },
