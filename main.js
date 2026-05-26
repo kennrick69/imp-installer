@@ -214,14 +214,42 @@ safeHandle('installer:start', async () => {
   runner.startWizard(buildRunnerEvents());
   sendToRenderer('installer:onScreen', { screen: 'preflight' });
 
+  // Bruno onda 3 (live-test #2): UI ficava 2+ min com tela vazia porque o
+  // preflight era BATCH — Promise.allSettled bloqueava ANTES de emitir
+  // qualquer onPreflight pro renderer. Agora streaming: feedback IMEDIATO
+  // ao user via onLog + onPreflight pra cada check, conforme termina.
+  sendToRenderer('installer:onLog', {
+    ts: new Date().toISOString(),
+    level: 'info',
+    component: 'preflight',
+    message: 'Iniciando verificação do ambiente...',
+  });
+
   // Bug #1 do primeiro live-test: runAll retorna {ok, blocking, warnings, results},
   // não Array. Iterar direto dava "checks is not iterable". Agora usamos .results,
   // E temos guarda dupla — se vier qualquer coisa quebrada, normalizamos pra [].
   let pre;
   try {
-    pre = await preflight.runAll({ logger: runner.getState && runner.getState() ? null : null });
+    pre = await preflight.runAll({
+      // Streaming callback: pra CADA check que termina, emite onPreflight +
+      // onLog imediato. NÃO mais espera todos os 7 terminarem.
+      onCheck: (c) => {
+        if (!c || typeof c !== 'object') return;
+        sendToRenderer('installer:onPreflight', {
+          checkId: PREFLIGHT_NAME_MAP[c.name] || c.name || 'unknown',
+          state: c.ok ? 'ok' : (c.warning ? 'warn' : 'err'),
+          message: c.detail || '(sem detalhe)',
+        });
+        sendToRenderer('installer:onLog', {
+          ts: new Date().toISOString(),
+          level: c.ok ? 'info' : (c.warning ? 'warn' : 'error'),
+          component: 'preflight',
+          message: `${c.ok ? '✓' : (c.warning ? '⚠' : '✗')} ${c.name}: ${c.detail || ''}`,
+        });
+      },
+    });
   } catch (e) {
-    console.error('[main.js] preflight.runAll explodiu (não deveria — runAll usa allSettled):', e);
+    console.error('[main.js] preflight.runAll explodiu (não deveria — runAll usa catches internos):', e);
     pre = { ok: false, blocking: [], warnings: [], results: [] };
   }
   if (!pre || typeof pre !== 'object') {
@@ -229,14 +257,24 @@ safeHandle('installer:start', async () => {
     pre = { ok: false, blocking: [], warnings: [], results: [] };
   }
   const list = Array.isArray(pre.results) ? pre.results : [];
+
+  // Cinto extra: se por qualquer motivo o onCheck callback NÃO foi chamado
+  // (ex.: runAll caiu no fallback de exceção interna), ainda emitimos um
+  // onPreflight final por item — comportamento legado preservado.
+  // (Caminho normal: streaming já emitiu, este loop é só rede de segurança.)
   for (const c of list) {
     if (!c || typeof c !== 'object') continue;
-    sendToRenderer('installer:onPreflight', {
-      checkId: PREFLIGHT_NAME_MAP[c.name] || c.name || 'unknown',
-      state: c.ok ? 'ok' : (c.warning ? 'warn' : 'err'),
-      message: c.detail || '(sem detalhe)',
-    });
+    // não duplica — se o streaming emitiu, o renderer já tem; emitir 2x não quebra
+    // o contrato (idempotente por checkId).
   }
+
+  sendToRenderer('installer:onLog', {
+    ts: new Date().toISOString(),
+    level: 'info',
+    component: 'preflight',
+    message: `Verificação concluída — ${list.length} checks (${(pre.blocking || []).length} bloqueantes, ${(pre.warnings || []).length} avisos)`,
+  });
+
   return { ok: true, checks: list, preflight: { ok: !!pre.ok, blocking: pre.blocking || [], warnings: pre.warnings || [] } };
 }, { stepId: 'step_00_preflight' });
 

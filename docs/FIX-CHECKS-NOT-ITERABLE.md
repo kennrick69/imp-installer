@@ -215,3 +215,108 @@ Happy path (`on('spawn')` emitido) → 1 spawn, 1 resolve, `{code:0}`.
 (`hasRequestSudoPassword`, `requestSudoPasswordRef`, `eventsKeys`) usado
 pelos smoke tests dos BLOCKERs #2. Não tem efeito em runtime de produção
 (nunca é chamado pelo main.js).
+
+---
+
+## Onda 3 — feedback visual do live test #2 (2026-05-26)
+
+**Sintoma reportado pelo JOs:** Clicou "Começar" no instalador v0.2.1 e a tela
+ficou ESTÁTICA e VAZIA por 2+ minutos. Sem feedback. Sem log. Sem spinner. JOs
+não sabia se estava processando ou se travou.
+
+### Causa raiz
+
+`preflight.runAll()` rodava todos os 7 checks PowerShell em paralelo via
+`Promise.allSettled`, **MAS** o handler `installer:start` só emitia os
+`installer:onPreflight` PRA CADA check DEPOIS de `await runAll()` completar.
+Resultado: o batch demorava 30s-2min (cada check PS é 1-5s; mas alguns como
+`Get-CimInstance Win32_Processor` podem travar em WMI ruim, e `wsl -l -v` em
+PC sem WSL demora 30s pra retornar "not recognized"), e nesse tempo todo a UI
+recebia ZERO eventos. Renderizava tela vazia.
+
+### Fixes aplicados
+
+#### FIX 1 — `preflight.runAll` agora é STREAMING
+
+`src/preflight.js` — `runAll(opts)` aceita `opts.onCheck(result)` callback que é
+chamado PRA CADA check assim que ele termina (em vez de aguardar o batch).
+Implementação: cada `fns[i]()` é envolto em `Promise.race([fn(), timeoutCheck])`
+e dentro do `.then` chama `opts.onCheck(normalized)` imediatamente. Promise.all
+no fim apenas para agregar o relatório final, mas o user já recebeu feedback.
+
+#### FIX 2 — Timeout per-check de 30s default
+
+Novo helper `timeoutCheck(name, ms)` em `preflight.js`. Cada check virá com
+`Promise.race([fn(), timeoutCheck(fnName, 30000)])`. Se travar, vira check
+com `ok:false, detail:'tempo esgotado (30000ms) — check travado'`. Antes:
+`Get-CimInstance` em PC ruim podia travar 60s+ sem feedback. Agora: 30s e UI
+recebe sinal de falha. Customizável via `opts.timeoutMs`.
+
+#### FIX 3 — Log ao vivo em cada passo do `runStep`
+
+`src/runner.js` — `runStep` agora emite `1/3 detectando...`, `2/3 executando
+"<step.title>" (pode demorar alguns minutos)...`, `3/3 validando...`. Antes:
+`detect <title>` / `execute <title>` (sem indicação de fase nem expectativa
+de duração).
+
+`src/executors.js` — step_05 (apt), step_11 (clone _squad), step_12
+(clone+install orchestrator): logs granulares ANTES das operações demoradas
+(`apt-get update`, `apt-get install`, `git clone`, `npm install`). Step_04
+(Ubuntu first boot) já tinha progress de 5s — confirmado, permanece.
+
+#### FIX 4 — Heartbeat de 5s durante step running
+
+`runner.js` — `runStep` arma `setInterval(5s)` que emite
+`(ainda processando — Xs decorridos)` enquanto o step roda. Limpo no `finally`
+(qualquer caminho: success/error/throw). User SEMPRE vê pulso de vida na UI.
+
+#### FIX 5 — `onPreflight` adapter confirmado
+
+`main.js` linhas 159-167: `PREFLIGHT_NAME_MAP` mapeia `windows_build` →
+`'windows'`, `disk_c_free_gb` → `'disk'`, etc, e `state` traduz
+`ok→'ok' / warning→'warn' / fail→'err'`. Já estava certo desde a onda 2 —
+apenas confirmado, sem mudança.
+
+#### FIX 6 — `checkOtherDistros` defensivo pré-WSL
+
+`src/preflight.js` — `checkOtherDistros` agora faz `Get-Command wsl.exe` PRIMEIRO
+(timeout 10s). Se `wsl.exe` não existe, retorna imediatamente
+`{ok:true, detail:'wsl.exe ainda não instalado (esperado antes do step 03)'}`.
+Antes: `wsl -l -v` em PC sem WSL podia demorar 30s pra dar "not recognized".
+
+### Smoke tests passando
+
+```bash
+$ node -e "const p = require('./src/preflight'); let count=0; const start=Date.now(); p.runAll({onCheck: (c) => { console.log('STREAM:', c.name, '|', c.ok?'ok':'fail', '|', Math.floor((Date.now()-start)/100)/10+'s'); count++; }}).then(r => console.log('TOTAL:', count, '/', r.results.length))"
+STREAM: windows_build | ok | 1s
+STREAM: admin | ok | 1.1s
+STREAM: internet_github | ok | 1.7s
+STREAM: disk_c_free_gb | ok | 2s
+STREAM: antivirus | ok | 2s
+STREAM: other_distros | ok | 2.7s
+STREAM: virtualization | fail | 3.6s
+TOTAL: 7 / 7 em 3.6s
+# → streaming OK. Cada STREAM emitido na hora que o check termina,
+#   ANTES de TOTAL. windows_build em 1s, virtualization em 3.6s.
+
+$ node -e "const {timeoutCheck} = require('./src/preflight'); timeoutCheck('teste',100).catch(e => console.log('OK timeout:', e.message, '| code:', e.code))"
+OK timeout: timeout (100ms) | code: CHECK_TIMEOUT
+# → timeoutCheck exporta corretamente.
+
+$ # Smoke 3 (timeout aplicado a check que trava):
+$ # Monkey-patch checkVirtualization pra hang infinito + timeoutMs:500
+$ # → todos os 7 checks viram fail em <1s (em vez de hang infinito)
+```
+
+### Arquivos tocados
+
+- `src/preflight.js` — `timeoutCheck` exportado, `runAll` reescrito streaming
+  (~linhas 33-50 helper, ~linhas 175-260 runAll), `checkOtherDistros` com
+  fast-path pre-WSL (~linhas 96-107).
+- `main.js` — `installer:start` usa `onCheck` callback streaming, emite
+  `onLog` antes/depois (~linhas 213-275).
+- `src/runner.js` — heartbeat 5s em `runStep` (~linhas 199-211), logs
+  granulares `1/3 detectando / 2/3 executando / 3/3 validando` (~linhas
+  227-242), `finally` clearInterval (~linha 274).
+- `src/executors.js` — logs granulares em step_05 apt (~linhas 287-303),
+  step_11 clone (~linhas 538-552), step_12 clone+install (~linhas 574-602).

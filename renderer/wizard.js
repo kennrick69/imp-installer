@@ -24,16 +24,16 @@
     { id: 'step_03_wsl_install',        num: 3,  name: 'Instalar WSL2 + Ubuntu',    cat: 'hybrid' },
     { id: 'step_04_ubuntu_first_boot',  num: 4,  name: '1ª boot do Ubuntu',         cat: 'manual' },
     { id: 'step_05_apt_base',           num: 5,  name: 'Pacotes apt base',          cat: 'auto'   },
-    { id: 'step_06_node',               num: 6,  name: 'Node 20 LTS',               cat: 'auto'   },
-    { id: 'step_07_npm_global',         num: 7,  name: 'npm global sem sudo',       cat: 'auto'   },
+    { id: 'step_06_node_nvm',           num: 6,  name: 'Node 20 LTS',               cat: 'auto'   },
+    { id: 'step_07_npm_prefix',         num: 7,  name: 'npm global sem sudo',       cat: 'auto'   },
     { id: 'step_08_claude_cli',         num: 8,  name: 'Claude Code CLI',           cat: 'auto'   },
     { id: 'step_09_claude_login',       num: 9,  name: 'Login Claude',              cat: 'manual' },
-    { id: 'step_10_github_auth',        num: 10, name: 'GitHub auth (Device Flow)', cat: 'hybrid' },
+    { id: 'step_10_gh_auth',            num: 10, name: 'GitHub auth (Device Flow)', cat: 'hybrid' },
     { id: 'step_11_clone_squad',        num: 11, name: 'Clonar imp-squad',          cat: 'auto'   },
-    { id: 'step_12_clone_orch',         num: 12, name: 'Clonar imp-orchestrator',   cat: 'auto'   },
+    { id: 'step_12_clone_orchestrator', num: 12, name: 'Clonar imp-orchestrator',   cat: 'auto'   },
     { id: 'step_13_sala3d',             num: 13, name: 'Sala 3D (opcional)',        cat: 'auto'   },
     { id: 'step_14_tmux_session',       num: 14, name: 'Sessão tmux imp (7 painéis)', cat: 'auto' },
-    { id: 'step_15_interface_dl',       num: 15, name: 'Baixar Squad Comando.exe', cat: 'auto'   },
+    { id: 'step_15_download_interface', num: 15, name: 'Baixar Squad Comando.exe', cat: 'auto'   },
     { id: 'step_16_e2e',                num: 16, name: 'Validação end-to-end',      cat: 'auto'   }
   ];
 
@@ -50,7 +50,13 @@
     autoScroll: true,
     startedAt: null,
     logBuffer: [],          // {ts, level, stepId, msg}
-    paused: false
+    paused: false,
+    // ─── feedback visual (Camila v0.2.2) ────────────────────
+    lastLogAt: 0,
+    activityTimer: null,
+    waitTimers: Object.create(null),   // stepId/checkId → { soft, hard }
+    pfWaitTimers: Object.create(null),
+    preflightRunning: false
   };
 
   // Atalho pra API do main.js — defensivo (se rodar standalone, vira no-op)
@@ -106,6 +112,8 @@
       heading.setAttribute('tabindex', '-1');
       heading.focus({ preventScroll: false });
     }
+    // mostrar/esconder barra global + log peek conforme tela
+    syncPersistentChrome();
   }
 
   // ───────────────────────────────────────────────────────────
@@ -331,23 +339,33 @@
   function setPreflightResult(checkId, state, message) {
     const card = $(`.pf-card[data-check="${checkId}"]`);
     if (!card) return;
-    card.dataset.state = state;          // pending | ok | warn | err
-    const status = card.querySelector('.pf-status');
+    card.dataset.state = state;          // pending | running | ok | warn | err
+    const status = card.querySelector('.pf-status') || card.querySelector('.pf-msg');
     if (status) status.textContent = message || statusFallback(state);
     const icon = card.querySelector('.pf-icon');
-    if (icon) {
+    if (icon && state !== 'running') {
+      // estado running usa CSS-only spinner; só atualizamos ícone nos outros
       icon.textContent = state === 'ok'   ? '✓'
                        : state === 'warn' ? '!'
                        : state === 'err'  ? '×'
                                           : '⏳';
     }
+    if (state === 'running') {
+      ensurePfWaitNode(card);
+      armPreflightWait(checkId);
+    } else {
+      clearPreflightWait(checkId);
+    }
     evaluatePreflightGate();
+    refreshPreflightProgress();
   }
   function statusFallback(state) {
-    return state === 'ok'   ? 'Tudo certo'
-         : state === 'warn' ? 'Atenção'
-         : state === 'err'  ? 'Bloqueado'
-                            : 'Verificando…';
+    // shadow do statusFallback original — sobrescrito pra cobrir "running"
+    return state === 'ok'      ? 'Tudo certo'
+         : state === 'warn'    ? 'Atenção'
+         : state === 'err'     ? 'Bloqueado'
+         : state === 'running' ? 'Verificando agora…'
+                               : 'Verificando…';
   }
   function evaluatePreflightGate() {
     const cards  = $$('.pf-card');
@@ -437,6 +455,190 @@
   }
 
   // ───────────────────────────────────────────────────────────
+  // FEEDBACK VISUAL GLOBAL (Camila v0.2.2)
+  // Resolve o bug "tela vazia e estática por 2min" do v0.2.1
+  // ───────────────────────────────────────────────────────────
+
+  // Telas que devem mostrar a barra global + log peek
+  const WORK_SCREENS = new Set(['preflight', 'progress', 'manual']);
+
+  // Status pill (topbar) — estado global
+  function setStatusPill(state, text) {
+    const pill = $('#status-pill');
+    if (!pill) return;
+    pill.dataset.state = state;                  // idle | working | error | success
+    const t = pill.querySelector('.sp-text');
+    if (t && text) t.textContent = text;
+    pill.title = text || '';
+    // erro vira clicável (abre logs)
+    pill.style.pointerEvents = state === 'error' ? 'auto' : 'none';
+  }
+  // Click no status pill (quando erro): abre logs
+  document.addEventListener('click', (e) => {
+    const pill = e.target.closest('#status-pill');
+    if (pill && pill.dataset.state === 'error') openLogsModal();
+  });
+
+  // Barra global no topo
+  function showGlobalProgress(show = true) {
+    const bar = $('#global-progress');
+    if (!bar) return;
+    bar.classList.toggle('hidden', !show);
+  }
+  function setGlobalProgress({ text, done, total, percent }) {
+    const bar = $('#global-progress');
+    if (!bar) return;
+    if (text) $('#gp-text').textContent = text;
+    if (typeof done === 'number' && typeof total === 'number') {
+      $('#gp-count').textContent = `${done}/${total}`;
+      if (typeof percent !== 'number') percent = Math.round((done / total) * 100);
+    }
+    if (typeof percent === 'number') {
+      $('#gp-fill').style.width = Math.max(0, Math.min(100, percent)) + '%';
+    }
+  }
+  function pulseActivity() {
+    const bar = $('#global-progress');
+    if (!bar) return;
+    bar.classList.add('activity');
+    clearTimeout(ui.activityTimer);
+    ui.activityTimer = setTimeout(() => bar.classList.remove('activity'), 1600);
+  }
+
+  // Log peek (painel inline embaixo das telas de work)
+  function showLogPeek(show = true) {
+    const peek = $('#log-peek');
+    if (!peek) return;
+    peek.classList.toggle('hidden', !show);
+  }
+  function appendLogPeek(entry) {
+    const body = $('#lp-body');
+    if (!body) return;
+    // remove placeholder se existir
+    const empty = body.querySelector('.lp-empty');
+    if (empty) empty.remove();
+
+    const line = el('div', { className: 'lp-line lp-' + (entry.level || 'info') + ' fresh' });
+    line.append(
+      el('span', { className: 'lp-ts' }, formatClock(entry.ts || Date.now())),
+      document.createTextNode((entry.message || entry.msg) || '')
+    );
+    body.appendChild(line);
+    // mantém até 12 linhas no peek (compacto)
+    while (body.children.length > 12) body.removeChild(body.firstChild);
+    // auto-scroll
+    body.scrollTop = body.scrollHeight;
+    // remove glow após 1s
+    setTimeout(() => line.classList.remove('fresh'), 1000);
+
+    // hint = última mensagem resumida
+    const hint = $('#lp-hint');
+    if (hint) hint.textContent = '— ' + ((entry.message || entry.msg) || '').slice(0, 80);
+
+    // marca peek como ativo (ponto pulsando)
+    const peek = $('#log-peek');
+    if (peek) {
+      peek.classList.remove('idle');
+      clearTimeout(peek._idleTimer);
+      peek._idleTimer = setTimeout(() => peek.classList.add('idle'), 8000);
+    }
+  }
+  function clearLogPeek() {
+    const body = $('#lp-body');
+    if (body) body.innerHTML = '<div class="lp-empty">aguardando primeira mensagem…</div>';
+    const hint = $('#lp-hint');
+    if (hint) hint.textContent = 'aguardando primeira mensagem…';
+  }
+
+  // Atualiza visibilidade dos elementos persistentes ao trocar de tela
+  function syncPersistentChrome() {
+    const isWork = WORK_SCREENS.has(ui.currentScreen);
+    showGlobalProgress(isWork);
+    showLogPeek(isWork);
+  }
+
+  // Marca TODOS os preflight cards como "running" — chamado ao entrar na tela
+  // ou após 200ms se nenhum evento backend chegou ainda (anti tela-vazia)
+  function startPreflightRunning() {
+    if (ui.preflightRunning) return;
+    ui.preflightRunning = true;
+    $$('.pf-card').forEach(card => {
+      if (card.dataset.state === 'pending') {
+        card.dataset.state = 'running';
+        const status = card.querySelector('.pf-status') || card.querySelector('.pf-msg');
+        if (status) status.textContent = 'Verificando agora…';
+        // injeta long-wait notice se ainda não existe
+        ensurePfWaitNode(card);
+        // arma watchdog
+        armPreflightWait(card.dataset.check);
+      }
+    });
+    setStatusPill('working', 'Verificando ambiente…');
+    setGlobalProgress({ text: 'Verificando ambiente…', done: 0, total: 7 });
+  }
+  function ensurePfWaitNode(card) {
+    if (card.querySelector('.pf-wait')) return;
+    const wait = el('p', { className: 'pf-wait' }, 'Esse passo pode levar alguns minutos — aguarde.');
+    // posição: depois do body ou do msg
+    (card.querySelector('.pf-body') || card).appendChild(wait);
+  }
+  function armPreflightWait(checkId) {
+    clearPreflightWait(checkId);
+    const card = $(`.pf-card[data-check="${checkId}"]`);
+    if (!card) return;
+    const soft = setTimeout(() => {
+      card.classList.add('long-wait');
+      const w = card.querySelector('.pf-wait');
+      if (w) w.textContent = 'Esse passo pode levar alguns minutos — aguarde.';
+    }, 30000);
+    const hard = setTimeout(() => {
+      card.classList.add('very-long-wait');
+      const w = card.querySelector('.pf-wait');
+      if (w) w.textContent = 'Demorou mais que o esperado — veja logs detalhados.';
+    }, 5 * 60000);
+    ui.pfWaitTimers[checkId] = { soft, hard };
+  }
+  function clearPreflightWait(checkId) {
+    const t = ui.pfWaitTimers[checkId];
+    if (t) { clearTimeout(t.soft); clearTimeout(t.hard); delete ui.pfWaitTimers[checkId]; }
+    const card = $(`.pf-card[data-check="${checkId}"]`);
+    if (card) card.classList.remove('long-wait', 'very-long-wait');
+  }
+
+  // Conta progresso do preflight (cards ok/warn/err vs total)
+  function refreshPreflightProgress() {
+    const cards = $$('.pf-card');
+    const total = cards.length;
+    const done = cards.filter(c => ['ok','warn','err'].includes(c.dataset.state)).length;
+    setGlobalProgress({ text: done < total ? `Verificando ambiente… (${done}/${total})` : 'Verificações concluídas', done, total });
+    if (done === total) {
+      const hasErr = cards.some(c => c.dataset.state === 'err');
+      setStatusPill(hasErr ? 'error' : 'success', hasErr ? 'Erro nas verificações — clique pra detalhes' : 'Ambiente pronto');
+    }
+  }
+
+  // Watchdog de "demora" pros steps principais
+  function armStepWait(stepId) {
+    clearStepWait(stepId);
+    const meta = STEP_BY_ID[stepId];
+    const num = meta ? String(meta.num).padStart(2, '0') : '?';
+    const name = meta ? meta.name : stepId;
+    const soft = setTimeout(() => {
+      appendLogPeek({ level: 'warn', msg: `[${num}] ${name}: esse passo pode levar alguns minutos — aguarde…` });
+      toast('Esse passo pode levar alguns minutos — aguarde', 'info', 6000);
+    }, 30000);
+    const hard = setTimeout(() => {
+      appendLogPeek({ level: 'error', msg: `[${num}] ${name}: demorou mais que o esperado — veja logs detalhados.` });
+      toast('Demorou mais que o esperado — clique em "Logs" para detalhes', 'warn', 8000);
+    }, 5 * 60000);
+    ui.waitTimers[stepId] = { soft, hard };
+  }
+  function clearStepWait(stepId) {
+    const t = ui.waitTimers[stepId];
+    if (t) { clearTimeout(t.soft); clearTimeout(t.hard); delete ui.waitTimers[stepId]; }
+  }
+
+  // ───────────────────────────────────────────────────────────
   // Boas-vindas — bindings
   // ───────────────────────────────────────────────────────────
   function bindWelcome() {
@@ -447,11 +649,19 @@
     });
     startBtn.addEventListener('click', async () => {
       ui.startedAt = Date.now();
+      ui.preflightRunning = false;
       showScreen('preflight');
+      // feedback IMEDIATO — não esperar evento backend pra parar de parecer travado
+      setStatusPill('working', 'Iniciando verificações…');
+      setGlobalProgress({ text: 'Iniciando verificações…', done: 0, total: 7 });
+      clearLogPeek();
+      // Safety net: se backend não emitir nada em 200ms, marca todos cards como running
+      setTimeout(() => startPreflightRunning(), 200);
       try {
         await api.start();
       } catch (e) {
         toast('Não consegui iniciar a instalação. ' + (e?.message || ''), 'error');
+        setStatusPill('error', 'Falhou ao iniciar — clique pra detalhes');
       }
     });
     $('#btn-cancel-welcome').addEventListener('click', () => {
@@ -479,9 +689,20 @@
   // ───────────────────────────────────────────────────────────
   function bindPreflight() {
     $('#btn-preflight-recheck').addEventListener('click', async () => {
-      $$('.pf-card').forEach(c => setPreflightResult(c.dataset.check, 'pending', 'Verificando…'));
+      ui.preflightRunning = false;
+      $$('.pf-card').forEach(c => {
+        c.classList.remove('long-wait', 'very-long-wait');
+        clearPreflightWait(c.dataset.check);
+        setPreflightResult(c.dataset.check, 'pending', 'Verificando…');
+      });
+      setStatusPill('working', 'Re-verificando ambiente…');
+      setGlobalProgress({ text: 'Re-verificando ambiente…', done: 0, total: 7 });
+      setTimeout(() => startPreflightRunning(), 200);
       try { await api.runStep('step_00_preflight'); }
-      catch (e) { toast('Erro no preflight: ' + (e?.message || ''), 'error'); }
+      catch (e) {
+        toast('Erro no preflight: ' + (e?.message || ''), 'error');
+        setStatusPill('error', 'Erro no preflight — clique pra detalhes');
+      }
     });
     $('#btn-preflight-next').addEventListener('click', () => {
       showScreen('progress');
@@ -620,6 +841,8 @@
   // ───────────────────────────────────────────────────────────
   function bindTopbar() {
     $('#btn-open-logs').addEventListener('click', openLogsModal);
+    const peekBtn = $('#btn-log-peek-open');
+    if (peekBtn) peekBtn.addEventListener('click', openLogsModal);
     $('#btn-export-logs').addEventListener('click', async () => {
       try {
         const out = await api.exportLogs();
@@ -657,12 +880,24 @@
       // entry = { msg, level?, stepId?, ts? }
       if (typeof entry === 'string') entry = { msg: entry };
       appendLog(entry);
+      // feedback visual — log também alimenta peek + ativa pulse
+      appendLogPeek(entry);
+      pulseActivity();
+      ui.lastLogAt = Date.now();
+      // anti tela-vazia: primeiro log já marca todos preflight cards como running
+      if (ui.currentScreen === 'preflight' && !ui.preflightRunning) {
+        startPreflightRunning();
+      }
     });
 
     api.onStepUpdate && api.onStepUpdate((update) => {
       // update = { stepId, state, progress?, etaSeconds?, message? }
       if (!update || !update.stepId) return;
       if (update.state) setStepState(update.stepId, update.state);
+      const meta = STEP_BY_ID[update.stepId] || {};
+      const num = String(meta.num ?? '?').padStart(2, '0');
+      const name = meta.name || update.stepId;
+
       if (update.state === 'running') {
         ui.currentStepId = update.stepId;
         setCurrentStep(update.stepId, {
@@ -670,12 +905,33 @@
           etaSeconds: update.etaSeconds
         });
         setConnection('ok');
-      } else if (update.stepId === ui.currentStepId) {
-        // refresh barra mesmo se não rolou troca
-        setCurrentStep(update.stepId, {
-          progress:   update.progress,
-          etaSeconds: update.etaSeconds
+        // status pill + barra global refletem o passo atual
+        setStatusPill('working', `Processando passo ${num}/${STEP_TOTAL - 1}: ${name}`);
+        const done = Object.values(ui.stepStates).filter(s => s === 'done' || s === 'skipped').length;
+        setGlobalProgress({
+          text: `Passo ${num} de ${STEP_TOTAL - 1}: ${name}`,
+          done, total: STEP_TOTAL
         });
+        armStepWait(update.stepId);
+        pulseActivity();
+      } else {
+        if (update.stepId === ui.currentStepId) {
+          // refresh barra mesmo se não rolou troca
+          setCurrentStep(update.stepId, {
+            progress:   update.progress,
+            etaSeconds: update.etaSeconds
+          });
+        }
+        // saiu do running: limpa watchdog
+        if (['done','skipped','error','manual'].includes(update.state)) {
+          clearStepWait(update.stepId);
+        }
+        // atualiza progress count
+        const done = Object.values(ui.stepStates).filter(s => s === 'done' || s === 'skipped').length;
+        setGlobalProgress({ done, total: STEP_TOTAL });
+        if (update.state === 'error') {
+          setStatusPill('error', `Erro no passo ${num} — clique pra detalhes`);
+        }
       }
     });
 
@@ -685,7 +941,12 @@
     });
 
     api.onManualPrompt && api.onManualPrompt(showManualPrompt);
-    api.onError        && api.onError(showErrorScreen);
+    api.onError        && api.onError((payload) => {
+      const meta = STEP_BY_ID[payload?.stepId] || {};
+      const num = String(meta.num ?? '?').padStart(2, '0');
+      setStatusPill('error', `Erro no passo ${num} — clique pra detalhes`);
+      showErrorScreen(payload);
+    });
 
     api.onComplete && api.onComplete((summary) => {
       // summary = { durationSeconds, sala3dInstalled }
@@ -693,6 +954,11 @@
         const m = Math.round(summary.durationSeconds / 60);
         $('#done-time-pill').textContent = `Levou ${m} min`;
       }
+      setStatusPill('success', 'Instalação concluída');
+      showGlobalProgress(false);
+      showLogPeek(false);
+      // limpa watchdogs
+      Object.keys(ui.waitTimers).forEach(clearStepWait);
       showScreen('done');
     });
 
@@ -753,6 +1019,8 @@
   // ───────────────────────────────────────────────────────────
   async function init() {
     renderStepList();
+    clearLogPeek();
+    setStatusPill('idle', 'Aguardando…');
     bindWelcome();
     bindPreflight();
     bindProgress();

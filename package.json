@@ -1,7 +1,7 @@
 {
   "name": "imp-installer",
   "productName": "IMP Squad \u2014 Instalador",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Instalador guiado da IMP Dev Squad (Windows zerado \u2192 squad rodando com 7 Claudes + interface).",
   "private": true,
   "main": "main.js",

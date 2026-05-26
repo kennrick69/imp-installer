@@ -22,6 +22,10 @@
         <span class="version" id="installer-version">v0.1.0</span>
       </div>
       <div class="topbar-actions">
+        <span class="status-pill" id="status-pill" data-state="idle" aria-live="polite" title="Estado atual do instalador">
+          <span class="sp-ico" aria-hidden="true"></span>
+          <span class="sp-text">Aguardando…</span>
+        </span>
         <button class="btn-mini" id="btn-open-logs" title="Ver logs detalhados (Ctrl+L)" aria-label="Abrir logs detalhados">
           Logs
         </button>
@@ -30,6 +34,19 @@
         </button>
       </div>
     </header>
+
+    <!-- =========================================================
+         BARRA DE PROGRESSO GLOBAL (sempre visível durante work)
+    ========================================================== -->
+    <div id="global-progress" class="hidden" aria-label="Progresso geral da instalação">
+      <div class="gp-label">
+        <span id="gp-text">Verificando ambiente…</span>
+        <span id="gp-count" class="gp-count">0/7</span>
+      </div>
+      <div class="gp-track">
+        <div class="gp-fill" id="gp-fill" style="width:0%"></div>
+      </div>
+    </div>
 
     <!-- =========================================================
          CONTAINER DAS TELAS
@@ -349,6 +366,20 @@
       </section>
 
     </main>
+
+    <!-- =========================================================
+         PAINEL DE LOG INLINE (peek — sempre visível em preflight/progress/manual)
+    ========================================================== -->
+    <aside id="log-peek" class="hidden" aria-label="Últimas atividades">
+      <header class="lp-head">
+        <span class="lp-dot" aria-hidden="true"></span>
+        <strong>Atividade</strong>
+        <span class="lp-hint" id="lp-hint">aguardando primeira mensagem…</span>
+        <span class="spacer"></span>
+        <button class="btn-mini" id="btn-log-peek-open" title="Ver logs completos">Ver tudo</button>
+      </header>
+      <div class="lp-body" id="lp-body" tabindex="0" aria-live="polite"></div>
+    </aside>
 
     <!-- =========================================================
          MODAL — INSTALAR SALA 3D

@@ -6,6 +6,25 @@ const { powershell } = require('./shell');
 const MIN_WIN_BUILD = 19041;
 const MIN_FREE_GB   = 5;
 
+// Default per-check timeout (ms). PowerShell checks geralmente terminam em
+// 1-5s, mas `Get-CimInstance Win32_Processor` pode travar 60s+ em PCs com
+// WMI ruim, e `wsl -l -v` em PC sem WSL instalado também pode demorar. 30s
+// dá feedback rápido pro user (e o check vira `ok:false, detail:'tempo esgotado'`).
+const DEFAULT_CHECK_TIMEOUT = 30_000;
+
+// timeoutCheck — Promise que rejeita após `ms` com mensagem padronizada.
+// Usada em Promise.race contra cada check pra cortar travas de PowerShell.
+function timeoutCheck(name, ms) {
+  return new Promise((_, reject) => {
+    setTimeout(() => {
+      const e = new Error(`timeout (${ms}ms)`);
+      e.code = 'CHECK_TIMEOUT';
+      e.checkName = name;
+      reject(e);
+    }, ms);
+  });
+}
+
 async function checkWindowsBuild() {
   const { stdout } = await powershell('[Environment]::OSVersion.Version.Build');
   const build = parseInt(stdout.trim(), 10);
@@ -76,6 +95,20 @@ async function checkVirtualization() {
 // (não vira default automaticamente, e nossos comandos `wsl -d Ubuntu-22.04` ficam
 // chumbados mas o usuário pode estranhar). Marca como warning (não-blocker).
 async function checkOtherDistros() {
+  // Fast path: se wsl.exe nem existe no PATH, NÃO chama `wsl -l -v` (pode demorar
+  // 30s+ pra retornar "not recognized" em PCs sem WSL instalado). Bruno onda 3.
+  try {
+    const probe = await powershell(
+      `if (Get-Command wsl.exe -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }`,
+      { timeout: 10_000 }
+    ).catch(() => ({ stdout: 'NO' }));
+    if (!/YES/i.test(probe.stdout || '')) {
+      return { name: 'other_distros', ok: true, value: 'no_wsl', detail: 'wsl.exe ainda não instalado (esperado antes do step 03)' };
+    }
+  } catch (_) {
+    return { name: 'other_distros', ok: true, value: 'probe_failed', detail: 'não consegui sondar wsl.exe — ignorando' };
+  }
+
   const script = `
     try {
       $out = wsl -l -v 2>&1 | Out-String
@@ -160,8 +193,13 @@ function normalizeCheck(name, raw) {
 // CONTRATO INVIOLÁVEL: SEMPRE retorna objeto com .results = Array<{name,ok,detail,warning?}>.
 // Nunca undefined, nunca null, nunca array vazio sem motivo. Cada check individual
 // pode falhar (throw, retornar undefined, retornar não-objeto) que normalizamos aqui.
+//
+// Bruno onda 3 (live-test #2): runAll agora chama `opts.onCheck(result)` PRA CADA
+// check assim que ele termina, em vez de só devolver o array no final. Sem isso,
+// a UI ficava 2+ minutos com tela vazia esperando todos os 7 checks
+// (Promise.allSettled = batch). Agora streaming: cada check normalizado vira
+// callback IMEDIATO + cada check tem timeout via Promise.race.
 async function runAll(opts = {}) {
-  const results = [];
   const fns = [
     checkWindowsBuild,
     checkAdmin,
@@ -171,41 +209,59 @@ async function runAll(opts = {}) {
     checkAntivirus,
     checkOtherDistros,
   ];
+  const timeoutMs = (opts && Number.isFinite(opts.timeoutMs)) ? opts.timeoutMs : DEFAULT_CHECK_TIMEOUT;
+  const onCheck = (opts && typeof opts.onCheck === 'function') ? opts.onCheck : null;
 
-  // Promise.allSettled em vez de Promise.all — uma reject não derruba o conjunto.
-  let settled;
+  // Cada check roda em paralelo (Promise.race contra timeoutCheck) e dispara
+  // onCheck assim que termina. Erros viram check com ok:false (não derruba batch).
+  const promises = fns.map(async (f) => {
+    const fnName = (f && f.name) || 'unknown';
+    try {
+      const raw = await Promise.race([
+        Promise.resolve().then(() => f()),
+        timeoutCheck(fnName, timeoutMs),
+      ]);
+      const norm = normalizeCheck(fnName, raw);
+      if (onCheck) {
+        try { onCheck(norm); } catch (_) { /* callback do consumidor não pode derrubar */ }
+      }
+      if (opts && opts.logger && typeof opts.logger.info === 'function') {
+        try { opts.logger.info('preflight', `${norm.name}: ${norm.detail}`); } catch (_) {}
+      }
+      return norm;
+    } catch (e) {
+      const reasonMsg = (e && e.message) || String(e || 'erro desconhecido');
+      const isTimeout = e && e.code === 'CHECK_TIMEOUT';
+      const errNorm = {
+        name: fnName,
+        ok: false,
+        warning: false,
+        detail: isTimeout ? `tempo esgotado (${timeoutMs}ms) — check travado` : `falhou: ${reasonMsg}`,
+      };
+      if (onCheck) {
+        try { onCheck(errNorm); } catch (_) {}
+      }
+      if (opts && opts.logger && typeof opts.logger.warn === 'function') {
+        try { opts.logger.warn('preflight', `${fnName}: ${errNorm.detail}`); } catch (_) {}
+      }
+      return errNorm;
+    }
+  });
+
+  // Promise.all aqui é seguro porque cada promise NUNCA rejeita (catch interno
+  // converte qualquer falha em objeto normalizado). Mantemos try/catch externo
+  // de defensiva pra cenário OOM/etc.
+  let results;
   try {
-    settled = await Promise.allSettled(fns.map(f => {
-      try { return Promise.resolve(f()); }
-      catch (e) { return Promise.reject(e); }
-    }));
+    results = await Promise.all(promises);
   } catch (e) {
-    // allSettled "nunca" rejeita, mas se algo MUITO inesperado acontecer
-    // (ex.: out-of-memory), preservamos o contrato e devolvemos objeto válido.
     return { ok: false, blocking: [], warnings: [], results: [
       { name: 'preflight_internal', ok: false, detail: `erro interno no runAll: ${(e && e.message) || e}` }
     ] };
   }
 
-  for (let i = 0; i < settled.length; i++) {
-    const r = settled[i];
-    const fnName = (fns[i] && fns[i].name) || `check_${i}`;
-    if (r.status === 'fulfilled') {
-      results.push(normalizeCheck(fnName, r.value));
-    } else {
-      const reasonMsg = (r.reason && r.reason.message) || String(r.reason || 'erro desconhecido');
-      results.push({ name: fnName, ok: false, detail: `falhou: ${reasonMsg}` });
-    }
-  }
-
   const blocking = results.filter(r => !r.ok && !r.warning);
   const warnings = results.filter(r => r.warning);
-  if (opts.logger && typeof opts.logger.info === 'function') {
-    for (const r of results) {
-      try { opts.logger.info('preflight', `${r.name}: ${r.detail}`); }
-      catch (_) { /* logger malformado não derruba preflight */ }
-    }
-  }
   return {
     ok: blocking.length === 0,
     blocking,
@@ -216,6 +272,8 @@ async function runAll(opts = {}) {
 
 module.exports = {
   runAll,
+  timeoutCheck,
+  normalizeCheck,
   checkWindowsBuild,
   checkAdmin,
   checkDiskSpace,
@@ -223,4 +281,5 @@ module.exports = {
   checkVirtualization,
   checkAntivirus,
   checkOtherDistros,
+  DEFAULT_CHECK_TIMEOUT,
 };

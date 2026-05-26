@@ -285,7 +285,11 @@ const step05AptBase = {
       if (e && /dpkg lock/.test(e.message)) throw e;
     }
 
-    const cmd = `DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl ca-certificates build-essential jq wget`;
+    // Bruno onda 3: log granular ANTES de cada operação demorada, pra UI ter
+    // sinal de "tá vivo" durante o apt (que pode demorar 2-5min).
+    ctx.logger.info('step_05', 'baixando lista de pacotes (apt-get update)...');
+    const cmd = `DEBIAN_FRONTEND=noninteractive apt-get update -y && (echo "[imp] update ok, instalando pacotes..." >&2) && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl ca-certificates build-essential jq wget`;
+    ctx.logger.info('step_05', 'pacotes a instalar: tmux git curl ca-certificates build-essential jq wget');
     await withRetry(
       () => sudoInWsl(cmd, {
         distro: ctx.state.distro,
@@ -296,6 +300,7 @@ const step05AptBase = {
       }),
       { label: 'apt install base', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
     );
+    ctx.logger.info('step_05', 'apt install concluído');
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -534,11 +539,14 @@ const step11CloneSquad = {
         fi
       fi
     `;
+    // Bruno onda 3: log granular pre-clone.
+    ctx.logger.info('step_11', 'clonando kennrick69/imp-squad em /mnt/c/Projetos/_squad...');
     try {
       await withRetry(
         () => wsl(cloneScript, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 300_000, logger: ctx.logger }),
         { label: 'clone imp-squad', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
       );
+      ctx.logger.info('step_11', 'clone _squad OK');
     } catch (e) {
       // Enriquece o erro do clone usando o catalog (4.6 do Eduardo + 7.1 da Patrícia).
       // Os padrões mais comuns: exit 128 (auth), exit 3 (sem fallback), 403, "could not read from remote".
@@ -569,11 +577,14 @@ const step12CloneOrchestrator = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
+    // Bruno onda 3: log granular pre-clone + pre-install.
+    ctx.logger.info('step_12', 'clonando kennrick69/imp-orchestrator em /mnt/c/Projetos/imp-orchestrator...');
     const script = `
       set -e
       mkdir -p /mnt/c/Projetos
       cd /mnt/c/Projetos
       if [ -d imp-orchestrator/.git ]; then
+        echo "[imp] orchestrator já existe — git pull --ff-only" >&2
         git -C imp-orchestrator pull --ff-only || true
       elif [ -d imp-orchestrator ]; then
         echo "[imp-orchestrator] existe sem .git — abortando" >&2; exit 2
@@ -582,12 +593,18 @@ const step12CloneOrchestrator = {
         touch imp-orchestrator/${FOLDER_MARKER}
       fi
       cd imp-orchestrator
-      [ -d node_modules ] || npm install --omit=dev
+      if [ -d node_modules ]; then
+        echo "[imp] node_modules existe — pulando npm install" >&2
+      else
+        echo "[imp] rodando npm install --omit=dev (pode demorar 1-3min)..." >&2
+        npm install --omit=dev
+      fi
     `;
     await withRetry(
       () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 600_000, logger: ctx.logger }),
       { label: 'clone+install orchestrator', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
     );
+    ctx.logger.info('step_12', 'orchestrator + npm install OK');
   },
   async validate(ctx) { return this.detect(ctx); },
 };

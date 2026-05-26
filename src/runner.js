@@ -191,6 +191,18 @@ async function runStep(stepId, events) {
   stateLib.setStepStatus(_ctx.state, step.id, 'running');
   _ctx.save();
 
+  // Bruno onda 3 (live-test #2): heartbeat a cada 5s enquanto step roda. Sem
+  // isso, steps que demoram >30s (clones, apt, npm install) deixavam a UI
+  // visualmente travada — user não sabia se tava processando ou pendurado.
+  // setInterval limpo no finally (sucesso, erro, ou throw).
+  const stepStart = Date.now();
+  const heartbeat = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - stepStart) / 1000);
+    try {
+      _ctx.logger.info(step.id, `(ainda processando — ${elapsed}s decorridos)`);
+    } catch (_) { /* logger malformado não derruba step */ }
+  }, 5000);
+
   // Bruno (live-test #1): garante que detect/execute/validate SEMPRE rodam dentro
   // de try/catch e convertem throws estranhos (string solta, null, número) em Error
   // proper, pra que `err.message` e `err.stderr` existam consistentemente.
@@ -216,20 +228,20 @@ async function runStep(stepId, events) {
   };
 
   try {
-    _ctx.logger.info(step.id, `detect ${step.title}`);
+    _ctx.logger.info(step.id, `1/3 detectando estado de "${step.title}"...`);
     const already = await safeCall('detect', () => step.detect(_ctx));
     if (already) {
       stateLib.setStepStatus(_ctx.state, step.id, 'skipped', { reason: 'detected' });
       _ctx.save();
       emitStepUpdate(_ctx, step, 'skipped', { reason: 'detected' });
-      _ctx.logger.info(step.id, 'já estava feito — skip');
+      _ctx.logger.info(step.id, 'já estava feito — pulando');
       return { id: step.id, status: 'skipped' };
     }
 
-    _ctx.logger.info(step.id, `execute ${step.title}`);
+    _ctx.logger.info(step.id, `2/3 executando "${step.title}" (pode demorar alguns minutos)...`);
     await safeCall('execute', () => step.execute(_ctx));
 
-    _ctx.logger.info(step.id, `validate ${step.title}`);
+    _ctx.logger.info(step.id, `3/3 validando resultado de "${step.title}"...`);
     const ok = await safeCall('validate', () => step.validate(_ctx));
     if (!ok) {
       throw new Error('validação pós-execução falhou');
@@ -238,7 +250,7 @@ async function runStep(stepId, events) {
     stateLib.setStepStatus(_ctx.state, step.id, 'done');
     _ctx.save();
     emitStepUpdate(_ctx, step, 'done');
-    _ctx.logger.info(step.id, 'done');
+    _ctx.logger.info(step.id, `done em ${Math.floor((Date.now() - stepStart) / 1000)}s`);
     return { id: step.id, status: 'done' };
 
   } catch (err) {
@@ -256,6 +268,9 @@ async function runStep(stepId, events) {
       } catch (_) {}
     }
     return { id: step.id, status: 'error', error: msg };
+  } finally {
+    // Heartbeat sempre limpo, mesmo em throw inesperado.
+    clearInterval(heartbeat);
   }
 }
 
