@@ -1,6 +1,6 @@
 'use strict';
 
-const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated } = require('./shell');
+const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated, wslExec } = require('./shell');
 const preflight = require('./preflight');
 const { enrichError } = require('./error-catalog');
 
@@ -95,28 +95,30 @@ async function wslInstallSupported(logger) {
 
   // Sinal 1 — `wsl --version`: SÓ existe em wsl moderno (>=0.64, 19041+).
   // Se retorna 0 e stdout menciona "WSL"/"kernel"/"distribu", é moderno.
+  // Bruno v0.2.12: wslExec direto (decode UTF-16 LE hard-coded) — antes
+  // powershell wrapper deixava mojibake mesmo com chcp 65001.
   try {
-    const r = await powershell(`chcp 65001 > $null; wsl --version 2>&1`, { timeout: 10_000 });
-    evidence.version = { code: r.code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
-    if (r.code === 0 && /WSL|kernel|distribu|vers[aã]o/i.test(r.stdout || '')) {
+    const r = await wslExec(['--version'], { timeout: 10_000, logger });
+    evidence.version = { code: r.exit_code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
+    if (r.exit_code === 0 && /WSL|kernel|distribu|vers[aã]o/i.test(r.stdout || '')) {
       if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --version OK, stdout=${(r.stdout || '').slice(0, 120).replace(/\s+/g, ' ')})`);
       return { supported: true, reason: 'wsl --version retornou ok', evidence };
     }
   } catch (e) {
-    evidence.version = { error: e.message, code: e.code };
+    evidence.version = { error: e.message };
   }
 
   // Sinal 2 — `wsl --help` com regex MAIS GENEROSA (pt-BR + en-US):
   // procura "--install" OU "instalar" OU "Install" como palavra/subcomando.
   try {
-    const r = await powershell(`chcp 65001 > $null; wsl --help 2>&1`, { timeout: 10_000 });
-    evidence.help = { code: r.code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
-    if (r.code === 0 && /--install\b|\binstall\b|\binstalar\b|\binstale\b/i.test(r.stdout || '')) {
+    const r = await wslExec(['--help'], { timeout: 10_000, logger });
+    evidence.help = { code: r.exit_code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
+    if (r.exit_code === 0 && /--install\b|\binstall\b|\binstalar\b|\binstale\b/i.test(r.stdout || '')) {
       if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --help menciona install/instalar)`);
       return { supported: true, reason: 'wsl --help menciona install', evidence };
     }
   } catch (e) {
-    evidence.help = { error: e.message, code: e.code };
+    evidence.help = { error: e.message };
   }
 
   // Sinal 3 — fallback BUILD do Windows. >=19041 = wsl --install moderno.
@@ -143,13 +145,64 @@ async function wslInstallSupported(logger) {
   return { supported: false, reason: 'nenhum sinal positivo', evidence };
 }
 
-// Helper: lista distros instaladas (UTF-16 LE decodada via shell.js).
+// Helper: lista distros instaladas. Usa wslExec direto (decode UTF-16 LE
+// hard-coded) em vez de PS wrapper que sofria mojibake mesmo com chcp 65001.
+// Mantém shape { stdout, stderr, code } pra não quebrar callers.
 async function wslListVerbose() {
-  try {
-    return await powershell(`chcp 65001 > $null; wsl -l -v 2>&1`, { timeout: 15_000 });
-  } catch (e) {
-    return { stdout: e.stdout || '', stderr: e.stderr || '', code: e.code || 1 };
+  const r = await wslExec(['-l', '-v'], { timeout: 15_000 });
+  return { stdout: r.stdout, stderr: r.stderr, code: r.exit_code };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// discoverUbuntuDistroName — lista distros DISPONÍVEIS via `wsl --list --online`
+// e escolhe o melhor candidato Ubuntu.
+//
+// Bruno v0.2.12 (live-test JOs em v0.2.11):
+// Em algumas instalações Win10 (especialmente pt-BR), o nome canônico
+// `Ubuntu-22.04` NÃO está disponível no catálogo online — wsl --install -d
+// retorna "Nome de distribuição inválido". Precisamos descobrir dinamicamente
+// quais nomes Ubuntu o `wsl.exe` deste host reconhece.
+//
+// Output típico de `wsl --list --online`:
+//   NAME            FRIENDLY NAME
+//   Ubuntu          Ubuntu
+//   Ubuntu-24.04    Ubuntu 24.04 LTS
+//   Ubuntu-22.04    Ubuntu 22.04 LTS
+//   ...
+//
+// Prioridade: 22.04 > 24.04 > 20.04 > Ubuntu (sem versão) > primeiro Ubuntu*.
+//
+// Retorna: string com NAME (ex: 'Ubuntu-22.04') ou null se não conseguiu listar
+// ou nenhum Ubuntu foi encontrado.
+async function discoverUbuntuDistroName(logger) {
+  const r = await wslExec(['--list', '--online'], { timeout: 15_000 });
+  if (r.exit_code !== 0) {
+    if (logger) logger.warn('discoverUbuntuDistroName',
+      `wsl --list --online falhou: exit=${r.exit_code} stderr=${(r.stderr || '').slice(0, 200)}`);
+    return null;
   }
+  const lines = (r.stdout || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  // Primeiro token de cada linha = NAME. Pega só linhas que começam com "Ubuntu".
+  const names = lines
+    .map(l => l.split(/\s+/)[0])
+    .filter(n => /^Ubuntu/i.test(n) && n !== 'NAME');
+  if (!names.length) {
+    if (logger) logger.warn('discoverUbuntuDistroName',
+      `nenhum Ubuntu no catálogo. stdout=${(r.stdout || '').slice(0, 400)}`);
+    return null;
+  }
+  const priority = ['Ubuntu-22.04', 'Ubuntu-24.04', 'Ubuntu-20.04', 'Ubuntu'];
+  for (const want of priority) {
+    const found = names.find(n => n.toLowerCase() === want.toLowerCase());
+    if (found) {
+      if (logger) logger.info('discoverUbuntuDistroName',
+        `escolhido por prioridade: ${found} (disponíveis: ${names.join(', ')})`);
+      return found;
+    }
+  }
+  if (logger) logger.info('discoverUbuntuDistroName',
+    `fallback primeiro Ubuntu*: ${names[0]} (disponíveis: ${names.join(', ')})`);
+  return names[0];
 }
 
 // Each executor exports: { id, title, description, category, detect, execute, validate, manualInstructions? }
@@ -243,12 +296,16 @@ async function _markRebootAndScheduleRunOnce(ctx, stepId) {
   }
 }
 
-// Compartilhado: detecta Ubuntu-22.04 instalado (qualquer um dos 3 steps
-// considera "feito" se isso é true, porque step_01 unificado já cuidou).
+// Compartilhado: detecta QUALQUER distro Ubuntu instalada (qualquer um dos 3
+// steps considera "feito" se isso é true, porque step_01 unificado já cuidou).
+//
+// Bruno v0.2.12: antes hardcodava `Ubuntu-22.04` — falhava quando o host só
+// tinha `Ubuntu` ou `Ubuntu-24.04`. Agora aceita qualquer NAME que comece com
+// "Ubuntu" (Ubuntu, Ubuntu-22.04, Ubuntu-24.04, etc.). Como a lista vem do
+// wslExec (UTF-16 LE decodado), regex casa limpa.
 async function _ubuntuInstalled() {
   const r = await wslListVerbose();
-  // decodeWslOutput em shell.js cobre o UTF-16 LE de wsl.exe (#A4).
-  return /Ubuntu-22\.04/i.test(r.stdout || '');
+  return /\bUbuntu(?:-\d+\.\d+)?\b/i.test(r.stdout || '');
 }
 
 // -------- step 01 — Install WSL2 + Ubuntu (unified, modern) ---------------
@@ -270,42 +327,70 @@ const step01EnableFeatures = {
     try {
       const r = await wslListVerbose();
       if (r.stdout && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(r.stdout)) {
-        ctx.logger.warn('step_01', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu-22.04 e setar como default.');
+        ctx.logger.warn('step_01', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu e setar como default.');
       }
     } catch (_) {}
 
-    // Caminho moderno: `wsl --install -d Ubuntu-22.04 --no-launch`.
+    // Caminho moderno: `wsl --install -d <distro> --no-launch`.
     // --no-launch evita Ubuntu GUI abrir no primeiro boot (step_04 cuida disso).
     //
-    // Bruno v0.2.11: wslInstallSupported() agora retorna {supported,reason,evidence}
+    // Bruno v0.2.11: wslInstallSupported() retorna {supported,reason,evidence}
     // pra logar exatamente por que decidiu moderno vs legacy.
     const decision = await wslInstallSupported(ctx.logger);
     ctx.logger.info('step_01', `wsl --install decision: ${decision.supported ? 'USAR_MODERNO' : 'USAR_LEGACY'} (motivo: ${decision.reason})`);
 
     if (decision.supported) {
-      ctx.logger.info('step_01', 'rodando: wsl --install -d Ubuntu-22.04 --no-launch');
+      // Bruno v0.2.12: descoberta DINÂMICA do nome de distro Ubuntu.
+      // Em v0.2.11 hardcodávamos `Ubuntu-22.04`, mas alguns hosts retornavam
+      // "Nome de distribuição inválido". Agora consultamos o catálogo online.
+      let distro = await discoverUbuntuDistroName(ctx.logger);
+      if (!distro) {
+        ctx.logger.warn('step_01',
+          'wsl --list --online falhou ou não retornou Ubuntu — tentando wsl --install sem -d (Ubuntu default do host).');
+        distro = null; // sinaliza pra rodar sem -d
+      } else {
+        ctx.logger.info('step_01', `distro Ubuntu detectada: ${distro}`);
+      }
+
+      // Persiste o nome ESCOLHIDO em ctx.state ANTES de instalar — assim, se
+      // der reboot e voltar, os steps 04+ já sabem qual distro usar.
+      const chosenDistro = distro || 'Ubuntu';
+      ctx.state.distro = chosenDistro;
+      ctx.state.ubuntuDistroName = chosenDistro;
+      ctx.save && ctx.save();
+
+      const installArgs = distro
+        ? ['--install', '-d', distro, '--no-launch']
+        : ['--install', '--no-launch'];
+
+      ctx.logger.info('step_01', `rodando: wsl ${installArgs.join(' ')}`);
+      // Bruno v0.2.12: usa wslExec direto (UTF-16 LE decode hard-coded) em vez
+      // de powershellVerbose que sofria mojibake mesmo com chcp 65001.
       const r = await withRetry(
-        () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
-        { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+        () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install' }),
+        { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger,
+          // wslExec NUNCA throw — sempre resolve com {exit_code,...}. Sinaliza
+          // retry só quando exit_code != 0 E não é "já instalado".
+          shouldRetry: () => true,
+        }
       );
 
-      // Bruno v0.2.11: parser ROBUSTO do output. Aceita sucesso em vários casos:
-      //   - exit 0 ou 3010 (canônicos)
+      // Bruno v0.2.12: parser ROBUSTO do output. Aceita sucesso em vários casos:
+      //   - exit_code 0 ou 3010 (canônicos)
       //   - stdout indica "já instalado" / "already installed"
       //   - stdout indica reboot needed → marca rebootRequired
-      // Loga o resultado completo pra debug futuro.
       const fullOut = ((r.stdout || '') + ' ' + (r.stderr || ''));
-      ctx.logger.info('step_01', `wsl --install resultado: code=${r.code} stdout=${(r.stdout || '').slice(0, 300).replace(/\s+/g, ' ')}`);
+      ctx.logger.info('step_01',
+        `wsl --install resultado: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 300).replace(/\s+/g, ' ')}`);
 
       const stdoutLower = fullOut.toLowerCase();
       const alreadyInstalled = /already installed|j[áa] (est[áa]|foi) instalad|already exists|j[áa] existe/i.test(fullOut);
-      const wantsReboot = r.rebootRequired
-        || r.code === 3010
+      const wantsReboot = r.exit_code === 3010
         || /restart|reinici|reboot/i.test(stdoutLower);
 
-      // Só falha se: code != 0/3010 E não há indicador de "já feito".
-      if (r.code !== 0 && r.code !== 3010 && !alreadyInstalled) {
-        throw new Error(`wsl --install falhou: code=${r.code} stdout=${(r.stdout || '').slice(0, 500)} stderr=${(r.stderr || '').slice(0, 300)}`);
+      // Só falha se: exit != 0/3010 E não há indicador de "já feito".
+      if (r.exit_code !== 0 && r.exit_code !== 3010 && !alreadyInstalled) {
+        throw new Error(`wsl --install falhou: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 500)} stderr=${(r.stderr || '').slice(0, 300)}`);
       }
 
       if (alreadyInstalled) {
@@ -316,9 +401,9 @@ const step01EnableFeatures = {
         ctx.logger.info('step_01', 'wsl --install OK — sem reboot necessário');
       }
 
-      // Força Ubuntu-22.04 como default (idempotente).
+      // Força a distro escolhida como default (idempotente). Usa wslExec.
       try {
-        await powershellVerbose(`wsl --set-default Ubuntu-22.04`).catch(() => {});
+        await wslExec(['--set-default', chosenDistro], { timeout: 30_000, logger: ctx.logger, label: 'set-default' });
       } catch (_) {}
 
       // Mesmo que wsl --install não tenha sinalizado reboot, é mais SEGURO
@@ -355,16 +440,33 @@ async function _executeLegacyDismFlow(ctx) {
     { timeout: 600_000 }
   );
   ctx.logger.info('step_01', 'fallback: wsl --set-default-version 2');
-  await powershellVerbose(`wsl --set-default-version 2`).catch(() => {
-    ctx.logger.warn('step_01', 'wsl --set-default-version 2 falhou — pode precisar reboot antes');
-  });
-  ctx.logger.info('step_01', 'fallback: wsl --install -d Ubuntu-22.04 --no-launch');
+  // wslExec direto (UTF-16 LE decodado) — antes powershellVerbose dava mojibake.
+  await wslExec(['--set-default-version', '2'], { timeout: 30_000, logger: ctx.logger, label: 'set-default-v2' })
+    .then(r => {
+      if (r.exit_code !== 0) {
+        ctx.logger.warn('step_01',
+          `wsl --set-default-version 2 falhou: exit=${r.exit_code} (pode precisar reboot antes)`);
+      }
+    });
+
+  // Bruno v0.2.12: descoberta dinâmica também no fallback legacy.
+  let distro = await discoverUbuntuDistroName(ctx.logger);
+  const chosen = distro || 'Ubuntu';
+  ctx.state.distro = chosen;
+  ctx.state.ubuntuDistroName = chosen;
+  ctx.save && ctx.save();
+
+  const installArgs = distro
+    ? ['--install', '-d', distro, '--no-launch']
+    : ['--install', '--no-launch'];
+
+  ctx.logger.info('step_01', `fallback: wsl ${installArgs.join(' ')}`);
   await withRetry(
-    () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
-    { label: 'wsl --install (legacy)', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+    () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install (legacy)' }),
+    { label: 'wsl --install (legacy)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
   );
   try {
-    await powershellVerbose(`wsl --set-default Ubuntu-22.04`).catch(() => {});
+    await wslExec(['--set-default', chosen], { timeout: 30_000, logger: ctx.logger, label: 'set-default-legacy' });
   } catch (_) {}
 }
 
@@ -380,21 +482,24 @@ const step02SetWslDefaultV2 = {
   async detect(ctx) {
     // Se reboot pendente, considera detectado (libera o caminho).
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Se Ubuntu-22.04 instalado, o `wsl --install` já setou default version 2.
+    // Se Ubuntu instalado, o `wsl --install` já setou default version 2.
     if (await _ubuntuInstalled()) return true;
     // Caso fluxo legacy (sem wsl --install), checa via wsl --status.
+    // Bruno v0.2.12: wslExec direto (UTF-16 LE decodado).
     try {
-      const { stdout } = await powershell(`chcp 65001 > $null; wsl --status 2>&1`);
-      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(stdout);
+      const r = await wslExec(['--status'], { timeout: 10_000 });
+      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(r.stdout || '');
     } catch (_) { return false; }
   },
   async execute(ctx) {
     // Defensiva: se detect retornou false (cenário raro de state corrompido),
     // roda set-default-version explícito.
     await requireAdminOrThrow();
-    await powershellVerbose(`wsl --set-default-version 2`).catch((e) => {
-      ctx.logger.warn('step_02', `set-default-version 2 falhou: ${e.message}`);
-    });
+    // Bruno v0.2.12: wslExec direto em vez de powershellVerbose.
+    const r = await wslExec(['--set-default-version', '2'], { timeout: 30_000, logger: ctx.logger });
+    if (r.exit_code !== 0) {
+      ctx.logger.warn('step_02', `set-default-version 2 falhou: exit=${r.exit_code} stderr=${(r.stderr || '').slice(0, 200)}`);
+    }
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -419,9 +524,18 @@ const step03WslInstall = {
     // se Ubuntu não tá instalado, tenta uma vez (raro: state corrompido).
     await requireAdminOrThrow();
     ctx.logger.warn('step_03', 'step_01 deveria ter instalado Ubuntu — rodando fallback');
+    // Bruno v0.2.12: descoberta dinâmica + wslExec.
+    let distro = await discoverUbuntuDistroName(ctx.logger);
+    const chosen = distro || 'Ubuntu';
+    ctx.state.distro = chosen;
+    ctx.state.ubuntuDistroName = chosen;
+    ctx.save && ctx.save();
+    const installArgs = distro
+      ? ['--install', '-d', distro, '--no-launch']
+      : ['--install', '--no-launch'];
     await withRetry(
-      () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
-      { label: 'wsl --install (step_03 fallback)', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+      () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install (step_03)' }),
+      { label: 'wsl --install (step_03 fallback)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
     );
     await _markRebootAndScheduleRunOnce(ctx, 'step_03');
   },

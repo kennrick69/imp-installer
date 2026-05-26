@@ -83,6 +83,88 @@ function execP(cmd, args, opts = {}) {
   });
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// wslExec — chamada DIRETA ao wsl.exe (sem PowerShell wrapper) com decode
+// hard-coded de UTF-16 LE no buffer cru.
+//
+// Bruno v0.2.12 (live-test JOs em v0.2.11):
+// Mesmo após `chcp 65001` na sessão PowerShell, o binário wsl.exe segue
+// emitindo stdout em UTF-16 LE — é como ele foi compilado. Quando passamos
+// `powershell -Command "wsl --install -d Ubuntu-22.04"`, o PS lê o stdout
+// do wsl como bytes brutos e re-emite, ainda em UTF-16 (mojibake garantido:
+// "distribuiýýo", "Parýmetro").
+//
+// Solução: spawn wsl.exe DIRETAMENTE (sem PS no meio), capturar Buffer cru
+// e decodificar como UTF-16 LE quando heurística detecta. Resultado: texto
+// limpo, regex de detecção funciona, mensagens de erro legíveis.
+//
+// Heurística de detecção: byte[1] === 0x00 → UTF-16 LE (caractere ASCII
+// em UTF-16 ocupa 2 bytes, sendo o segundo 0x00). Em saídas UTF-8 normais
+// o byte[1] raramente é zero.
+//
+// Retorna shape unificado: { exit_code, stdout, stderr } (snake_case proposital
+// pra distinguir do shape do execP que usa `code`).
+function wslExec(args, opts = {}) {
+  const { timeout = 30_000, env, logger, label } = opts;
+  const mergedEnv = { ...(process.env || {}), ...(env || {}), WSL_UTF8: '1' };
+  return new Promise((resolve) => {
+    if (logger) logger.debug('shell', `wslExec ${label || ''} wsl.exe ${(args || []).join(' ')}`);
+    let ps;
+    try {
+      ps = spawn('wsl.exe', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: mergedEnv,
+      });
+    } catch (err) {
+      return resolve({ exit_code: -1, stdout: '', stderr: `spawn falhou: ${err.message}` });
+    }
+
+    const stdoutBufs = [];
+    const stderrBufs = [];
+    ps.stdout.on('data', (b) => stdoutBufs.push(b));
+    ps.stderr.on('data', (b) => stderrBufs.push(b));
+
+    const to = setTimeout(() => {
+      try { ps.kill(); } catch (_) {}
+    }, timeout);
+
+    ps.on('error', (err) => {
+      clearTimeout(to);
+      resolve({ exit_code: -1, stdout: '', stderr: err.message });
+    });
+
+    ps.on('close', (code) => {
+      clearTimeout(to);
+      const rawOut = Buffer.concat(stdoutBufs);
+      const rawErr = Buffer.concat(stderrBufs);
+
+      // Detecta UTF-16 LE: byte 1 (e idealmente byte 3) === 0x00.
+      const isUtf16 = (buf) =>
+        buf.length >= 2 && buf[1] === 0x00 && (buf.length < 4 || buf[3] === 0x00);
+
+      const stripBom = (s) => (s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s);
+
+      const stdout = rawOut.length === 0
+        ? ''
+        : (isUtf16(rawOut) ? stripBom(rawOut.toString('utf16le')) : rawOut.toString('utf8'));
+      const stderr = rawErr.length === 0
+        ? ''
+        : (isUtf16(rawErr) ? stripBom(rawErr.toString('utf16le')) : rawErr.toString('utf8'));
+
+      if (logger) {
+        const preview = mask((stdout + (stderr ? '\n' + stderr : '')).slice(0, 400));
+        logger.debug('shell', `wslExec exit=${code} ${label || ''}: ${preview}`);
+      }
+      resolve({
+        exit_code: code,
+        stdout: (stdout || '').trim(),
+        stderr: (stderr || '').trim(),
+      });
+    });
+  });
+}
+
 // PowerShell wrapper. Runs with -NoProfile to avoid user profile side effects.
 // Injeta WSL_UTF8=1 (suportado em wsl.exe ≥ 0.64) — força saída UTF-8 plain
 // quando o script chamar `wsl --status`/`wsl -l -v` por dentro do PS. Defesa
@@ -422,4 +504,5 @@ module.exports = {
   decodeWslOutput,
   isElevated,
   relaunchAsAdmin,
+  wslExec,
 };
