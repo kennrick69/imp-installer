@@ -275,6 +275,21 @@ safeHandle('installer:start', async () => {
     message: `Verificação concluída — ${list.length} checks (${(pre.blocking || []).length} bloqueantes, ${(pre.warnings || []).length} avisos)`,
   });
 
+  // Bruno onda 4: se sobrou QUALQUER blocker, NÃO segue. Emite onError humano
+  // (com mensagem específica por check), retorna {ok:false, blocking:[...]}.
+  // UI tem que mostrar o erro e oferecer retry — não pode avançar pra step_01.
+  const blocking = Array.isArray(pre.blocking) ? pre.blocking : [];
+  if (blocking.length > 0) {
+    const payload = preflight.buildBlockingErrorPayload(blocking);
+    sendToRenderer('installer:onError', payload);
+    return {
+      ok: false,
+      blocking,
+      checks: list,
+      preflight: { ok: false, blocking, warnings: pre.warnings || [] },
+    };
+  }
+
   return { ok: true, checks: list, preflight: { ok: !!pre.ok, blocking: pre.blocking || [], warnings: pre.warnings || [] } };
 }, { stepId: 'step_00_preflight' });
 

@@ -292,38 +292,10 @@
       </section>
 
       <!-- ─────────────────────────────────────────────────────
-           TELA 5 — ERRO
+           TELA 5 — (substituída por #modal-error abaixo)
+           Bug 3 fix v0.2.3: erro virou modal sobreposto à tela atual
+           em vez de tela cheia separada — preserva contexto.
       ────────────────────────────────────────────────────── -->
-      <section class="screen" id="screen-error" aria-labelledby="error-title">
-        <div class="screen-inner error-wrap">
-          <div class="error-card">
-            <div class="error-icon" aria-hidden="true">!</div>
-            <h2 id="error-title">Ops, travei no passo <span id="error-step-num">?</span></h2>
-            <p class="error-headline" id="error-headline">
-              Algo não deu certo. Vou te explicar e a gente decide juntos o próximo passo.
-            </p>
-
-            <div class="error-detail">
-              <h4>O que aconteceu</h4>
-              <p id="error-what">—</p>
-            </div>
-
-            <div class="error-detail">
-              <h4>O que você pode tentar</h4>
-              <ul id="error-suggestions">
-                <li>Tentar de novo — às vezes é só rede instável.</li>
-              </ul>
-            </div>
-
-            <div class="error-actions">
-              <button class="btn-primary" id="btn-error-retry">Tentar de novo</button>
-              <button class="btn-ghost" id="btn-error-skip">Pular este passo</button>
-              <button class="btn-ghost" id="btn-error-logs">Ver logs detalhados</button>
-              <button class="btn-ghost" id="btn-error-help">Pedir ajuda</button>
-            </div>
-          </div>
-        </div>
-      </section>
 
       <!-- ─────────────────────────────────────────────────────
            TELA 6 — FINAL
@@ -495,6 +467,38 @@
         <footer>
           <button class="btn-ghost" id="btn-sudo-cancel">Cancelar</button>
           <button class="btn-primary" id="btn-sudo-confirm">Confirmar</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         MODAL — DETALHES DO ERRO (Bug 3 fix v0.2.3)
+         Sobrepõe à tela atual com qual check/step bloqueou, sugestões
+         e ações: Tentar de novo / Ignorar e continuar / Ver logs.
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-error" role="dialog" aria-modal="true" aria-labelledby="error-modal-title">
+      <div class="modal modal-error">
+        <header>
+          <h2 id="error-modal-title">Detalhes do problema</h2>
+          <button class="close" data-close-modal="modal-error" aria-label="Fechar">×</button>
+        </header>
+        <div class="body">
+          <div class="error-headline-box">
+            <span class="error-headline-ico" aria-hidden="true">!</span>
+            <div class="error-headline" id="error-headline-text">—</div>
+          </div>
+          <p class="error-what" id="error-what-text">—</p>
+          <h4 class="error-section-title">O que tentar</h4>
+          <ul class="error-suggestions" id="error-suggestions-list"></ul>
+          <details class="error-raw-wrap" hidden>
+            <summary>Detalhes técnicos (pro Claudio)</summary>
+            <pre class="error-raw" id="error-raw-pre"></pre>
+          </details>
+        </div>
+        <footer>
+          <button class="btn-ghost" id="btn-error-skip" hidden>Ignorar e continuar</button>
+          <button class="btn-ghost" id="btn-error-logs">Ver logs detalhados</button>
+          <button class="btn-primary" id="btn-error-retry">Tentar de novo</button>
         </footer>
       </div>
     </div>

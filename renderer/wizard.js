@@ -56,7 +56,9 @@
     activityTimer: null,
     waitTimers: Object.create(null),   // stepId/checkId → { soft, hard }
     pfWaitTimers: Object.create(null),
-    preflightRunning: false
+    preflightRunning: false,
+    // Bug 3 fix v0.2.3 — guarda último payload de erro pra status-pill re-abrir modal
+    lastErrorPayload: null
   };
 
   // Atalho pra API do main.js — defensivo (se rodar standalone, vira no-op)
@@ -263,7 +265,14 @@
   // ───────────────────────────────────────────────────────────
   // Logs
   // ───────────────────────────────────────────────────────────
-  function appendLog({ msg, level = 'info', stepId = null, ts = Date.now() }) {
+  function appendLog(entry = {}) {
+    // BUG 2 fix: aceita backend novo (message) e legacy (msg).
+    // Sempre normaliza pra .msg internamente pra refreshLogsModal continuar funcionando.
+    const msg     = (entry.message != null ? entry.message : entry.msg) || '';
+    const level   = entry.level   || 'info';
+    const stepId  = entry.stepId  || null;
+    const ts      = entry.ts      || Date.now();
+
     ui.logBuffer.push({ ts, level, stepId, msg });
     if (ui.logBuffer.length > 5000) ui.logBuffer.shift();
 
@@ -327,8 +336,10 @@
       const tag = STEP_BY_ID[e.stepId]
         ? `[${String(STEP_BY_ID[e.stepId].num).padStart(2,'0')}] `
         : '';
+      // BUG 2 fix: defensivo — se algum entry escapou sem normalizar, lê message OU msg
+      const text = (e.message != null ? e.message : e.msg) || '';
       pane.appendChild(el('div', { className: 'log-line log-' + e.level },
-        formatClock(e.ts) + '  ' + tag + e.msg));
+        formatClock(e.ts) + '  ' + tag + text));
     });
     pane.scrollTop = pane.scrollHeight;
   }
@@ -417,29 +428,64 @@
   }
 
   // ───────────────────────────────────────────────────────────
-  // Error screen
+  // Modal de erro (Bug 3 fix v0.2.3)
+  // payload backend = { stepId, headline, what, suggestions[], canRetry, canSkip, raw? }
+  // Cobre erros de preflight (blocking) E erros de step normais.
   // ───────────────────────────────────────────────────────────
-  function showErrorScreen(payload) {
-    // payload = { stepId, headline, what, suggestions: [string], canRetry, canSkip }
-    showScreen('error');
-    const meta = STEP_BY_ID[payload.stepId] || {};
-    $('#error-step-num').textContent = String(meta.num ?? '?').padStart(2, '0');
-    $('#error-headline').textContent = payload.headline || 'Algo não deu certo.';
-    $('#error-what').textContent     = payload.what     || '—';
+  function showErrorModal(payload = {}) {
+    const {
+      stepId = '',
+      headline,
+      what,
+      suggestions = [],
+      canRetry = true,
+      canSkip = false,
+      raw = ''
+    } = payload;
 
-    const ul = $('#error-suggestions');
-    ul.innerHTML = '';
-    (payload.suggestions && payload.suggestions.length
-      ? payload.suggestions
-      : ['Tentar de novo — às vezes é só rede instável.']
-    ).forEach(s => ul.appendChild(el('li', {}, s)));
+    const meta = STEP_BY_ID[stepId] || {};
+    const num = meta.num != null ? String(meta.num).padStart(2, '0') : null;
 
-    $('#btn-error-retry').disabled = payload.canRetry === false;
-    $('#btn-error-skip').disabled  = payload.canSkip  === false;
-    $('#screen-error').dataset.stepId = payload.stepId;
+    // Cabeçalho com fallback amigável
+    const headlineText = headline
+      || (num ? `Travei no passo ${num}` : 'Algo deu errado');
+    $('#error-headline-text').textContent = headlineText;
+    $('#error-what-text').textContent = what || '—';
 
-    setStepState(payload.stepId, 'error');
-    setConnection('err', 'Travado no passo ' + (meta.num ?? '?'));
+    // Sugestões — pelo menos uma sempre
+    const list = $('#error-suggestions-list');
+    list.innerHTML = '';
+    const items = (suggestions && suggestions.length)
+      ? suggestions
+      : ['Tentar de novo — às vezes é só rede instável.'];
+    items.forEach(s => list.appendChild(el('li', {}, s)));
+
+    // Detalhes técnicos só se houver raw
+    const rawWrap = $('.error-raw-wrap');
+    if (raw) {
+      $('#error-raw-pre').textContent = raw;
+      rawWrap.hidden = false;
+    } else {
+      $('#error-raw-pre').textContent = '';
+      rawWrap.hidden = true;
+    }
+
+    // Botões: skip só se canSkip, retry só se canRetry
+    $('#btn-error-skip').hidden  = !canSkip;
+    $('#btn-error-retry').hidden = !canRetry;
+    $('#btn-error-retry').dataset.stepId = stepId;
+    $('#btn-error-skip').dataset.stepId  = stepId;
+
+    // Guarda payload pra re-abrir via status pill
+    ui.lastErrorPayload = payload;
+
+    // Reflete estado no sidebar / connection pill (preserva tela atual)
+    if (stepId && STEP_BY_ID[stepId]) {
+      setStepState(stepId, 'error');
+    }
+    setConnection('err', num ? 'Travado no passo ' + num : 'Erro');
+
+    openModal('modal-error');
   }
 
   // ───────────────────────────────────────────────────────────
@@ -473,10 +519,17 @@
     // erro vira clicável (abre logs)
     pill.style.pointerEvents = state === 'error' ? 'auto' : 'none';
   }
-  // Click no status pill (quando erro): abre logs
+  // Click no status pill (quando erro): abre modal de detalhes do erro
+  // (Bug 3 fix v0.2.3) — antes abria modal de logs genérico.
   document.addEventListener('click', (e) => {
     const pill = e.target.closest('#status-pill');
-    if (pill && pill.dataset.state === 'error') openLogsModal();
+    if (!pill || pill.dataset.state !== 'error') return;
+    if (ui.lastErrorPayload) {
+      showErrorModal(ui.lastErrorPayload);
+    } else {
+      // fallback: sem payload guardado, ainda mostra logs
+      openLogsModal();
+    }
   });
 
   // Barra global no topo
@@ -783,28 +836,42 @@
   }
 
   // ───────────────────────────────────────────────────────────
-  // Error — bindings
+  // Modal de erro — bindings (Bug 3 fix v0.2.3)
   // ───────────────────────────────────────────────────────────
   function bindError() {
+    // Tentar de novo: retry step ou, se sem stepId (preflight), reinicia
     $('#btn-error-retry').addEventListener('click', async () => {
-      const stepId = $('#screen-error').dataset.stepId;
-      if (!stepId) return;
-      showScreen('progress');
+      const stepId = $('#btn-error-retry').dataset.stepId;
+      closeModal('modal-error');
       setConnection('ok');
-      try { await api.retry(stepId); }
-      catch (e) { toast('Retry falhou: ' + (e?.message || ''), 'error'); }
+      try {
+        if (stepId) {
+          await api.retry(stepId);
+        } else {
+          // erro de preflight sem stepId → reinicia o start()
+          await api.start();
+        }
+      } catch (e) {
+        toast('Retry falhou: ' + (e?.message || ''), 'error');
+      }
     });
-    $('#btn-error-skip').addEventListener('click', () => {
-      const stepId = $('#screen-error').dataset.stepId;
+    // Ignorar e continuar — só quando canSkip (botão escondido senão)
+    $('#btn-error-skip').addEventListener('click', async () => {
+      const stepId = $('#btn-error-skip').dataset.stepId;
+      closeModal('modal-error');
       if (!stepId) return;
-      ui.currentStepId = stepId;
-      $('#skip-reason').value = '';
-      openModal('modal-skip');
+      try {
+        await api.skip(stepId, 'usuário ignorou bloqueante');
+        setStepState(stepId, 'skipped');
+        toast('Passo ignorado. Cuidado com efeitos colaterais.', 'warn');
+      } catch (e) {
+        toast('Não consegui pular: ' + (e?.message || ''), 'error');
+      }
     });
-    $('#btn-error-logs').addEventListener('click', openLogsModal);
-    $('#btn-error-help').addEventListener('click', () => {
-      toast('Exportei os logs. Mande pro time.', 'info');
-      api.exportLogs && api.exportLogs();
+    // Ver logs detalhados — fecha este modal e abre o de logs
+    $('#btn-error-logs').addEventListener('click', () => {
+      closeModal('modal-error');
+      openLogsModal();
     });
   }
 
@@ -942,10 +1009,13 @@
 
     api.onManualPrompt && api.onManualPrompt(showManualPrompt);
     api.onError        && api.onError((payload) => {
+      // Cobre erro normal de step E erro de preflight (Bruno envia via mesmo canal)
       const meta = STEP_BY_ID[payload?.stepId] || {};
-      const num = String(meta.num ?? '?').padStart(2, '0');
-      setStatusPill('error', `Erro no passo ${num} — clique pra detalhes`);
-      showErrorScreen(payload);
+      const label = meta.num != null
+        ? `Erro no passo ${String(meta.num).padStart(2, '0')} — clique pra detalhes`
+        : 'Erro — clique pra detalhes';
+      setStatusPill('error', label);
+      showErrorModal(payload || {});
     });
 
     api.onComplete && api.onComplete((summary) => {
