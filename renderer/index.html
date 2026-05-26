@@ -49,6 +49,28 @@
     </div>
 
     <!-- =========================================================
+         ÁREA PRINCIPAL — sidebar persistente + container das telas
+         Camila v0.2.11: sidebar saiu de dentro do #screen-progress e
+         agora é PERSISTENTE em preflight/progress/manual/error.
+         Escondida no welcome e no done.
+    ========================================================== -->
+    <div id="main-area">
+
+    <!-- Sidebar global dos 17 passos -->
+    <aside id="step-sidebar" class="hidden" aria-label="Etapas da instalação">
+      <header class="sidebar-head">
+        <h3 id="progress-title">Etapas</h3>
+        <span class="step-counter"><span id="step-done-count">0</span>/<span id="step-total-count">17</span></span>
+      </header>
+      <div class="overall-progress" aria-label="Progresso total">
+        <div class="overall-bar"><div class="overall-fill" id="overall-fill" style="width:0%"></div></div>
+      </div>
+      <ol class="step-list" id="step-list" role="list">
+        <!-- Renderizado por JS — renderStepList() -->
+      </ol>
+    </aside>
+
+    <!-- =========================================================
          CONTAINER DAS TELAS
          Apenas uma .screen visível por vez (classe .active)
     ========================================================== -->
@@ -219,24 +241,10 @@
       <!-- ─────────────────────────────────────────────────────
            TELA 3 — PROGRESSO PRINCIPAL
       ────────────────────────────────────────────────────── -->
-      <section class="screen" id="screen-progress" aria-labelledby="progress-title">
+      <section class="screen" id="screen-progress" aria-labelledby="cur-step-title">
         <div class="progress-layout">
 
-          <!-- Sidebar com os 17 passos -->
-          <aside class="steps-sidebar" aria-label="Etapas da instalação">
-            <header class="sidebar-head">
-              <h3 id="progress-title">Etapas</h3>
-              <span class="step-counter"><span id="step-done-count">0</span>/<span id="step-total-count">17</span></span>
-            </header>
-            <div class="overall-progress" aria-label="Progresso total">
-              <div class="overall-bar"><div class="overall-fill" id="overall-fill" style="width:0%"></div></div>
-            </div>
-            <ol class="step-list" id="step-list" role="list">
-              <!-- Renderizado por JS — template guardado abaixo -->
-            </ol>
-          </aside>
-
-          <!-- Painel central -->
+          <!-- Painel central (sidebar foi extraída pra #step-sidebar global — Camila v0.2.11) -->
           <section class="step-detail" aria-live="polite">
             <header class="detail-head">
               <div class="detail-meta">
@@ -358,6 +366,8 @@
       </section>
 
     </main>
+
+    </div><!-- /#main-area -->
 
     <!-- =========================================================
          PAINEL DE LOG INLINE (peek — sempre visível em preflight/progress/manual)

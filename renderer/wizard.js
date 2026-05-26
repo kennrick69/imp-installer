@@ -195,6 +195,11 @@
     const node = $(`.step-item[data-step-id="${stepId}"]`);
     if (node) node.dataset.state = state;
     refreshCounter();
+    // Camila v0.2.11: quando um passo entra em running/manual/blocked,
+    // rola a sidebar pra que o passo atual fique sempre visível.
+    if (['running', 'manual', 'blocked_user_action', 'error'].includes(state)) {
+      scrollStepIntoView(stepId);
+    }
   }
 
   function refreshCounter() {
@@ -231,6 +236,8 @@
     } else {
       $('#step-eta').textContent = '—';
     }
+    // Camila v0.2.11: garante que o passo atual está visível na sidebar
+    scrollStepIntoView(stepId);
   }
 
   function describeStep(meta) {
@@ -639,6 +646,11 @@
   // Telas que devem mostrar a barra global + log peek
   const WORK_SCREENS = new Set(['preflight', 'progress', 'manual']);
 
+  // Telas em que a sidebar global dos 17 passos deve aparecer
+  // Camila v0.2.11: sidebar virou persistente — visível em preflight, progress,
+  // manual e error. Esconde só no welcome e no done.
+  const SIDEBAR_SCREENS = new Set(['preflight', 'progress', 'manual', 'error']);
+
   // Status pill (topbar) — estado global
   function setStatusPill(state, text) {
     const pill = $('#status-pill');
@@ -739,6 +751,28 @@
     const isWork = WORK_SCREENS.has(ui.currentScreen);
     showGlobalProgress(isWork);
     showLogPeek(isWork);
+    syncStepSidebar();
+  }
+
+  // Mostra/esconde a sidebar global dos 17 passos conforme tela atual.
+  // Camila v0.2.11: antes a sidebar vivia DENTRO de #screen-progress,
+  // então sumia em preflight/manual/error. Agora é global e persistente.
+  function syncStepSidebar() {
+    const sb = $('#step-sidebar');
+    if (!sb) return;
+    const show = SIDEBAR_SCREENS.has(ui.currentScreen);
+    sb.classList.toggle('hidden', !show);
+    if (show && ui.currentStepId) scrollStepIntoView(ui.currentStepId);
+  }
+
+  // Rola o passo atual pra dentro da viewport da sidebar (suave, sem
+  // mexer no scroll da página).
+  function scrollStepIntoView(stepId) {
+    const li = $(`.step-item[data-step-id="${stepId}"]`);
+    if (!li) return;
+    // scrollIntoView com block:'nearest' evita pular se já está visível
+    try { li.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+    catch { li.scrollIntoView(); }
   }
 
   // Marca TODOS os preflight cards como "running" — chamado ao entrar na tela

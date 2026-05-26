@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, screen } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -27,12 +27,21 @@ if (!gotLock) {
 let mainWindow = null;
 
 function createWindow() {
+  // BUG 3 v0.2.11: ready-to-show não confiável pra disparar maximize em portable.
+  // Estratégia belt-and-suspenders:
+  //  1. Cria janela JÁ no tamanho da workArea da tela primária (full screen size)
+  //  2. Maximize() chamado SINCRONAMENTE imediato + de novo no ready-to-show
+  //  3. show:true direto (sem esperar ready-to-show)
+  // Resultado: em qualquer caminho (boot normal, relaunch admin, RunOnce pós-reboot),
+  // a janela abre maximizada.
+  let workArea = { width: 1400, height: 900 };
+  try { workArea = screen.getPrimaryDisplay().workAreaSize; } catch (_) {}
+
   mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
+    width: workArea.width,
+    height: workArea.height,
     minWidth: 900,
     minHeight: 640,
-    show: false, // só exibe depois de maximize pra evitar flash
     backgroundColor: '#0E1015',
     title: PRODUCT,
     autoHideMenuBar: true,
@@ -44,10 +53,12 @@ function createWindow() {
     },
   });
   Menu.setApplicationMenu(null);
+  mainWindow.maximize(); // imediato
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   mainWindow.once('ready-to-show', () => {
-    mainWindow.maximize();
+    try { mainWindow.maximize(); } catch (_) {} // segundo tiro
     mainWindow.show();
+    mainWindow.focus();
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 }

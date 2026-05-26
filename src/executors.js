@@ -77,15 +77,70 @@ async function powershellVerbose(script, opts = {}) {
 }
 
 // Helper: detecta se `wsl --install` moderno está disponível neste Windows.
-// Win10 build 19041+ e Win11 têm. Retorna true se wsl.exe aceita --install.
-async function wslInstallSupported() {
+// Win10 build 19041+ (Win10 21H2) e Win11 têm.
+//
+// Bruno v0.2.11 (live-test JOs em v0.2.10): a versão anterior dependia 100% de
+// regex `/--install/i` sobre `wsl --help`. FALHOU em Win10 19045 pt-BR porque:
+//   1) wsl --help em pt-BR não cita o flag literal "--install" em toda linha;
+//   2) UTF-16 LE + chcp 65001 ainda assim deixa stdout com chars NUL ou texto
+//      traduzido que o regex inglês não casa.
+// Resultado: falso-negativo → fallback dism legacy → mojibake + exit 1.
+//
+// Estratégia v0.2.11: testa via MÚLTIPLOS sinais, retorna na primeira evidência
+// positiva. Loga o motivo da decisão pra debug.
+//
+// Retorna: { supported: boolean, reason: string, evidence: object }
+async function wslInstallSupported(logger) {
+  const evidence = {};
+
+  // Sinal 1 — `wsl --version`: SÓ existe em wsl moderno (>=0.64, 19041+).
+  // Se retorna 0 e stdout menciona "WSL"/"kernel"/"distribu", é moderno.
   try {
-    // `wsl --help` lista subcomandos. Se contém "--install" é a versão moderna.
-    const r = await powershell(`chcp 65001 > $null; wsl --help 2>&1`, { timeout: 15_000 });
-    return /--install/i.test(r.stdout || '');
-  } catch (_) {
-    return false;
+    const r = await powershell(`chcp 65001 > $null; wsl --version 2>&1`, { timeout: 10_000 });
+    evidence.version = { code: r.code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
+    if (r.code === 0 && /WSL|kernel|distribu|vers[aã]o/i.test(r.stdout || '')) {
+      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --version OK, stdout=${(r.stdout || '').slice(0, 120).replace(/\s+/g, ' ')})`);
+      return { supported: true, reason: 'wsl --version retornou ok', evidence };
+    }
+  } catch (e) {
+    evidence.version = { error: e.message, code: e.code };
   }
+
+  // Sinal 2 — `wsl --help` com regex MAIS GENEROSA (pt-BR + en-US):
+  // procura "--install" OU "instalar" OU "Install" como palavra/subcomando.
+  try {
+    const r = await powershell(`chcp 65001 > $null; wsl --help 2>&1`, { timeout: 10_000 });
+    evidence.help = { code: r.code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
+    if (r.code === 0 && /--install\b|\binstall\b|\binstalar\b|\binstale\b/i.test(r.stdout || '')) {
+      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --help menciona install/instalar)`);
+      return { supported: true, reason: 'wsl --help menciona install', evidence };
+    }
+  } catch (e) {
+    evidence.help = { error: e.message, code: e.code };
+  }
+
+  // Sinal 3 — fallback BUILD do Windows. >=19041 = wsl --install moderno.
+  // Win10 build 19045 (22H2 do JOs) > 19041 → MODERNO. Esse é o sinal mais
+  // confiável quando os 2 primeiros falham por encoding bizarro.
+  try {
+    const r = await powershell(`[Environment]::OSVersion.Version.Build`, { timeout: 5_000 });
+    const buildStr = (r.stdout || '').trim();
+    const build = parseInt(buildStr, 10);
+    evidence.build = { raw: buildStr, parsed: build, code: r.code };
+    if (Number.isFinite(build) && build >= 19041) {
+      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: build ${build} >= 19041)`);
+      return { supported: true, reason: `build ${build} >= 19041`, evidence };
+    }
+    if (Number.isFinite(build) && build < 19041) {
+      if (logger) logger.info('wslInstallSupported', `decisão: LEGACY (build ${build} < 19041)`);
+      return { supported: false, reason: `build ${build} < 19041`, evidence };
+    }
+  } catch (e) {
+    evidence.build = { error: e.message, code: e.code };
+  }
+
+  if (logger) logger.warn('wslInstallSupported', `decisão: LEGACY (nenhum sinal confirmou suporte) evidence=${JSON.stringify(evidence).slice(0, 400)}`);
+  return { supported: false, reason: 'nenhum sinal positivo', evidence };
 }
 
 // Helper: lista distros instaladas (UTF-16 LE decodada via shell.js).
@@ -221,23 +276,41 @@ const step01EnableFeatures = {
 
     // Caminho moderno: `wsl --install -d Ubuntu-22.04 --no-launch`.
     // --no-launch evita Ubuntu GUI abrir no primeiro boot (step_04 cuida disso).
-    const modern = await wslInstallSupported();
-    if (modern) {
+    //
+    // Bruno v0.2.11: wslInstallSupported() agora retorna {supported,reason,evidence}
+    // pra logar exatamente por que decidiu moderno vs legacy.
+    const decision = await wslInstallSupported(ctx.logger);
+    ctx.logger.info('step_01', `wsl --install decision: ${decision.supported ? 'USAR_MODERNO' : 'USAR_LEGACY'} (motivo: ${decision.reason})`);
+
+    if (decision.supported) {
       ctx.logger.info('step_01', 'rodando: wsl --install -d Ubuntu-22.04 --no-launch');
       const r = await withRetry(
         () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
         { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
       );
 
-      // 3010 vira r.rebootRequired=true (powershellVerbose trata).
-      // Mas wsl --install pode terminar com 0 e ainda assim sinalizar reboot
-      // no stdout ("restart your computer", "reinicie", etc.). Cobrimos ambos.
-      const stdoutLower = (r.stdout || '').toLowerCase();
+      // Bruno v0.2.11: parser ROBUSTO do output. Aceita sucesso em vários casos:
+      //   - exit 0 ou 3010 (canônicos)
+      //   - stdout indica "já instalado" / "already installed"
+      //   - stdout indica reboot needed → marca rebootRequired
+      // Loga o resultado completo pra debug futuro.
+      const fullOut = ((r.stdout || '') + ' ' + (r.stderr || ''));
+      ctx.logger.info('step_01', `wsl --install resultado: code=${r.code} stdout=${(r.stdout || '').slice(0, 300).replace(/\s+/g, ' ')}`);
+
+      const stdoutLower = fullOut.toLowerCase();
+      const alreadyInstalled = /already installed|j[áa] (est[áa]|foi) instalad|already exists|j[áa] existe/i.test(fullOut);
       const wantsReboot = r.rebootRequired
         || r.code === 3010
         || /restart|reinici|reboot/i.test(stdoutLower);
 
-      if (wantsReboot) {
+      // Só falha se: code != 0/3010 E não há indicador de "já feito".
+      if (r.code !== 0 && r.code !== 3010 && !alreadyInstalled) {
+        throw new Error(`wsl --install falhou: code=${r.code} stdout=${(r.stdout || '').slice(0, 500)} stderr=${(r.stderr || '').slice(0, 300)}`);
+      }
+
+      if (alreadyInstalled) {
+        ctx.logger.info('step_01', 'wsl --install OK — distro já estava instalada (idempotente)');
+      } else if (wantsReboot) {
         ctx.logger.info('step_01', 'wsl --install OK — reboot pendente');
       } else {
         ctx.logger.info('step_01', 'wsl --install OK — sem reboot necessário');
@@ -258,7 +331,7 @@ const step01EnableFeatures = {
 
     // PARTE D — Fallback: Windows antigo (build <19041, raro). Volta pro
     // método dism+wsl --set-default+wsl --install que era v0.2.8.
-    ctx.logger.warn('step_01', 'wsl --install não suportado neste Windows — usando fallback dism (legacy)');
+    ctx.logger.warn('step_01', `wsl --install não suportado (motivo: ${decision.reason}) — usando fallback dism (legacy)`);
     await _executeLegacyDismFlow(ctx);
     await _markRebootAndScheduleRunOnce(ctx, 'step_01');
   },
