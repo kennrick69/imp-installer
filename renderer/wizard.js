@@ -58,7 +58,9 @@
     pfWaitTimers: Object.create(null),
     preflightRunning: false,
     // Bug 3 fix v0.2.3 — guarda último payload de erro pra status-pill re-abrir modal
-    lastErrorPayload: null
+    lastErrorPayload: null,
+    // Bruno v0.2.4 — auto-advance de preflight { timer, origLabel }
+    preflightAdvance: null
   };
 
   // Atalho pra API do main.js — defensivo (se rodar standalone, vira no-op)
@@ -378,12 +380,15 @@
          : state === 'running' ? 'Verificando agora…'
                                : 'Verificando…';
   }
-  function evaluatePreflightGate() {
+  function evaluatePreflightGate({ force = false } = {}) {
+    // Fix Eduardo/Patrícia: se countdown ativo, NÃO mexe no botão
+    // (onPreflight atrasado podia re-disabilitar e quebrar o flow).
+    if (ui.preflightAdvance && ui.preflightAdvance.timer) return;
     const cards  = $$('.pf-card');
     const states = cards.map(c => c.dataset.state);
-    const pending = states.some(s => s === 'pending');
+    const pending = states.some(s => s === 'pending' || s === 'running');
     const hasErr  = states.some(s => s === 'err');
-    const allDone = !pending;
+    const allDone = force || !pending;
     $('#btn-preflight-next').disabled = !allDone || hasErr;
   }
 
@@ -478,6 +483,9 @@
 
     // Guarda payload pra re-abrir via status pill
     ui.lastErrorPayload = payload;
+
+    // Erro aberto cancela qualquer auto-advance de preflight em curso
+    cancelPreflightAdvance();
 
     // Reflete estado no sidebar / connection pill (preserva tela atual)
     if (stepId && STEP_BY_ID[stepId]) {
@@ -692,6 +700,158 @@
   }
 
   // ───────────────────────────────────────────────────────────
+  // Preflight flow + auto-advance (Bruno v0.2.4 — fix tela travada)
+  // CAUSA RAIZ v0.2.3: evaluatePreflightGate() era chamada só dentro de
+  // setPreflightResult(); se algum card não recebia onPreflight (race ou
+  // check ausente), ficava 'pending'/'running' pra sempre e o botão
+  // #btn-preflight-next nunca habilitava. Agora usamos o return de
+  // api.start() como FONTE DA VERDADE: se ok===true, libera o gate
+  // mesmo que UI tenha card travado, mostra countdown 3s e auto-advance.
+  // ───────────────────────────────────────────────────────────
+  async function runPreflightFlow() {
+    ui.startedAt = Date.now();
+    ui.preflightRunning = false;
+    cancelPreflightAdvance(); // limpa qualquer timer pendente de tentativa anterior
+    showScreen('preflight');
+    setStatusPill('working', 'Iniciando verificações…');
+    setGlobalProgress({ text: 'Iniciando verificações…', done: 0, total: 7 });
+    clearLogPeek();
+    // Safety net: se backend não emitir nada em 200ms, marca todos cards como running
+    setTimeout(() => startPreflightRunning(), 200);
+    try {
+      const res = await api.start();
+      // Backend retorna {ok, checks, preflight:{ok,blocking,warnings}}.
+      // ok===false significa que onError já foi emitido com modal — só atualiza pill e sai.
+      if (res && res.ok === false) {
+        setStatusPill('error', 'Verificação detectou bloqueantes — clique pra detalhes');
+        return;
+      }
+      // ok===true → preflight passou (0 blockers). Agenda auto-advance.
+      schedulePreflightAdvance(res && res.preflight);
+    } catch (e) {
+      toast('Não consegui iniciar a instalação. ' + (e?.message || ''), 'error');
+      setStatusPill('error', 'Falhou ao iniciar — clique pra detalhes');
+    }
+  }
+
+  // Schedule countdown 3s + auto-advance. JOs pode clicar pra adiantar
+  // ou navegar/recheck pra cancelar.
+  function schedulePreflightAdvance(preflightResult) {
+    renderPreflightWarnings(preflightResult); // Camila — BUG 1 v0.2.4: painel visível de avisos
+    cancelPreflightAdvance();
+    evaluatePreflightGate({ force: true }); // backend confirmou ok — libera botão já
+    const warnings = (preflightResult && preflightResult.warnings || []).length;
+    const baseLabel = warnings > 0
+      ? `Ambiente pronto com ${warnings} aviso(s). Avançando em 3s…`
+      : 'Ambiente pronto! Avançando em 3s…';
+    toast(baseLabel, 'info', 3500);
+    setStatusPill('success', warnings > 0 ? `Ambiente pronto (${warnings} aviso)` : 'Ambiente pronto');
+
+    const btn = $('#btn-preflight-next');
+    if (!btn) return;
+    if (!ui.preflightAdvance) ui.preflightAdvance = {};
+
+    // Fix Eduardo: hint do footer + data-state countdown + aria-live
+    const hint = $('#preflight-footer-hint');
+    const hintText = $('#preflight-footer-hint-text');
+    if (hint && hintText) {
+      hint.hidden = false;
+      hint.dataset.tone = warnings > 0 ? 'warn' : 'ok';
+      hintText.textContent = warnings > 0
+        ? `${warnings} aviso${warnings > 1 ? 's' : ''} — instalador resolve no caminho. Pode continuar.`
+        : 'Ambiente pronto. Quando quiser, avança pra instalação.';
+    }
+    btn.dataset.state = 'countdown';
+    btn.setAttribute('aria-live', 'polite');
+
+    // Label: usa span filho se existir (não destrói estrutura interna)
+    const labelEl = $('#btn-preflight-next-label') || btn;
+    ui.preflightAdvance.origLabel = labelEl.textContent || 'Avançar →';
+    btn.disabled = false;
+    let count = 3;
+    labelEl.textContent = `Continuar agora (${count})`;
+    const iv = setInterval(() => {
+      count--;
+      if (count <= 0) {
+        cancelPreflightAdvance({ keepBtnLabel: false });
+        advanceToProgress();
+      } else {
+        labelEl.textContent = `Continuar agora (${count})`;
+      }
+    }, 1000);
+    ui.preflightAdvance.timer = iv;
+  }
+
+  function cancelPreflightAdvance({ keepBtnLabel = true, keepWarnings = true } = {}) {
+    const adv = ui.preflightAdvance;
+    if (!adv) return;
+    if (adv.timer) { clearInterval(adv.timer); adv.timer = null; }
+    if (keepBtnLabel && adv.origLabel) {
+      const labelEl = $('#btn-preflight-next-label') || $('#btn-preflight-next');
+      if (labelEl) labelEl.textContent = adv.origLabel;
+    }
+    const btn = $('#btn-preflight-next');
+    if (btn) btn.dataset.state = 'waiting';
+    const hint = $('#preflight-footer-hint');
+    if (hint && !keepWarnings) hint.hidden = true;
+    if (!keepWarnings) clearPreflightWarnings();
+  }
+
+  // Camila — BUG 1 v0.2.4: painel de avisos visível na tela preflight
+  function renderPreflightWarnings(checks) {
+    const panel = $('#preflight-warnings');
+    const list = $('#pw-list');
+    const count = $('#pw-count');
+    if (!panel || !list) return;
+    const warnings = (checks && checks.warnings) || [];
+    if (warnings.length === 0) {
+      panel.hidden = true;
+      list.innerHTML = '';
+      return;
+    }
+    if (count) count.textContent = String(warnings.length);
+    list.innerHTML = '';
+    // Mapa: name → {title amigável, resolução}
+    const FRIENDLY = {
+      admin:          { title: 'Sem privilégio de administrador', resolve: 'Vou pedir UAC quando precisar (Passo 1)' },
+      virtualization: { title: 'Virtualização não detectada no firmware', resolve: 'Se falhar no Passo 3, abro o que fazer na BIOS' },
+      antivirus:      { title: 'Antivírus de terceiros detectado', resolve: 'Vou seguir; se algo bloquear, te aviso' },
+      other_distros:  { title: 'Estado do WSL incerto', resolve: 'Vou instalar/ajustar Ubuntu 22.04 no Passo 3' }
+    };
+    warnings.forEach(w => {
+      const meta = FRIENDLY[w.name] || { title: w.name, resolve: 'Vou tratar durante a instalação' };
+      const li = el('li', { className: 'pw-item' },
+        el('span', { className: 'pw-item-ico' }, '⚠'),
+        el('div', { className: 'pw-item-body' },
+          el('span', { className: 'pw-item-title' }, meta.title),
+          el('span', { className: 'pw-item-detail' }, w.detail || ''),
+          el('span', { className: 'pw-item-resolve' }, '→ ' + meta.resolve)
+        )
+      );
+      list.appendChild(li);
+    });
+    panel.hidden = false;
+  }
+
+  function clearPreflightWarnings() {
+    const panel = $('#preflight-warnings');
+    if (panel) panel.hidden = true;
+    const list = $('#pw-list');
+    if (list) list.innerHTML = '';
+  }
+
+  function advanceToProgress() {
+    cancelPreflightAdvance({ keepBtnLabel: false });
+    showScreen('progress');
+    // Dispara os 17 passos (backend fire-and-forget, eventos vêm via onStepUpdate/onLog)
+    try {
+      if (api.runAll) api.runAll();
+    } catch (e) {
+      toast('Não consegui iniciar os passos: ' + (e?.message || ''), 'error');
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────
   // Boas-vindas — bindings
   // ───────────────────────────────────────────────────────────
   function bindWelcome() {
@@ -700,23 +860,7 @@
     consent.addEventListener('change', () => {
       startBtn.disabled = !consent.checked;
     });
-    startBtn.addEventListener('click', async () => {
-      ui.startedAt = Date.now();
-      ui.preflightRunning = false;
-      showScreen('preflight');
-      // feedback IMEDIATO — não esperar evento backend pra parar de parecer travado
-      setStatusPill('working', 'Iniciando verificações…');
-      setGlobalProgress({ text: 'Iniciando verificações…', done: 0, total: 7 });
-      clearLogPeek();
-      // Safety net: se backend não emitir nada em 200ms, marca todos cards como running
-      setTimeout(() => startPreflightRunning(), 200);
-      try {
-        await api.start();
-      } catch (e) {
-        toast('Não consegui iniciar a instalação. ' + (e?.message || ''), 'error');
-        setStatusPill('error', 'Falhou ao iniciar — clique pra detalhes');
-      }
-    });
+    startBtn.addEventListener('click', () => runPreflightFlow());
     $('#btn-cancel-welcome').addEventListener('click', () => {
       if (api.closeApp) api.closeApp();
       else window.close();
@@ -742,6 +886,7 @@
   // ───────────────────────────────────────────────────────────
   function bindPreflight() {
     $('#btn-preflight-recheck').addEventListener('click', async () => {
+      cancelPreflightAdvance({ keepWarnings: false }); // user pediu recheck — cancela auto-advance e limpa painel
       ui.preflightRunning = false;
       $$('.pf-card').forEach(c => {
         c.classList.remove('long-wait', 'very-long-wait');
@@ -751,14 +896,20 @@
       setStatusPill('working', 'Re-verificando ambiente…');
       setGlobalProgress({ text: 'Re-verificando ambiente…', done: 0, total: 7 });
       setTimeout(() => startPreflightRunning(), 200);
-      try { await api.runStep('step_00_preflight'); }
-      catch (e) {
+      try {
+        const res = await api.runStep('step_00_preflight');
+        // runStep também retorna ok=true se passou — re-agenda auto-advance.
+        if (res && res.ok !== false) {
+          schedulePreflightAdvance(res && res.preflight);
+        }
+      } catch (e) {
         toast('Erro no preflight: ' + (e?.message || ''), 'error');
         setStatusPill('error', 'Erro no preflight — clique pra detalhes');
       }
     });
     $('#btn-preflight-next').addEventListener('click', () => {
-      showScreen('progress');
+      // Click manual: cancela timer e avança imediato.
+      advanceToProgress();
     });
   }
 

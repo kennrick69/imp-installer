@@ -189,9 +189,29 @@
             </li>
           </ul>
 
+          <!-- Painel de avisos consolidado (Camila — BUG 1 v0.2.4) -->
+          <aside class="preflight-warnings" id="preflight-warnings" hidden aria-live="polite" aria-label="Avisos da verificação">
+            <header class="pw-header">
+              <span class="pw-ico" aria-hidden="true">⚠</span>
+              <h3 id="pw-title">Avisos da verificação</h3>
+              <span class="pw-count" id="pw-count">0</span>
+            </header>
+            <p class="pw-intro">
+              Nenhum desses avisos impede a instalação — eu resolvo no caminho.
+              Estão aqui só pra você saber o que vai acontecer.
+            </p>
+            <ul class="pw-list" id="pw-list" role="list"></ul>
+          </aside>
+
           <div class="preflight-foot">
             <button class="btn-ghost" id="btn-preflight-recheck">Conferir de novo</button>
-            <button class="btn-primary" id="btn-preflight-next" disabled>Avançar →</button>
+            <div class="preflight-footer-hint" id="preflight-footer-hint" hidden>
+              <span class="pf-hint-ico" aria-hidden="true">✓</span>
+              <span id="preflight-footer-hint-text">Ambiente pronto. Quando quiser, avança pra instalação.</span>
+            </div>
+            <button class="btn-primary btn-large" id="btn-preflight-next" data-state="waiting" aria-describedby="preflight-footer-hint" disabled>
+              <span id="btn-preflight-next-label">Avançar →</span>
+            </button>
           </div>
         </div>
       </section>

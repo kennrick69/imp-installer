@@ -627,9 +627,181 @@ body {
 .pf-card[data-state="warn"] .pf-status { color: var(--warn); }
 .pf-card[data-state="err"]  .pf-status { color: var(--err); }
 
+/* Painel de avisos pós-preflight (Camila — BUG 1 v0.2.4) */
+.preflight-warnings {
+  margin: 16px 0;
+  padding: 16px 18px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.30);
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  animation: slideIn 0.3s ease-out;
+}
+
+.preflight-warnings .pw-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.preflight-warnings .pw-ico {
+  font-size: 1.3em;
+  color: #f59e0b;
+}
+
+.preflight-warnings .pw-header h3 {
+  margin: 0;
+  font-size: 1.05em;
+  font-weight: 600;
+  color: #fbbf24;
+  flex: 1;
+}
+
+.preflight-warnings .pw-count {
+  background: rgba(245, 158, 11, 0.25);
+  color: #fbbf24;
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.preflight-warnings .pw-intro {
+  margin: 0 0 12px 0;
+  color: var(--text-secondary, #a3b3c2);
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+
+.preflight-warnings .pw-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preflight-warnings .pw-item {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(245, 158, 11, 0.06);
+  border-radius: 6px;
+  border-left: 3px solid rgba(245, 158, 11, 0.55);
+  align-items: flex-start;
+}
+
+.preflight-warnings .pw-item .pw-item-ico {
+  color: #f59e0b;
+  font-weight: 700;
+  flex-shrink: 0;
+  min-width: 18px;
+}
+
+.preflight-warnings .pw-item .pw-item-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.preflight-warnings .pw-item .pw-item-title {
+  font-weight: 600;
+  color: var(--text, #e2e8f0);
+  font-size: 0.95em;
+}
+
+.preflight-warnings .pw-item .pw-item-detail {
+  font-size: 0.88em;
+  color: var(--text-secondary, #94a3b8);
+  line-height: 1.4;
+}
+
+.preflight-warnings .pw-item .pw-item-resolve {
+  font-size: 0.85em;
+  color: #14b8a6;
+  font-style: italic;
+  margin-top: 2px;
+}
+
 .preflight-foot {
-  display: flex; justify-content: space-between; gap: 10px;
-  margin-top: 8px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 16px;
+  padding: 16px 0 14px 0;
+  position: sticky;
+  bottom: 0;
+  background: linear-gradient(180deg, rgba(14, 16, 21, 0) 0%, var(--bg-dark) 45%, var(--bg-dark) 100%);
+  z-index: 10;
+}
+
+/* Ordem: [recheck] [hint expansível] [botão avançar] */
+.preflight-foot #btn-preflight-recheck { flex: 0 0 auto; }
+.preflight-foot .preflight-footer-hint { flex: 1 1 auto; }
+.preflight-foot #btn-preflight-next    { flex: 0 0 auto; }
+
+/* Botão SEMPRE visível — mesmo disabled — mas estado pulsa quando habilita */
+#btn-preflight-next {
+  min-width: 200px;
+  font-size: 1.05em;
+  font-weight: 600;
+  transition: background 0.25s ease, box-shadow 0.25s ease, filter 0.25s ease, opacity 0.25s ease;
+}
+
+#btn-preflight-next:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.5);
+  animation: none;
+}
+
+#btn-preflight-next:not(:disabled) {
+  background: linear-gradient(135deg, #0D9488 0%, #14B8A6 100%);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(13, 148, 136, 0.35);
+  animation: pulse-ready 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-ready {
+  0%, 100% { box-shadow: 0 4px 20px rgba(13, 148, 136, 0.35); transform: translateY(0); }
+  50%      { box-shadow: 0 4px 28px rgba(13, 148, 136, 0.55); transform: translateY(-1px); }
+}
+
+/* Variante countdown (Bruno seta data-state="countdown") */
+#btn-preflight-next[data-state="countdown"]:not(:disabled) {
+  background: linear-gradient(135deg, #F59E0B 0%, #FBBF24 100%);
+  box-shadow: 0 4px 24px rgba(245, 158, 11, 0.45);
+  color: #1a1208;
+}
+
+/* Hint que aparece quando ambiente fica pronto */
+.preflight-footer-hint {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ok);
+  font-size: 0.95em;
+  padding: 8px 12px;
+  background: rgba(16, 185, 129, 0.08);
+  border-left: 3px solid var(--ok);
+  border-radius: 4px;
+  line-height: 1.35;
+}
+.preflight-footer-hint[hidden] { display: none; }
+.preflight-footer-hint .pf-hint-ico {
+  font-weight: 700;
+  font-size: 1.1em;
+  flex: 0 0 auto;
+}
+
+/* Variante warning (ex: 0 blockers + 2 warnings) */
+.preflight-footer-hint[data-tone="warn"] {
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.08);
+  border-left-color: var(--warn);
 }
 
 /* ════════════════════════════════════════════════════════════
