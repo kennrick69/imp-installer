@@ -72,6 +72,49 @@ async function checkVirtualization() {
   };
 }
 
+// §1.7 — outra distro WSL como default pode atrapalhar `wsl --install -d Ubuntu-22.04`
+// (não vira default automaticamente, e nossos comandos `wsl -d Ubuntu-22.04` ficam
+// chumbados mas o usuário pode estranhar). Marca como warning (não-blocker).
+async function checkOtherDistros() {
+  const script = `
+    try {
+      $out = wsl -l -v 2>&1 | Out-String
+      $out
+    } catch { '' }
+  `;
+  try {
+    const { stdout } = await powershell(script);
+    const text = stdout || '';
+    // wsl -l -v não instalado / sem distros → não tem outra distro pra atrapalhar.
+    if (!text || /no installed distributions/i.test(text) || /not recognized/i.test(text)) {
+      return { name: 'other_distros', ok: true, value: 'none', detail: 'nenhuma distro WSL instalada (esperado)' };
+    }
+    // Procura linha começando com `*` (default) seguida de nome não-Ubuntu.
+    const lines = text.split(/\r?\n/);
+    let defaultName = null;
+    for (const ln of lines) {
+      // Formato típico: `* Ubuntu-22.04    Running   2`
+      const m = ln.match(/^\s*\*\s+(\S+)/);
+      if (m) { defaultName = m[1]; break; }
+    }
+    if (!defaultName) {
+      return { name: 'other_distros', ok: true, value: 'unknown', detail: 'não consegui parsear wsl -l -v' };
+    }
+    const isUbuntu = /^Ubuntu/i.test(defaultName);
+    return {
+      name: 'other_distros',
+      ok: isUbuntu,
+      value: defaultName,
+      warning: !isUbuntu,
+      detail: isUbuntu
+        ? `default distro = ${defaultName} (ok)`
+        : `default distro = ${defaultName} (não-Ubuntu) — o instalador vai forçar Ubuntu-22.04 como default depois de instalar`,
+    };
+  } catch (_) {
+    return { name: 'other_distros', ok: true, value: 'error', detail: 'check de outras distros falhou (ignorável)' };
+  }
+}
+
 async function checkAntivirus() {
   // Just inform; we don't block. AntiVirusProduct on Win10/11.
   const script = `
@@ -101,6 +144,7 @@ async function runAll(opts = {}) {
     checkInternet,
     checkVirtualization,
     checkAntivirus,
+    checkOtherDistros,
   ];
   const settled = await Promise.allSettled(fns.map(f => f()));
   for (let i = 0; i < settled.length; i++) {
@@ -131,4 +175,5 @@ module.exports = {
   checkInternet,
   checkVirtualization,
   checkAntivirus,
+  checkOtherDistros,
 };

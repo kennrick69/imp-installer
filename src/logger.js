@@ -17,6 +17,12 @@ const SECRET_PATTERNS = [
   { re: /sk-ant-[A-Za-z0-9\-_]{20,}/g,     mask: 'sk-ant-****' },
   // bearer
   { re: /(Bearer\s+)[A-Za-z0-9_\-.]{16,}/gi, mask: '$1****' },
+  // env-var-form tokens (logs de export/echo) — Eduardo 4.7
+  { re: /(ANTHROPIC_API_KEY\s*=\s*["']?)[^\s"']+/gi, mask: '$1****' },
+  { re: /(GH_TOKEN\s*=\s*["']?)[^\s"']+/gi,          mask: '$1****' },
+  { re: /(GITHUB_TOKEN\s*=\s*["']?)[^\s"']+/gi,      mask: '$1****' },
+  // Slack bot tokens — by precaution se algum dia logarmos.
+  { re: /xoxb-[A-Za-z0-9\-]{10,}/g,                  mask: 'xoxb-****' },
   // url-embedded credential (https://user:token@host)
   { re: /(https?:\/\/[^:\s\/]+:)([^@\s]+)(@)/g, mask: '$1****$3' },
 ];

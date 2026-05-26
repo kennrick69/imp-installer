@@ -7,6 +7,39 @@ const { mask } = require('./logger');
 const DEFAULT_TIMEOUT = 120_000;
 const DEFAULT_MAXBUF  = 50_000_000;
 
+// --------- UTF-16LE mojibake fix for wsl.exe output (Patrícia #A4) ----------
+// wsl.exe (legacy paths sem WSL_UTF8=1) emite stdout em UTF-16 LE; Node lê isso
+// como string latin1/utf8 e a regex `/Default Version:\s*2/` nunca matcha
+// porque cada char vem intercalado com \x00.
+// Esta função detecta heuristicamente saídas com null bytes interleaved e
+// re-decodifica como UTF-16 LE. Em saídas normais (UTF-8), passa direto.
+function decodeWslOutput(buf) {
+  if (buf == null) return '';
+  // Caso 1: Buffer cru com null bytes nos índices ímpares (UTF-16 LE clássico).
+  if (Buffer.isBuffer(buf)) {
+    if (buf.length >= 2 && buf[1] === 0x00 && buf[3] === 0x00) {
+      // Strip BOM se presente.
+      const s = buf.toString('utf16le');
+      return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s;
+    }
+    return buf.toString('utf8');
+  }
+  // Caso 2: string já decodada como utf8/latin1 mas com null bytes intercalados.
+  if (typeof buf === 'string') {
+    // Heurística: se >20% dos chars são \x00, é UTF-16 LE lido como bytes.
+    let nulls = 0;
+    const sample = buf.slice(0, Math.min(200, buf.length));
+    for (let i = 0; i < sample.length; i++) if (sample.charCodeAt(i) === 0) nulls++;
+    if (sample.length > 0 && nulls / sample.length > 0.2) {
+      const b = Buffer.from(buf, 'binary');
+      const s = b.toString('utf16le');
+      return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s;
+    }
+    return buf;
+  }
+  return String(buf);
+}
+
 function execP(cmd, args, opts = {}) {
   const {
     timeout = DEFAULT_TIMEOUT,
@@ -18,19 +51,28 @@ function execP(cmd, args, opts = {}) {
     label,
   } = opts;
 
+  // wsl.exe (e algumas vezes powershell encapsulando wsl --status) emite UTF-16 LE.
+  // Pra fix #A4: sempre que rodarmos algo que possa ser wsl.exe ou um comando wsl
+  // que retorne mojibake, passamos o stdout/stderr por decodeWslOutput antes.
+  // Heurístico — não custa nada quando a saída já é UTF-8.
+  const needsWslDecode = cmd === 'wsl.exe' || cmd === 'wsl'
+    || (Array.isArray(args) && args.some(a => typeof a === 'string' && /\bwsl\b/i.test(a)));
+
   return new Promise((resolve, reject) => {
     if (logger) logger.debug('shell', `exec ${label || cmd} ${(args || []).join(' ')}`);
     const child = execFile(cmd, args, { timeout, maxBuffer, env, cwd, windowsHide: true },
       (err, stdout, stderr) => {
-        const result = { stdout: stdout || '', stderr: stderr || '', code: err ? (err.code ?? 1) : 0 };
+        const out = needsWslDecode ? decodeWslOutput(stdout) : (stdout || '');
+        const errOut = needsWslDecode ? decodeWslOutput(stderr) : (stderr || '');
+        const result = { stdout: out, stderr: errOut, code: err ? (err.code ?? 1) : 0 };
         if (err) {
           err.stdout = result.stdout;
           err.stderr = result.stderr;
-          if (logger) logger.warn('shell', `exit ${err.code} ${label || cmd}: ${mask((stderr || err.message || '').slice(0, 400))}`);
+          if (logger) logger.warn('shell', `exit ${err.code} ${label || cmd}: ${mask((result.stderr || err.message || '').slice(0, 400))}`);
           return reject(err);
         }
-        if (logger && (stdout || stderr)) {
-          const preview = mask(((stdout || '') + (stderr ? '\n' + stderr : '')).slice(0, 400));
+        if (logger && (out || errOut)) {
+          const preview = mask(((out || '') + (errOut ? '\n' + errOut : '')).slice(0, 400));
           logger.debug('shell', `ok ${label || cmd}: ${preview}`);
         }
         resolve(result);
@@ -42,10 +84,14 @@ function execP(cmd, args, opts = {}) {
 }
 
 // PowerShell wrapper. Runs with -NoProfile to avoid user profile side effects.
+// Injeta WSL_UTF8=1 (suportado em wsl.exe ≥ 0.64) — força saída UTF-8 plain
+// quando o script chamar `wsl --status`/`wsl -l -v` por dentro do PS. Defesa
+// em profundidade pro fix #A4 (decodeWslOutput cobre o resto).
 function powershell(script, opts = {}) {
+  const env = { ...(process.env || {}), ...(opts.env || {}), WSL_UTF8: '1' };
   return execP('powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { timeout: 300_000, ...opts });
+    { timeout: 300_000, ...opts, env });
 }
 
 // Run a bash command inside WSL (login shell so nvm/PATH from ~/.bashrc are loaded).
@@ -56,7 +102,9 @@ function wsl(bashCmd, opts = {}) {
   const args = ['-d', distro];
   if (user) args.push('-u', user);
   args.push('--', 'bash', '-lc', bashCmd);
-  return execP('wsl.exe', args, { timeout: 300_000, ...opts, label: opts.label || 'wsl' });
+  // WSL_UTF8=1 vai no env do wsl.exe (versão >=0.64). decodeWslOutput cobre o resto.
+  const env = { ...(process.env || {}), ...(opts.env || {}), WSL_UTF8: '1' };
+  return execP('wsl.exe', args, { timeout: 300_000, ...opts, env, label: opts.label || 'wsl' });
 }
 
 // Sudo inside WSL. Uses `sudo -n` first; if that fails (NEEDS_PASSWORD),
@@ -95,8 +143,10 @@ async function sudoInWsl(bashCmd, opts = {}) {
   const args = ['-d', distro];
   if (user) args.push('-u', user);
   args.push('--', 'bash', '-lc', `sudo -S -p "" bash -lc ${shSingleQuote(bashCmd)}`);
+  const sudoEnv = { ...(process.env || {}), ...(opts.env || {}), WSL_UTF8: '1' };
   return execP('wsl.exe', args, {
     ...opts,
+    env: sudoEnv,
     input: pass + '\n',
     label: 'sudo-S',
   });
@@ -165,17 +215,27 @@ function shSingleQuote(s) {
 
 // Schedule the .exe to relaunch via HKCU\...\RunOnce after reboot.
 // RunOnce auto-clears its entry on first run, so this is naturally idempotent.
+//
+// Eduardo 4.5 (nit): passamos exePath via -ArgumentList em vez de interpolar
+// dentro do script PS — assim caracteres especiais no path (quotes, etc.) não
+// quebram a string PS. O script lê via $args[0].
 function scheduleRunOnceAfterReboot(exePath, opts = {}) {
   const name = opts.name || 'IMP-Installer-Resume';
-  // Use single-quotes around path for PS to tolerate spaces.
   const script = `
-    $exe = '${exePath.replace(/'/g, "''")}'
-    if (-not (Test-Path $exe)) { throw "Executável não encontrado: $exe" }
+    param($Exe, $Name)
+    if (-not (Test-Path $Exe)) { throw "Executável não encontrado: $Exe" }
     $key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce'
     New-Item -Path $key -Force | Out-Null
-    Set-ItemProperty -Path $key -Name '${name}' -Value ('"' + $exe + '" --resume')
+    Set-ItemProperty -Path $key -Name $Name -Value ('"' + $Exe + '" --resume')
   `;
-  return powershell(script, opts);
+  // execP usa execFile; passamos args sem interpolação. -Command bloco recebe
+  // $args[0], $args[1] via param().
+  return execP('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-Command', script,
+    '-Exe', exePath,
+    '-Name', name,
+  ], { timeout: 60_000, ...opts, label: 'scheduleRunOnce' });
 }
 
 module.exports = {
@@ -187,4 +247,5 @@ module.exports = {
   withRetry,
   shSingleQuote,
   scheduleRunOnceAfterReboot,
+  decodeWslOutput,
 };

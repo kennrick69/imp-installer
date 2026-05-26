@@ -464,9 +464,13 @@
       try { await api.resume(); }
       catch (e) { toast('Não consegui retomar. ' + (e?.message || ''), 'error'); }
     });
-    $('#btn-fresh').addEventListener('click', () => {
+    $('#btn-fresh').addEventListener('click', async () => {
+      // Fix Eduardo N1: reset real do state antes de começar
+      if (typeof api.reset === 'function') {
+        try { await api.reset(); toast('Estado anterior arquivado. Começando do zero.', 'info'); }
+        catch (e) { toast('Não consegui resetar: ' + (e?.message || ''), 'error'); }
+      }
       $('#resume-card').classList.add('hidden');
-      // backend pode oferecer "start" zerando state — convenção: chamar start() sem resume
     });
   }
 

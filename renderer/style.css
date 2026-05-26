@@ -33,6 +33,16 @@
   --warn-glow:      rgba(245, 158, 11, 0.28);
   --err:            #EF4444;
   --err-glow:       rgba(239, 68, 68, 0.30);
+  --err-soft:       rgba(239, 68, 68, 0.08);
+
+  /* estados manuais / bloqueio do JOs */
+  --manual:         #F59E0B;          /* amber/ouro — JOs precisa agir */
+  --manual-glow:    rgba(245, 158, 11, 0.28);
+  --manual-soft:    rgba(245, 158, 11, 0.10);
+
+  --blocked:        #FCA5A5;          /* vermelho pálido — gate de reboot */
+  --blocked-soft:   rgba(252, 165, 165, 0.10);
+  --blocked-border: rgba(252, 165, 165, 0.45);
 
   /* sombras + gradientes */
   --grad-topbar:    linear-gradient(180deg, #181B24 0%, #0F1117 100%);
@@ -504,18 +514,41 @@ body {
   border-left: 3px solid transparent;
 }
 .step-item:hover { background: var(--bg-card-hover); }
+.step-item[data-state="pending"] {
+  /* estado default — neutro, sem hover destacado */
+  color: var(--text-secondary);
+  border-left-color: transparent;
+}
 .step-item[data-state="running"] {
   background: var(--accent-soft);
   border-left-color: var(--accent);
 }
 .step-item[data-state="done"] { color: var(--text-secondary); }
 .step-item[data-state="error"] {
-  background: rgba(239, 68, 68, 0.08);
+  background: var(--err-soft);
   border-left-color: var(--err);
 }
 .step-item[data-state="manual"] {
-  background: rgba(245, 158, 11, 0.08);
-  border-left-color: var(--warn);
+  background: var(--manual-soft);
+  border-left-color: var(--manual);
+  color: var(--text-primary);
+}
+.step-item[data-state="manual"] .si-name {
+  font-weight: 600;  /* destaca que JOs precisa olhar */
+}
+.step-item[data-state="blocked_user_action"] {
+  background: var(--blocked-soft);
+  border-left-color: var(--blocked);
+  color: var(--text-primary);
+  /* pulso suave pra chamar atenção (sem ser irritante) */
+  animation: blockedPulse 2.4s ease-in-out infinite;
+}
+@keyframes blockedPulse {
+  0%, 100% { box-shadow: inset 3px 0 0 var(--blocked), 0 0 0 0 transparent; }
+  50%      { box-shadow: inset 3px 0 0 var(--blocked), 0 0 0 2px var(--blocked-soft); }
+}
+.step-item[data-state="blocked_user_action"] .si-name {
+  font-weight: 600;
 }
 .step-item[data-state="skipped"] { color: var(--text-muted); }
 .step-item[data-state="skipped"] .si-name { text-decoration: line-through; }
@@ -533,7 +566,10 @@ body {
 .step-item[data-state="running"] .si-num,
 .step-item[data-state="done"] .si-num    { background: var(--accent); border-color: var(--accent); color: #FFF; }
 .step-item[data-state="error"] .si-num   { background: var(--err); border-color: var(--err); color: #FFF; }
-.step-item[data-state="manual"] .si-num  { background: var(--warn); border-color: var(--warn); color: #000; }
+.step-item[data-state="manual"] .si-num  { background: var(--manual); border-color: var(--manual); color: #000; }
+.step-item[data-state="blocked_user_action"] .si-num {
+  background: var(--blocked); border-color: var(--blocked); color: #4A0E0E;
+}
 
 .si-name {
   font-size: 12px;
@@ -549,7 +585,12 @@ body {
 .step-item[data-state="running"] .si-icon::after { content: '◐'; color: var(--accent); animation: spin 1.2s linear infinite; display: inline-block; }
 .step-item[data-state="done"]    .si-icon::after { content: '✓'; color: var(--ok); }
 .step-item[data-state="error"]   .si-icon::after { content: '✕'; color: var(--err); }
-.step-item[data-state="manual"]  .si-icon::after { content: '◆'; color: var(--warn); }
+.step-item[data-state="manual"]  .si-icon::after { content: '◆'; color: var(--manual); }
+.step-item[data-state="blocked_user_action"] .si-icon::after {
+  content: '⏸';  /* pause — gate de reboot / ação JOs obrigatória */
+  color: var(--blocked);
+  font-size: 13px;
+}
 .step-item[data-state="skipped"] .si-icon::after { content: '↷'; color: var(--text-muted); }
 
 /* Painel detalhe */

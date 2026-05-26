@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  IMP Squad Instalador — ícone
+  Camila (criativa). Conceito: escudo/insígnia da squad em teal IMP.
+  Elementos: escudo (squad protetor), 3 barras (3 Claudes em formação),
+  ponto central (líder/JOs no comando). Silhueta forte pra 16px.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Fundo escuro arredondado (mesma família imp-interface) -->
+  <rect width="256" height="256" rx="48" ry="48" fill="#0E1015"/>
+
+  <!-- Escudo principal teal -->
+  <path d="M128 36 L208 64 L208 132
+           C 208 178 176 212 128 224
+           C 80 212 48 178 48 132
+           L 48 64 Z"
+        fill="#0D9488"
+        stroke="#14B8A6"
+        stroke-width="4"/>
+
+  <!-- 3 barras verticais (formação da squad) -->
+  <rect x="82"  y="92" width="18" height="76" rx="4" fill="#07080B" opacity="0.85"/>
+  <rect x="119" y="80" width="18" height="100" rx="4" fill="#07080B" opacity="0.85"/>
+  <rect x="156" y="92" width="18" height="76" rx="4" fill="#07080B" opacity="0.85"/>
+
+  <!-- Ponto central (líder/JOs) -->
+  <circle cx="128" cy="60" r="10" fill="#F3F4F8"/>
+</svg>

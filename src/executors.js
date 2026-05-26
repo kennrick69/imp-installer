@@ -2,6 +2,7 @@
 
 const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote } = require('./shell');
 const preflight = require('./preflight');
+const { enrichError } = require('./error-catalog');
 
 // Each executor exports: { id, title, description, category, detect, execute, validate, manualInstructions? }
 //   detect():    Promise<boolean>  — true if step is already done (skip).
@@ -74,8 +75,10 @@ const step02SetWslDefaultV2 = {
   category: 'AUTO',
   async detect() {
     try {
+      // shell.js decodeWslOutput desfaz mojibake UTF-16 LE de wsl.exe (#A4).
+      // Regex tolera EN ("Default Version") e PT-BR ("Versão padrão").
       const { stdout } = await powershell(`wsl --status 2>&1`);
-      return /Default Version:\s*2/i.test(stdout);
+      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(stdout);
     } catch (_) { return false; }
   },
   async execute() {
@@ -90,18 +93,36 @@ const step03WslInstall = {
   title: 'Instalar WSL2 + Ubuntu-22.04 (requer reboot)',
   description: 'Baixa kernel WSL2 + imagem Ubuntu-22.04. Pós-execução o Windows precisa reiniciar.',
   category: 'HYBRID',
+  manualInstructions:
+    'Depois que o WSL terminar de instalar, o Windows VAI precisar reiniciar. ' +
+    'Salve seu trabalho. Quando o PC voltar, este instalador abre sozinho e retoma de onde parou.',
   async detect() {
     try {
+      // decodeWslOutput em shell.js cobre o UTF-16 LE de wsl.exe (#A4).
       const { stdout } = await powershell(`wsl -l -v 2>&1`);
-      // Ubuntu-22.04 present and version 2.
+      // Ubuntu-22.04 present and version 2 (locale-agnostic: o "2" é numérico).
       return /Ubuntu-22\.04[\s\S]*\b2\b/m.test(stdout) || /Ubuntu[\s\S]*\b2\b/m.test(stdout);
     } catch (_) { return false; }
   },
   async execute(ctx) {
+    // Checa se há outra distro como default (Debian/Kali/etc) e avisa.
+    try {
+      const { stdout: list } = await powershell(`wsl -l -v 2>&1`).catch(() => ({ stdout: '' }));
+      if (list && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(list)) {
+        ctx.logger.warn('step_03', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu-22.04 mesmo assim e setar como default.');
+      }
+    } catch (_) {}
+
     await withRetry(
       () => powershell(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
       { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
     );
+
+    // Força Ubuntu-22.04 como default (idempotente; ignora erro se já é).
+    try {
+      await powershell(`wsl --set-default Ubuntu-22.04`).catch(() => {});
+    } catch (_) {}
+
     // Mark reboot required; runner will halt and schedule RunOnce.
     ctx.state.rebootRequired = true;
     ctx.state.rebootDone = false;
@@ -123,8 +144,8 @@ const step04UbuntuFirstBoot = {
   description: 'Usuário precisa abrir Ubuntu uma vez para criar username/senha. Não automatizável.',
   category: 'MANUAL',
   manualInstructions:
-    'Vou abrir o Ubuntu. Crie um usuário em minúsculas (ex: jos) e uma senha. ' +
-    'Quando ver o prompt "<user>@PC:~$", volte aqui e clique CONTINUAR.',
+    'Abra a janela do Ubuntu que apareceu, defina seu usuário (em minúsculas, ex: jos) e uma senha. ' +
+    'Quando ver o prompt "<user>@PC:~$", volte aqui — o instalador detecta sozinho e segue.',
   async detect(ctx) {
     try {
       // Check default user is non-root and exists.
@@ -138,17 +159,94 @@ const step04UbuntuFirstBoot = {
   },
   async execute(ctx) {
     // Open the Ubuntu console window so user can create account.
-    await powershell(`Start-Process ubuntu2204.exe`).catch(async () => {
-      // Fallback name varies; try generic.
-      await powershell(`Start-Process ubuntu.exe`).catch(() => {});
-    });
+    // Fix #A2: detectar dinamicamente qual launcher o WSL tem instalado.
+    // Em PCs com "Ubuntu" genérico (AppX CanonicalGroupLimited.Ubuntu) o launcher
+    // é `ubuntu.exe`; em "Ubuntu 22.04 LTS" (CanonicalGroupLimited.Ubuntu22.04LTS)
+    // é `ubuntu2204.exe`. Antigamente fallback hardcoded engolia falha silenciosa.
+    // Estratégia: descobrir via Get-Command quais .exe existem no PATH, e tentar
+    // na ordem 2204 → ubuntu-22.04 → ubuntu → wsl -d (último recurso).
+    let opened = false;
+    let launcherUsed = null;
+
+    // 1) Descobre launchers Ubuntu disponíveis (Get-Command devolve só os no PATH).
+    let availableLaunchers = [];
+    try {
+      const probe = `
+        $names = @()
+        Get-Command "ubuntu*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $names += $_.Name }
+        $names -join ';'
+      `;
+      const { stdout } = await powershell(probe, { timeout: 30_000 }).catch(() => ({ stdout: '' }));
+      availableLaunchers = (stdout || '').trim().split(';').filter(Boolean);
+      if (availableLaunchers.length) {
+        ctx.logger.info('step_04', `launchers Ubuntu encontrados: ${availableLaunchers.join(', ')}`);
+      }
+    } catch (_) {}
+
+    // 2) Monta ordem de tentativas: 2204 primeiro (matches D6 do roteiro), depois alt names, depois genérico.
+    const preferred = ['ubuntu2204.exe', 'ubuntu-22.04.exe', 'ubuntu.exe'];
+    const tryOrder = [];
+    // primeiro os preferidos que de fato existem
+    for (const p of preferred) {
+      if (availableLaunchers.some(n => n.toLowerCase() === p.toLowerCase())) tryOrder.push(p);
+    }
+    // se a probe falhou ou não achou nada, tenta cegamente na ordem preferida (Start-Process pode resolver via WindowsApps)
+    if (tryOrder.length === 0) tryOrder.push(...preferred);
+
+    for (const exe of tryOrder) {
+      try {
+        await powershell(`Start-Process ${exe}`, { timeout: 30_000 });
+        opened = true;
+        launcherUsed = exe;
+        ctx.logger.info('step_04', `abriu Ubuntu via ${exe}`);
+        break;
+      } catch (e) {
+        ctx.logger.warn('step_04', `${exe} falhou: ${e.message}`);
+      }
+    }
+
+    // 3) Último recurso: abre WSL direto pela distro via Windows Terminal (cria sessão e força primeiro setup).
+    if (!opened) {
+      try {
+        const distro = ctx.state.distro || 'Ubuntu-22.04';
+        ctx.logger.warn('step_04', `nenhum launcher .exe funcionou — tentando wsl.exe -d ${distro} via terminal`);
+        const { openInteractiveTerminal } = require('./shell');
+        await openInteractiveTerminal(`echo "Defina seu usuário Ubuntu abaixo:" && exec bash`, {
+          distro,
+          title: 'IMP — Primeira boot Ubuntu',
+        });
+        opened = true;
+        launcherUsed = `wsl.exe -d ${distro}`;
+      } catch (e) {
+        ctx.logger.error('step_04', `fallback wsl.exe também falhou: ${e.message}`);
+      }
+    }
+
+    if (!opened) {
+      throw new Error(
+        'Não consegui abrir o Ubuntu automaticamente. ' +
+        'Abra o Ubuntu pelo Menu Iniciar do Windows (procure "Ubuntu"), defina usuário+senha, e volte aqui.'
+      );
+    }
+
+    if (launcherUsed) ctx.state.ubuntuLauncher = launcherUsed;
+    ctx.save();
+
     // Poll until detect() succeeds, with a 10-minute window.
-    const deadline = Date.now() + 10 * 60 * 1000;
+    // Emite progresso a cada 5s pro renderer não parecer travado (Eduardo 3.6).
+    const startTs = Date.now();
+    const deadline = startTs + 10 * 60 * 1000;
+    let lastLogTs = 0;
     while (Date.now() < deadline) {
       if (await this.detect(ctx)) return;
+      const elapsed = Math.floor((Date.now() - startTs) / 1000);
+      if (Date.now() - lastLogTs >= 5000) {
+        ctx.logger.info('step_04', `aguardando criação do usuário Ubuntu (${elapsed}s decorridos, timeout em 10 min)...`);
+        lastLogTs = Date.now();
+      }
       await new Promise(r => setTimeout(r, 3000));
     }
-    throw new Error('Ubuntu não respondeu em 10 min — abra o Ubuntu manualmente e complete o setup de usuário.');
+    throw new Error('Ubuntu não respondeu em 10 min — abra o Ubuntu manualmente pelo menu Iniciar e complete o setup de usuário.');
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -169,6 +267,24 @@ const step05AptBase = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
+    // Pré-check dpkg lock (Eduardo §2.4 / Patrícia §2.4). Se outra instalação travou,
+    // apt-get install vai falhar feio — melhor avisar antes com instrução clara.
+    try {
+      const { stdout: lockOut } = await wsl(
+        `(sudo -n lsof /var/lib/dpkg/lock-frontend 2>/dev/null || lsof /var/lib/dpkg/lock-frontend 2>/dev/null) | tail -n +2`,
+        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 15_000 }
+      ).catch(() => ({ stdout: '' }));
+      if (lockOut && lockOut.trim()) {
+        throw new Error(
+          'instalação anterior do Ubuntu ficou pendente (dpkg lock detectado). ' +
+          'Abra o Ubuntu pelo menu Iniciar, rode `sudo dpkg --configure -a` e depois `sudo apt-get -f install`, então tente de novo aqui.'
+        );
+      }
+    } catch (e) {
+      // Se a mensagem é nossa (lock detectado), propaga; senão segue.
+      if (e && /dpkg lock/.test(e.message)) throw e;
+    }
+
     const cmd = `DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl ca-certificates build-essential jq wget`;
     await withRetry(
       () => sudoInWsl(cmd, {
@@ -322,6 +438,10 @@ const step10GhAuth = {
   title: 'GitHub auth (gh CLI — Device Flow)',
   description: 'Instala gh CLI + gh auth login --web. Configura credential helper.',
   category: 'HYBRID',
+  manualInstructions:
+    'Vou abrir um terminal com `gh auth login --web`. Ele vai mostrar um código curto ' +
+    '(ex.: ABCD-1234) e abrir o GitHub no seu browser. Cole o código, autorize com sua conta ' +
+    'GitHub, e feche a janela do terminal. O instalador detecta sozinho e segue.',
   async detect(ctx) {
     try {
       const { stdout } = await wsl(`gh auth status 2>&1 | grep -q "Logged in to github.com" && echo OK || echo MISSING`,
@@ -414,10 +534,21 @@ const step11CloneSquad = {
         fi
       fi
     `;
-    await withRetry(
-      () => wsl(cloneScript, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 300_000, logger: ctx.logger }),
-      { label: 'clone imp-squad', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
-    );
+    try {
+      await withRetry(
+        () => wsl(cloneScript, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 300_000, logger: ctx.logger }),
+        { label: 'clone imp-squad', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
+      );
+    } catch (e) {
+      // Enriquece o erro do clone usando o catalog (4.6 do Eduardo + 7.1 da Patrícia).
+      // Os padrões mais comuns: exit 128 (auth), exit 3 (sem fallback), 403, "could not read from remote".
+      const raw = `${e.message || ''}\n${e.stderr || ''}`;
+      const enriched = enrichError('step_11_clone_squad', raw);
+      const friendly = new Error(`${enriched.headline} — ${enriched.what}`);
+      friendly.stderr = e.stderr;
+      friendly.enriched = enriched;
+      throw friendly;
+    }
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -479,25 +610,78 @@ const step13Sala3D = {
   async execute(ctx) {
     if (ctx.state.decisions.escritorio3dStrategy === 'skip') {
       ctx.logger.info('sala3d', 'pulado por decisão do usuário');
+      ctx.state.sala3dSkipped = true;
+      ctx.state.sala3dSkipReason = 'usuario_pulou';
+      ctx.save();
       return;
     }
+
+    // Fix #A1: probe a release ANTES de tentar baixar. Release pode não existir
+    // ainda (caso atual: kennrick69/escritorio-3d sem release publicado).
+    // Se a API GitHub retorna 404, marca como skipped (não erro) e segue —
+    // usuário pode instalar depois quando a release for publicada.
+    const releaseUrl = 'https://api.github.com/repos/kennrick69/escritorio-3d/releases/latest';
+    let releaseExists = false;
+    try {
+      const probe = await wsl(
+        `curl -s -o /dev/null -w '%{http_code}' --max-time 15 ${releaseUrl}`,
+        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 30_000 }
+      ).catch(() => ({ stdout: '' }));
+      const code = parseInt((probe.stdout || '').trim(), 10);
+      releaseExists = code === 200;
+      if (!releaseExists) {
+        ctx.logger.info('sala3d',
+          `release não publicada ainda (HTTP ${code || 'erro'}). ` +
+          `Sala 3D ainda não disponível — usuário pode instalar depois quando estiver publicada.`
+        );
+      }
+    } catch (e) {
+      ctx.logger.warn('sala3d', `probe release falhou: ${e.message} — assumindo indisponível`);
+      releaseExists = false;
+    }
+
+    if (!releaseExists) {
+      // Graceful skip por default — NÃO é erro.
+      ctx.state.sala3dSkipped = true;
+      ctx.state.sala3dSkipReason = 'sala_3d_release_indisponivel';
+      ctx.save();
+      return;
+    }
+
+    // Release existe — segue download normal.
     const script = `
       set -e
       mkdir -p /mnt/c/Projetos/escritorio-3d
       cd /tmp
       curl -fsSL --retry 3 -o escritorio-3d.zip \\
         https://github.com/kennrick69/escritorio-3d/releases/latest/download/escritorio-3d.zip
-      unzip -qo escritorio-3d.zip -d /mnt/c/Projetos/escritorio-3d/
+      # unzip pode não estar instalado em Ubuntu mínimo — tenta python3 como fallback
+      if command -v unzip >/dev/null; then
+        unzip -qo escritorio-3d.zip -d /mnt/c/Projetos/escritorio-3d/
+      else
+        python3 -c "import zipfile; zipfile.ZipFile('escritorio-3d.zip').extractall('/mnt/c/Projetos/escritorio-3d/')"
+      fi
       touch /mnt/c/Projetos/escritorio-3d/${FOLDER_MARKER}
       rm -f escritorio-3d.zip
     `;
-    await withRetry(
-      () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 900_000, logger: ctx.logger }),
-      { label: 'sala 3d download', attempts: 2, backoff: [5, 30], logger: ctx.logger }
-    );
+    try {
+      await withRetry(
+        () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 900_000, logger: ctx.logger }),
+        { label: 'sala 3d download', attempts: 2, backoff: [5, 30], logger: ctx.logger }
+      );
+    } catch (e) {
+      // Mesmo se a probe disse "200" e o download falhou, não bloqueia install — vira skip.
+      ctx.logger.warn('sala3d',
+        `download falhou (${e.message}) — marcando como skipped, instalação principal continua.`
+      );
+      ctx.state.sala3dSkipped = true;
+      ctx.state.sala3dSkipReason = 'download_falhou';
+      ctx.save();
+    }
   },
   async validate(ctx) {
     if (ctx.state.decisions.escritorio3dStrategy === 'skip') return true;
+    if (ctx.state.sala3dSkipped) return true; // skip aceitável (release indisponível)
     return this.detect(ctx);
   },
 };

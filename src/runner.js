@@ -9,6 +9,19 @@ const { ALL_STEPS } = require('./executors');
 // Lock file prevents two installer processes from racing on state.json.
 const LOCK_NAME = '.installer.lock';
 
+// CRITICAL_STEPS: skipStep recusa esses (sem force:true). Pular qualquer um quebra
+// downstream — ex.: pular step_05 (apt) garante que step_06 (node via nvm via apt deps)
+// falhe; pular step_03 (wsl_install) deixa o sistema sem distro Linux.
+const CRITICAL_STEPS = new Set([
+  'step_03_wsl_install',
+  'step_05_apt_base',
+  'step_06_node_nvm',
+  'step_08_claude_cli',
+  'step_10_gh_auth',
+  'step_11_clone_squad',
+  'step_14_tmux_session',
+]);
+
 function acquireLock(dir) {
   fs.mkdirSync(dir, { recursive: true });
   const lockPath = path.join(dir, LOCK_NAME);
@@ -77,6 +90,10 @@ function startWizard(events = {}, opts = {}) {
   return _ctx.state;
 }
 
+// getState pode ser chamado ANTES de startWizard (ex.: main.js pra detectar
+// rebootDone). Quando isso acontece, carregamos do disco diretamente sem
+// adquirir lock — startWizard adquire o lock depois. Esse padrão é seguro
+// porque o app é single-instance (app.requestSingleInstanceLock no main.js).
 function getState() {
   if (!_ctx) return stateLib.loadState();
   return _ctx.state;
@@ -107,12 +124,24 @@ function emitStepUpdate(ctx, step, status, extra) {
   }
 }
 
+// Espera o usuário "retomar" caso esteja pausado. Não-bloqueante se nunca foi pausado.
+async function pauseGate(ctx) {
+  if (!ctx || !ctx.state || !ctx.state.paused) return;
+  ctx.logger.info('runner', 'execução pausada — aguardando resume()');
+  while (ctx.state.paused) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+  ctx.logger.info('runner', 'resume — voltando a rodar');
+}
+
 // Run one step. Returns { id, status, skipped, error }.
 async function runStep(stepId, events) {
   if (!_ctx) startWizard(events || {});
   if (events) _ctx.events = events;
   const step = ALL_STEPS.find(s => s.id === stepId);
   if (!step) throw new Error(`step não encontrado: ${stepId}`);
+
+  await pauseGate(_ctx);
 
   // Reboot gate: step 03 sets rebootRequired=true. Subsequent steps cannot run
   // until rebootDone is also true. main.js flips rebootDone on next launch.
@@ -171,6 +200,8 @@ async function runAll(events) {
   if (events) _ctx.events = events;
   const results = [];
   for (const step of ALL_STEPS) {
+    // Pause check antes de CADA step (não-bloqueante se nunca foi pausado).
+    await pauseGate(_ctx);
     // If reboot just happened (resume), step 03 might already be done; respect existing 'done' state.
     if (stateLib.isStepDone(_ctx.state, step.id)) {
       results.push({ id: step.id, status: _ctx.state.steps[step.id] });
@@ -186,6 +217,28 @@ async function runAll(events) {
     }
   }
   return results;
+}
+
+// Pause/resume reais: flag em _ctx.state.paused. runAll/runStep checam via pauseGate.
+// NÃO mata o passo em execução — ele termina, e o próximo bloqueia.
+function pause() {
+  if (!_ctx) return { ok: false, error: 'wizard ainda não iniciado' };
+  _ctx.state.paused = true;
+  _ctx.save();
+  _ctx.logger.info('runner', 'pause solicitado pelo usuário');
+  return { ok: true };
+}
+
+function resume() {
+  if (!_ctx) return { ok: false, error: 'wizard ainda não iniciado' };
+  _ctx.state.paused = false;
+  _ctx.save();
+  _ctx.logger.info('runner', 'resume solicitado pelo usuário');
+  return { ok: true };
+}
+
+function isPaused() {
+  return !!(_ctx && _ctx.state && _ctx.state.paused);
 }
 
 // User confirms they finished a manual step (e.g., after closing terminal).
@@ -212,10 +265,48 @@ function markRebootDone() {
 }
 
 // Allow user to pre-skip an optional step (e.g., Sala 3D).
-function skipStep(stepId, reason = 'user_skipped') {
+// Recusa CRITICAL_STEPS a menos que force:true seja passado.
+function skipStep(stepId, reason = 'user_skipped', opts = {}) {
   if (!_ctx) startWizard({});
+  if (CRITICAL_STEPS.has(stepId) && !opts.force) {
+    const err = new Error(`step ${stepId} é crítico — não pode ser pulado (use force:true se sabe o que está fazendo)`);
+    err.code = 'CRITICAL_STEP';
+    throw err;
+  }
   stateLib.setStepStatus(_ctx.state, stepId, 'skipped', { reason });
   _ctx.save();
+  return { ok: true };
+}
+
+// resetState: limpa state.json (preserva backup), libera lock, zera _ctx.
+// Pra "btn-fresh" do wizard — começar do zero.
+function resetState() {
+  const stateDir = stateLib.defaultStateDir();
+  const statePath = stateLib.defaultStatePath();
+  const ts = Date.now();
+
+  // Renomeia state.json pra preserved (forense + undo manual se preciso).
+  try {
+    if (fs.existsSync(statePath)) {
+      fs.renameSync(statePath, `${statePath}.preserved-${ts}`);
+    }
+    const bak = statePath + '.bak';
+    if (fs.existsSync(bak)) {
+      fs.renameSync(bak, `${bak}.preserved-${ts}`);
+    }
+  } catch (e) {
+    // Best-effort; se rename falhar tentamos unlink.
+    try { fs.unlinkSync(statePath); } catch (_) {}
+  }
+
+  // Libera lock e zera _ctx pra startWizard reinicializar do zero.
+  if (_ctx && _ctx._lockPath) releaseLock(_ctx._lockPath);
+  else {
+    // Lock pode existir mesmo sem _ctx (cenário de crash anterior).
+    try { releaseLock(path.join(stateDir, LOCK_NAME)); } catch (_) {}
+  }
+  _ctx = null;
+  return { ok: true, preservedAt: ts };
 }
 
 function shutdown() {
@@ -233,4 +324,9 @@ module.exports = {
   listSteps,
   getState,
   shutdown,
+  pause,
+  resume,
+  isPaused,
+  resetState,
+  CRITICAL_STEPS,
 };

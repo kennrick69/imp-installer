@@ -29,6 +29,7 @@ const installer = {
   pause: () => ipcRenderer.invoke('installer:pause'),
   closeApp: () => ipcRenderer.invoke('installer:closeApp'),
   pickFolder: () => ipcRenderer.invoke('installer:pickFolder'),
+  reset: () => ipcRenderer.invoke('installer:reset'),
 
   sudoReply: (id, password, cancelled = false) =>
     ipcRenderer.invoke('installer:sudoReply', { id, password, cancelled }),

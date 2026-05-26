@@ -1,8 +1,8 @@
 {
   "name": "imp-installer",
-  "productName": "IMP Squad — Instalador",
-  "version": "0.1.0",
-  "description": "Instalador guiado da IMP Dev Squad (Windows zerado → squad rodando com 7 Claudes + interface).",
+  "productName": "IMP Squad \u2014 Instalador",
+  "version": "0.2.0",
+  "description": "Instalador guiado da IMP Dev Squad (Windows zerado \u2192 squad rodando com 7 Claudes + interface).",
   "private": true,
   "main": "main.js",
   "type": "commonjs",
@@ -46,14 +46,17 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
-      "artifactName": "IMP-Squad-Instalador-${version}-portable.exe"
+      "artifactName": "IMP-Squad-Instalador-${version}-portable.exe",
+      "icon": "assets/icon.ico"
     },
     "asar": true,
     "compression": "normal"
   },
-  "author": "IMP Dev Squad (Claudio, Marcos, Camila, Bruno, Patrícia, Eduardo)",
+  "author": "IMP Dev Squad (Claudio, Marcos, Camila, Bruno, Patr\u00edcia, Eduardo)",
   "license": "ISC"
 }

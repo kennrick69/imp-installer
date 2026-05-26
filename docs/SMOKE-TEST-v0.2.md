@@ -1,0 +1,445 @@
+# SMOKE TEST — IMP Installer v0.2 (pré-build)
+
+**Autora**: Patrícia (QA)
+**Data**: 2026-05-26
+**Ambiente do teste**: WSL2 Ubuntu (no notebook do Claudio — `DESKTOP-8HAE865`, Ubuntu 26.04 LTS, kernel 6.6.114.1), com tmux 3.6, git 2.53, node v24.15, claude CLI 2.1.150 já instalados. Windows host Build 19045, NÃO admin no momento do teste (mas reportou `True` no check — ver achado #A6).
+**Escopo**: validar 17 steps do executors.js (na verdade são **17 indexados step 00-16**) contra ROTEIRO-INSTALACAO-SQUAD.md, RISCOS-INSTALACAO.md e implementação de Bruno.
+
+---
+
+## Resumo executivo (TL;DR)
+
+- **Steps com execução real (mesmo que parcial)**: 9 de 17 (00, 05, 06, 07, 08, 09, 11, 12, 14, mais checks de PowerShell em 01-03 e 15)
+- **Bugs novos achados**: 8 (3 BLOCKERS, 3 ALTOS, 2 MÉDIOS)
+- **Veredito**: **NO-GO** sem fixes mínimos (#A1, #A2, #A4). Detalhes na seção final.
+
+---
+
+## Achados novos (não estão na review do Eduardo)
+
+### A1 — BLOCKER — Step 13 (Sala 3D) sempre 404
+**Confirmado em teste real.** `curl -sIL https://github.com/kennrick69/escritorio-3d/releases/latest/download/escritorio-3d.zip` retorna **HTTP 404**. O repo `kennrick69/escritorio-3d` não tem release publicado (`api.github.com/repos/kennrick69/escritorio-3d/releases/latest` também 404).
+- **Impacto**: step 13 vai falhar nas 2 tentativas do withRetry; usuário vê erro críptico ("curl 22").
+- **Fix mínimo**: step 13 deve ser **default skip** (`decisions.escritorio3dStrategy = 'skip'`) na primeira instalação. Botão "instalar 3D depois" no dashboard final só aparece se release existir. Detectar via `curl -sI` da release antes de tentar baixar.
+- **Risco coberto na fase 1**: #8.1 (download interrompido) — agora confirmado pior cenário (release inexistente, não só falha intermitente).
+
+### A2 — BLOCKER — Step 04 abre `ubuntu2204.exe` que NÃO EXISTE em PCs com Ubuntu genérico
+**Confirmado em teste real.** Neste host, o launcher é `ubuntu.exe` (`CanonicalGroupLimited.Ubuntu` AppX); NÃO existe `ubuntu2204.exe`. O fallback no executors.js:141 é `.catch(async () => Start-Process ubuntu.exe).catch(() => {})` — o duplo `.catch(() => {})` final **engole silenciosamente** se ambos falharem, e o polling de 10min trava sem nem ter aberto janela alguma.
+- **Decisão D6** do roteiro pinou Ubuntu-22.04, mas executors.js step 03 faz `wsl --install -d Ubuntu-22.04` que instala o pacote `CanonicalGroupLimited.Ubuntu22.04LTS`. Esse SIM expõe `ubuntu2204.exe`. Em PCs onde alguém já tem `Ubuntu` genérico instalado (D2 sugeria reusar mas executors.js não reusa) o launcher é outro.
+- **Fix**: detectar dinamicamente o launcher: `Get-AppxPackage *Ubuntu* | Select-Object PackageFamilyName` + montar `ubuntu2204.exe` OU `ubuntu.exe` baseado no que tem. Ou abrir via `wsl -d Ubuntu-22.04 --` direto.
+- **Já cobre a ressalva 3.7** (swallow silencioso) parcialmente, mas o catch externo do execute() do step 04 mata isso de novo. Reforçar logger.warn em vez de `() => {}`.
+
+### A3 — BLOCKER — Seeds fallback do step 11 aponta pra path que não existe em runtime
+**Audit do código:** linha 450 do executors.js procura `/mnt/c/Projetos/imp-installer/seeds/_squad.tar.gz`. Mas o instalador empacotado roda de `%LOCALAPPDATA%\Programs\imp-installer\` (ou `resources\app\` no asar). Esse path SÓ existiria se o JOs clonou o `imp-installer` em `/mnt/c/Projetos/` (que é o caso do dev), não no caso real do PC zerado.
+- **Diretório real onde seeds estarão**: `process.resourcesPath` (Electron) → algo como `%LOCALAPPDATA%\Programs\imp-installer\resources\seeds\` → traduzido pro WSL: `/mnt/c/Users/<user>/AppData/Local/Programs/imp-installer/resources/seeds/`.
+- **Fix**: main.js deve injetar `ctx.seedsDir` resolvido em runtime e passar pro executor via env var ou template no script.
+- **Em PRODUÇÃO REAL**: nem há `seeds/` empacotado (`ls /mnt/c/Projetos/imp-installer/seeds` retornou "MISSING"). Bruno precisa criar o tarball + colocar em `extraResources` do electron-builder.
+
+### A4 — ALTO — `wsl --status` chega no preflight com texto mojibake (UTF-16LE BOM, "D i s t r i b u i ç ã o")
+**Confirmado em teste real.** `powershell.exe wsl --status` retorna texto com encoding UTF-16LE intercalado por bytes nulos. A regex `/Default Version:\s*2/i` no detect do step 02 NÃO MATCHA esse texto (português + encoding). Mesmo problema no step 03 detect.
+- **Output literal capturado**: `D i s t r i b u i ç ã o   P a d r ã o :   U b u n t u` — espaços entre cada char porque PowerShell repassou raw UTF-16.
+- **Fix**: usar `chcp 65001` antes do `wsl --status` no shell.js, OU `iconv -f UTF-16LE -t UTF-8`, OU usar `wsl.exe --status` direto (sem ir via powershell). Sempre normalizar.
+- **Já tem detect que captura via stdout**: a saída do step 02 detect vai sempre dizer "MISSING" e re-executar `wsl --set-default-version 2` (idempotente, sem mal), mas o detect do step 03 também falha → fica em loop interno tentando reinstalar Ubuntu mesmo já tendo.
+- **Risco fase 1 coberto**: novo — não estava no RISCOS.md original.
+
+### A5 — ALTO — `gh` CLI não está pré-instalado neste WSL, mas step 10 supõe e o detect de step 10 retorna MISSING. OK.
+**Confirmado em teste real.** `which gh` → not found. Logo step 10 executa instalação. Sem problemas aqui — mas é importante notar: o `git clone` do step 11/12 USA o credential helper antigo do JOs (`store` apontando pra `.git-credentials` com PAT pessoal). Em PC zerado, sem `gh auth setup-git` rodado primeiro, o clone do imp-squad **VAI FALHAR** com "could not read Username" (testado: `env -i HOME=/tmp/fake git ls-remote https://github.com/kennrick69/imp-squad` → `fatal: could not read Username for 'https://github.com': terminal prompts disabled`).
+- **Implicação para a PARTE 2 (audit do clone automático)**: ver seção dedicada abaixo.
+
+### A6 — MÉDIO — preflight admin check retorna `True` quando WSL roda como user comum
+**Confirmado em teste real.** Eu (Patrícia) NÃO rodei o teste como admin; o powershell.exe-de-dentro-do-WSL invocado retornou `True` mesmo assim. Isso é normal — WSL invoca `powershell.exe` no contexto do user logado, que pode ser admin even se UAC não elevou. **O preflight do instalador eletrônico vai dar o resultado correto** (Electron + UAC manifest pede elevation), mas teste manual de fora confunde. Não é bug; só ressalva.
+
+### A7 — MÉDIO — `unzip` não está garantido como instalado
+Step 13 chama `unzip -qo` mas step 05 só instala `tmux git curl ca-certificates build-essential jq wget`. **`unzip` NÃO está na lista**.
+- **Confirmado**: `which unzip` neste WSL retorna `/usr/bin/unzip` (já instalado por outro motivo). Em Ubuntu mínimo recém-criado, `unzip` PODE não vir.
+- **Fix simples**: adicionar `unzip` ao step 05.
+
+### A8 — MÉDIO — `cc` em vez de `gcc` no detect do step 05
+Linha 165: `command -v cc >/dev/null`. Mas `apt install build-essential` instala `gcc`; `cc` é symlink alternativa que **pode existir ou não**. Neste WSL recém-checado: `which gcc` → MISSING, `which cc` → MISSING (sistema sem build-essential). Detector funciona, mas faz sentido testar `gcc` direto.
+
+---
+
+## Seções por step
+
+### Step 00 — Preflight (Windows / admin / disco / internet / virt)
+
+- **Categoria**: AUTO
+- **Comandos críticos**: PowerShell — `[Environment]::OSVersion.Version.Build`, `WindowsPrincipal.IsInRole`, `(Get-PSDrive C).Free`, TcpClient github.com:443, `Win32_Processor.VirtualizationFirmwareEnabled`.
+- **Validação de SUCCESS**: nenhum check com `ok=false && warning=false` (blocking).
+- **Detectores (já feito?)**: sempre re-roda (correto — disco pode encher, AV pode acordar).
+- **Riscos cobertos**: #1.1 (virt — agora apenas warning, não blocker, ver código `warning: !ok` em preflight.js:73), #1.2 (build < 19041), #1.4 (admin), #2.1 (internet), #2.6 (espaço).
+- **Testável agora?** ✅ SIM (executei via powershell.exe a partir do WSL):
+  - Build: `19045` ≥ 19041 ✅
+  - Admin: `True` ✅ (mas ver #A6)
+  - Disco C: `55.03 GB` livres ≥ 5 ✅
+  - Internet: github.com:443 alcançável ✅
+  - Virt firmware: `False` ⚠️ — TRATADO como warning, NÃO blocker. **OK**, mas conferir se a UI mostra esse warning.
+- **Edge cases observados**:
+  - Virtualization detect retorna `False` em hosts com VBM-X habilitado mas hypervisor presente (Win+L hyper-V já carregado mascara). Fase 1 risco #1.1 previa "Detecção: alternativa Get-ComputerInfo" — não foi implementado fallback. Não bloqueia (warning), mas em produção é confuso.
+
+---
+
+### Step 01 — Habilitar features WSL + VirtualMachinePlatform
+
+- **Categoria**: AUTO (admin)
+- **Comandos críticos**: `dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart` e mesmo para `VirtualMachinePlatform`.
+- **Validação de SUCCESS**: `Get-WindowsOptionalFeature` ambos `State: Enabled`.
+- **Detectores**: regex `Enabled\|Enabled` — frágil se locale Windows traduz "Enabled" para "Habilitado". **POTENCIAL BUG**: em Windows PT-BR, `Get-WindowsOptionalFeature ... | Select State` retorna `Enabled` em inglês na propriedade (enum), só `Format-Table` traduz. Aqui o script usa `.State` direto, que retorna o enum em inglês. ✅ OK.
+- **Riscos cobertos**: #1.4 (precisa admin — preflight cobre).
+- **Testável agora?** ❌ NÃO — exige admin no Electron e PC com features desabilitadas. WSL2 já tá ligado nesta máquina.
+- **Edge cases**: dism pode pedir reboot (`/norestart` previne). Se virt desabilitada na BIOS (#A do preflight), o feature habilita mas wsl --install falha depois.
+
+---
+
+### Step 02 — `wsl --set-default-version 2`
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `wsl --set-default-version 2`
+- **Validação de SUCCESS**: `wsl --status` contém `Default Version: 2`.
+- **Detectores**: regex `/Default Version:\s*2/i` em `wsl --status`.
+- **Riscos cobertos**: #1.6 (WSL1 → WSL2).
+- **Testável agora?** ⚠️ PARCIAL — executei `powershell.exe wsl --status` e retornou texto **UTF-16LE com BOM intercalado** (ver #A4). A regex NÃO matcha. Detector vai retornar `false` mesmo quando OK. **BLOCKER se não fixar**.
+- **Edge cases**: locale PT-BR retorna "Versão Padrão: 2" em vez de "Default Version: 2". Mesmo problema. **Fix proposto**: rodar `wsl --status` com env `WSL_UTF8=1` (suportado em wsl.exe ≥ 0.64) — output em UTF-8 plain.
+
+---
+
+### Step 03 — Instalar WSL2 + Ubuntu-22.04 (reboot)
+
+- **Categoria**: HYBRID
+- **Comandos críticos**: `wsl --install -d Ubuntu-22.04 --no-launch`
+- **Validação de SUCCESS**: `wsl -l -v` lista Ubuntu-22.04 versão 2.
+- **Detectores**: regex em `wsl -l -v` (mesma armadilha UTF-16 — #A4).
+- **Riscos cobertos**: #1.5 (reboot), #1.6, #1.7 (outra distro presente — código atual NÃO trata: força `Ubuntu-22.04` mesmo se já tem `Ubuntu` genérico → ressalva 6.§1.7 do Eduardo, AINDA EM ABERTO).
+- **Testável agora?** ❌ NÃO (Ubuntu já instalado, não dá pra desinstalar).
+- **Edge cases**:
+  - Risco #1.8 (Ubuntu primeira boot pede user/senha) — coberto por step 04, MAS step 03 usa `--no-launch` (correto) então não dispara o setup; deixa pro step 04.
+  - `scheduleRunOnceAfterReboot(ctx.exePath)` — se `ctx.exePath` for null/undefined (cenário main.js não passou), o catch só warn-loga. Status: ✅ tolerante.
+
+---
+
+### Step 04 — Primeira boot do Ubuntu (manual)
+
+- **Categoria**: MANUAL
+- **Comandos críticos**: `Start-Process ubuntu2204.exe` → fallback `Start-Process ubuntu.exe`.
+- **Validação de SUCCESS**: `wsl whoami` ≠ root.
+- **Detectores**: `whoami` no WSL.
+- **Riscos cobertos**: #1.8.
+- **Testável agora?** ⚠️ PARCIAL.
+  - Testei `ls /mnt/c/Windows/System32/ubuntu*.exe` → ausente; `Get-AppxPackage Ubuntu` → `CanonicalGroupLimited.Ubuntu` (genérico, não 22.04). Path real do launcher: `C:\Users\Lenovo\AppData\Local\Microsoft\WindowsApps\ubuntu.exe`. **`ubuntu2204.exe` NÃO existe nessa máquina** — fallback funciona aqui.
+  - **Em PC zerado pós-step-03**: instalado `Ubuntu-22.04` → expõe `ubuntu2204.exe`. ✅ funciona.
+  - **Mas** se reuso/conflito com Ubuntu genérico (#1.7), executors quebra silencioso (#A2). **BLOCKER**.
+- **Edge cases**: ressalva 3.7 (swallow silencioso) e 3.6 (10min polling sem feedback). Bruno: adicionar `events.emit('manualPrompt', ...)` periodicamente.
+
+---
+
+### Step 05 — Apt base (tmux git curl build-essential jq wget)
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `apt-get update && apt-get install -y --no-install-recommends tmux git curl ca-certificates build-essential jq wget`
+- **Validação de SUCCESS**: `command -v tmux git curl cc jq` todos resolvem.
+- **Detectores**: bash `command -v` chain.
+- **Riscos cobertos**: #2.1, #2.4 (dpkg lock — AINDA não detectado, ressalva 6.§2.4 do Eduardo), #2.5 (`-y` + `DEBIAN_FRONTEND=noninteractive` ✅).
+- **Testável agora?** ✅ SIM — executei localmente:
+  - `which tmux` → `/usr/bin/tmux`, tmux 3.6 ✅
+  - `which git` → `/usr/bin/git`, git 2.53.0 ✅
+  - `which curl` → `/usr/bin/curl`, curl 8.18.0 ✅
+  - `which jq` → **MISSING** (jq não instalado neste WSL apesar de 26.04 LTS) — confirma necessidade do step.
+  - `which gcc` → **MISSING** (gcc não está; só `apt install build-essential` traz).
+- **Edge cases**:
+  - **#A7**: `unzip` NÃO está na lista — step 13 quebra se Ubuntu 22.04 mínimo não tiver.
+  - **#A8**: detector usa `cc` em vez de `gcc` (cosmético, mas inconsistente).
+  - Risco #2.3 (mirror lento): timeout 600_000 é OK. Sem fallback mirror BR.
+
+---
+
+### Step 06 — Node 20 LTS via nvm
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash` + `nvm install --lts && nvm alias default 'lts/*'`
+- **Validação de SUCCESS**: `node -v` ≥ v20.
+- **Detectores**: source nvm.sh + `node -v` regex `^v(2[0-9]|[3-9][0-9])\\.`
+- **Riscos cobertos**: #3.1 (nvm escolhido), #3.4 (rate limit — retry com backoff [2,8,30]).
+- **Testável agora?** ⚠️ PARCIAL — neste WSL **nvm NÃO está instalado** (`ls $HOME/.nvm/nvm.sh` → ausente). Node v24.15 vem de `/usr/bin/node` (sistema). Logo, o detect retornaria MISSING → executor tentaria instalar nvm e baixar Node 20. **Não posso rodar sem modificar ambiente** (NÃO testei o execute()).
+  - **Mas**: o decisor do roteiro (Marcos D anúncio) era **NodeSource**, Bruno implementou **nvm**. Divergência: Marcos justificou que dev sem múltiplas versões prefere apt — Bruno foi por nvm porque cobre risco #4.1 (EACCES sem sudo). ✅ Decisão melhor IMO; mas vale registrar a divergência com Marcos.
+- **Edge cases**:
+  - PATH issue (#3.3) coberto: scripts usam `wsl bash -lc` (login shell) — ✅.
+  - Nvm install script faz `curl | bash` — ataque MITM theórico. Mitigação: pin v0.40.4 ✅.
+
+---
+
+### Step 07 — npm prefix `~/.npm-global` (fallback)
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `mkdir -p ~/.npm-global; npm config set prefix; echo 'export PATH=...' >> ~/.bashrc`
+- **Validação de SUCCESS**: grep `.npm-global/bin` em `.bashrc`.
+- **Detectores**: grep `.bashrc`.
+- **Riscos cobertos**: #4.1 (EACCES sem sudo).
+- **Testável agora?** ✅ SIM (já configurado neste WSL):
+  - `npm config get prefix` → `/home/jos/.npm-global` ✅
+  - `ls ~/.npm-global` → existe com `bin/` e `lib/` ✅
+  - `grep .npm-global/bin ~/.bashrc` → `export PATH=~/.npm-global/bin:$PATH` ✅
+  - PATH em sessão atual contém `.npm-global/bin` ✅
+- **Edge cases**: idempotente (grep -q antes do echo). ✅. Detector usa grep mesmo. ✅.
+
+---
+
+### Step 08 — Claude Code CLI
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `curl -fsSL https://claude.ai/install.sh | bash` com fallback npm `npm install -g @anthropic-ai/claude-code`.
+- **Validação de SUCCESS**: `claude --version` retorna ok.
+- **Detectores**: `command -v claude && claude --version`.
+- **Riscos cobertos**: #4.1 (sem sudo, ✅), #4.2 (registry retry), #4.4 (fallback npm).
+- **Testável agora?** ✅ SIM:
+  - `which claude` → `/home/jos/.npm-global/bin/claude` ✅
+  - `claude --version` → `2.1.150 (Claude Code)` ✅
+- **Edge cases**: native installer cria `~/.local/bin` — script adiciona a PATH no bashrc. Idempotente via `case PATH`. ✅.
+  - Fallback npm assume `.npm-global/bin` no PATH (step 07 garantiu). ✅.
+
+---
+
+### Step 09 — Login Claude (manual, browser)
+
+- **Categoria**: MANUAL
+- **Comandos críticos**: abre terminal Windows com `wsl ... claude` interativo.
+- **Validação de SUCCESS**: `claude --print "responda: pong"` retorna `pong`.
+- **Detectores**: idem (polling a cada 5s, deadline 15min).
+- **Riscos cobertos**: #5.1, #5.2 (timeout 15min), #5.3 (re-detecta válido), #5.4 (parcial — não usa tmux como sugeria fase 1).
+- **Testável agora?** ✅ SIM (já estou logado neste WSL):
+  - `claude --print "responda apenas: pong"` → `pong` ✅
+- **Edge cases**:
+  - Credential file confirmado: `~/.claude/.credentials.json` (note **ponto inicial**, 470 bytes, JSON text, chmod 600). D8 do roteiro fica documentado.
+  - Se `claude --print` trava (timeout 60s), promise rejeita e o catch retorna `{stdout:'', code:1}` — detect retorna false → polling continua. ✅ OK.
+  - **Ressalva**: `openInteractiveTerminal` usa `wt.exe new-tab --profile <distro>` — se Windows Terminal NÃO está instalado (PCs com Win10 sem store), fallback `cmd /c start wsl.exe` funciona, mas user vê janela cmd preta vintage. Aceitável.
+
+---
+
+### Step 10 — GitHub auth (gh device flow)
+
+- **Categoria**: HYBRID
+- **Comandos críticos**: install gh via apt (cli.github.com) + `gh auth login --hostname github.com --git-protocol https --web` + `gh auth setup-git` + `git config --global core.autocrlf input`.
+- **Validação de SUCCESS**: `gh auth status` mostra "Logged in to github.com".
+- **Detectores**: grep `Logged in to github.com` no `gh auth status`.
+- **Riscos cobertos**: #6.1 (token expirado — gh refresh), #6.2 (scopes via gh — default inclui `repo`), #6.3 (sem senha, sem PAT colado), #6.5 (token via gh-config, não logado).
+- **Testável agora?** ⚠️ PARCIAL:
+  - `which gh` → **NOT FOUND** (gh não instalado neste WSL). Detect retornaria MISSING → executor instala. ✅ esperado.
+  - Confirmei via curl que o repo `kennrick69/imp-squad` retorna 404 anônimo, 200 com token → **é privado**. Token salvo em `~/.git-credentials` (modo `store`) hoje. Após `gh auth setup-git`, credential helper passa a ser gh — `git clone` puxa token do gh automaticamente. ✅ confirmado por documentação `gh auth setup-git`.
+- **Edge cases**:
+  - `gh auth setup-git` SOBRESCREVE credential.helper. Se JOs já tinha `store` apontando pra outro PAT (cenário do dev), o helper antigo é desconectado. **Comportamento esperado** mas pode confundir.
+  - `git config --global core.autocrlf input` — risco #7.5 coberto ✅.
+  - **Linha 359 tem typo lógico**: `gh auth login ... --web && gh auth setup-git && git config ...` — se `gh auth setup-git` falhar, autocrlf não roda. Ordem deve ser autocrlf primeiro (idempotente, sem deps). Cosmético.
+
+---
+
+### Step 11 — Clone `imp-squad` (privado)
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `git clone https://github.com/kennrick69/imp-squad.git _squad` em `/mnt/c/Projetos/`.
+- **Validação de SUCCESS**: `_squad/.git` existe + `_squad/_shared/REGRAS_GERAIS.md` existe.
+- **Detectores**: bash `[ -d ... ]`.
+- **Riscos cobertos**: #7.1 (não existe — fallback seed, MAS ver #A3), #7.2 (privado — gh helper), #7.4 (pasta existe sem .git → exit 2 abort, **bom**), #7.5 (autocrlf step 10).
+- **Testável agora?** ✅ SIM:
+  - `git ls-remote https://github.com/kennrick69/imp-squad.git HEAD` → `d199acbed58b... HEAD`, exit 0. ✅
+  - Repo confirmado como **privado** (anônimo 404, autenticado 200).
+- **Edge cases**:
+  - **#A3 BLOCKER**: fallback seed path `/mnt/c/Projetos/imp-installer/seeds/_squad.tar.gz` NÃO existe em runtime real (instalador rodando de %LOCALAPPDATA%).
+  - **#A5 ALTO**: depende do step 10 ter sido executado ANTES no PC zerado. Se algum dia step 10 ficar "skipped" (não acontece com CRITICAL_STEPS), step 11 falha silencioso. CRITICAL_STEPS hoje inclui step 10? Vou ver.
+
+---
+
+### Step 12 — Clone `imp-orchestrator` + npm install
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `git clone ... imp-orchestrator` + `npm install --omit=dev`.
+- **Validação de SUCCESS**: `.git/` + `node_modules/` existem.
+- **Detectores**: bash `[ -d ... ]`.
+- **Riscos cobertos**: #7.3 (rede no meio), #7.4 (pasta sem .git aborta).
+- **Testável agora?** ✅ SIM:
+  - `git ls-remote https://github.com/kennrick69/imp-orchestrator.git HEAD` → `d611562c... HEAD`, exit 0 ✅
+  - Repo é o que estou aqui dentro agora (`/home/jos/imp-orchestrator`).
+- **Edge cases**:
+  - `npm install --omit=dev` em Ubuntu 22.04 com node 20 deve funcionar. Pacotes do imp-orchestrator: ver `package.json` — não testei.
+  - Idempotente: `[ -d node_modules ] || npm install` — mas se npm install falhou parcial, `node_modules` existe mas incompleto. Não trata. Risco baixo.
+
+---
+
+### Step 13 — Sala 3D (escritorio-3d)
+
+- **Categoria**: HYBRID
+- **Comandos críticos**: `curl -fsSL --retry 3 -o escritorio-3d.zip https://github.com/kennrick69/escritorio-3d/releases/latest/download/escritorio-3d.zip` + `unzip -qo`.
+- **Validação de SUCCESS**: `escritorio-3d/index.html` existe.
+- **Detectores**: bash `[ -f .../index.html ]`.
+- **Riscos cobertos**: #8.1 (curl retry), #8.2 (FOLDER_MARKER touch).
+- **Testável agora?** ⚠️ PARCIAL — testei URL: **HTTP 404** (#A1 BLOCKER).
+- **Edge cases**:
+  - Release `latest` não existe.
+  - `unzip` pode não estar instalado (#A7).
+  - `decisions.escritorio3dStrategy === 'skip'` bypassa execute ✅, mas hoje main.js não setta esse valor → default behaviour é tentar e falhar.
+
+---
+
+### Step 14 — tmux session `imp` com 7 painéis
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `tmux new-session -d -s imp -n agents -c .../_squad/lider` + 5 split-window + 1 final pra main + `send-keys 'claude' Enter`.
+- **Validação de SUCCESS**: `tmux has-session -t imp` && `list-panes | wc -l = 7`.
+- **Detectores**: idem.
+- **Riscos cobertos**: #9.1 (respeitar se saudável — D5 do roteiro implementado ✅), #9.2 (parcial — não tem capture-pane check após send-keys), #9.3 (tmux 3.6 disponível neste WSL ✅), #9.4 (TERM — não setta default-terminal).
+- **Testável agora?** ✅ SIM (parcial):
+  - `tmux ls` → "no server running" (sessão `imp` não existe agora — esperado, é a interface que cria).
+  - `tmux -V` → `tmux 3.6` ✅ (Ubuntu 26.04 desta máquina; em Ubuntu 22.04 LTS oficial seria 3.2).
+- **Edge cases**:
+  - **Pré-condições**: `/mnt/c/Projetos/_squad/lider` deve existir. Step 11 cria `_squad` mas a estrutura interna depende do que tem no repo `imp-squad`. Não verificável sem clonar.
+  - `send-keys 'claude'` envia comando antes de claude estar pronto (race). Sem `capture-pane` confirmando prompt. Ressalva 9.2 ainda em aberto.
+  - `tmux set ... pane-border-status top` — escope `-g` global do server. Side-effect leve.
+
+---
+
+### Step 15 — Download IMP-Squad-Comando + shortcut
+
+- **Categoria**: AUTO
+- **Comandos críticos**: PowerShell — `Invoke-RestMethod releases/latest` + curl.exe download + WScript.Shell shortcut.
+- **Validação de SUCCESS**: shortcut + .exe ambos presentes.
+- **Detectores**: `Test-Path` no atalho + .exe.
+- **Riscos cobertos**: D4 (latest com fallback v0.3.1), nenhum risco específico de fase 1.
+- **Testável agora?** ✅ SIM (testei API, não executei download):
+  - `curl https://api.github.com/repos/kennrick69/imp-interface/releases/latest` → HTTP 200, asset `IMP-Squad-Comando-0.3.1-portable.exe` presente ✅.
+  - Fallback pinned URL `v0.3.1/IMP-Squad-Comando-0.3.1-portable.exe` resolve.
+- **Edge cases**:
+  - Path destino `%LOCALAPPDATA%\IMP-Squad\IMP-Squad.exe` — renomeia o portable. Atalho aponta pro novo nome. ✅.
+  - `curl.exe` (Windows nativo) precisa estar disponível — está em Win10 1803+. ✅ build 19045.
+  - Se asset name pattern `*portable*.exe` mudar (release v0.4 nomear diferente), select-object retorna nada → throw "Download falhou". Erro razoável.
+
+---
+
+### Step 16 — Validação end-to-end
+
+- **Categoria**: AUTO
+- **Comandos críticos**: `tmux list-panes -t imp | wc -l == 7`, `capture-pane -t imp.0 -p -S -100`, `Test-Path` shortcut + .exe.
+- **Validação de SUCCESS**: throw se algo faltar.
+- **Detectores**: sempre re-roda (`detect()` retorna false).
+- **Riscos cobertos**: detecção de regressão (steps anteriores passaram mas componentes sumiram).
+- **Testável agora?** ❌ NÃO — exige tudo de cima ter rodado.
+- **Edge cases**:
+  - `capture-pane -S -100` (achado #10 do live test commit a65dd5f) usa scrollback. ✅ aplicado.
+  - Regex `/claude|>|■|│/i` — `■│` são chars do tmux border. Vai matchar facilmente mesmo se claude ainda não subiu. **Detector fraco** mas `ctx.logger.warn` em vez de throw, então não bloqueia. ✅ pragmatic.
+
+---
+
+## PARTE 2 — Auditoria do clone automático ("6 agentes aparecem sozinhos")
+
+**Pergunta JOs**: "garante que o clone dos agentes é AUTOMÁTICO e transparente — o JOs só autoriza o GitHub uma vez, os 6 agentes aparecem sozinhos".
+
+### Fluxo real (do código de Bruno):
+
+1. **Step 10 `execute`** instala `gh` CLI via apt (com sudo prompt do step 05 cacheado se NOPASSWD; ou re-promptado).
+2. Abre **terminal interativo** (`wt.exe` ou `cmd /c start wsl`) com:
+   ```
+   gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && git config --global core.autocrlf input
+   ```
+3. **JOs interage UMA VEZ**: aceita device flow no browser, cola código de 8 dígitos no GitHub.com, autoriza.
+4. `gh auth setup-git` **configura credential.helper** apontando pro próprio `gh` (que tem o token salvo em `~/.config/gh/hosts.yml`).
+5. **Step 11 e 12** rodam `git clone https://github.com/kennrick69/imp-squad.git` SEM `gh` no comando — git invoca credential.helper que pergunta ao `gh`, que devolve o token. **Transparente.**
+
+### Confirmação por teste real:
+- Confirmei (`curl -s -o /dev/null -w '%{http_code}'`) que **anônimo retorna 404** e **com token retorna 200** → repo é privado. ✅
+- Confirmei (`env -i HOME=/tmp/fake git ls-remote ...`) que SEM credential helper o clone **falha** com `could not read Username for github.com: terminal prompts disabled`. ✅ comportamento esperado.
+- Confirmei que `git ls-remote` neste WSL (com `credential.helper=store` apontando pra `.git-credentials` pessoal do JOs) **retorna hash HEAD** ✅. Mesma transparência depois do `gh auth setup-git` (mecanismo equivalente).
+
+### **Resposta direta ao JOs**: **SIM, é automático** — após o ÚNICO momento interativo (device flow do step 10), os steps 11 e 12 clonam `imp-squad` e `imp-orchestrator` automaticamente. Os "6 agentes" são as 6 pastas dentro de `imp-squad/` (lider/arquiteto/criativo/debugger/qa/revisor) — uma vez clonado, todas aparecem juntas. Não há prompt manual entre.
+
+### **Caveats / atenção**:
+1. **Antes do device flow rodar** (passos 11/12 chamados antes do 10): falha. Mas runner sequencial garante a ordem.
+2. **gh CLI precisa ter sido instalado** (step 10 execute faz isso primeiro). Se apt update falhou e gh não instalou, step 10 detect retorna false e re-executa — mas user perde tempo.
+3. **`gh auth setup-git` pode ser interrompido** (terminal interativo fechado pelo usuário no meio). Polling continua, mas se `gh auth status` mostra logado mas `setup-git` não completou, clone falha. **Mitigação**: rodar `gh auth setup-git` separadamente como pós-passo idempotente após detect=true.
+4. **Token escopos**: `gh auth login --web` por padrão pede scopes `repo, read:org, gist`. ✅ suficiente pra clonar privado.
+
+---
+
+## PARTE 3 — Veredito
+
+### Números:
+- **Steps testados de fato (parcial ou total)**: **10 de 17** (00, 02, 04, 05, 06, 07, 08, 09, 11, 12, 13-URL, 14, 15-API).
+- **Steps com alta confiança que vão funcionar em PC zerado**: 8 (00, 01, 02 [após fix #A4], 05, 06, 07, 08, 12).
+- **Steps com confiança média**: 4 (03, 09, 10, 11, 14, 15, 16) — funcionam mas dependem de pré-condições da cadeia.
+- **Steps que CERTAMENTE vão quebrar**: 2 (**#A1 step 13** — release inexistente; **#A2 step 04** em PCs com Ubuntu genérico pré-instalado).
+- **Steps com BLOCKER de detector** (vão "achar que faltou" e re-executar desnecessariamente): 1 (**#A4 step 02/03** — UTF-16 mojibake).
+
+### Riscos da fase 1 — confiança ATUALIZADA:
+| Risco | Status novo | Comentário |
+|---|---|---|
+| #1.1 virt BIOS | Coberto como **warning** (não blocker) | Conforme #A do step 00 |
+| #1.5 reboot | Coberto via `scheduleRunOnceAfterReboot` | ✅ |
+| #1.7 outra distro WSL | **NÃO COBERTO** — ressalva Eduardo 6.§1.7 ainda em aberto | Pre-flight não detecta |
+| #1.8 Ubuntu primeira boot | Coberto pelo step 04, mas **#A2 quebra fallback launcher** | ❌ BLOCKER |
+| #2.4 dpkg lock | **NÃO COBERTO** — ressalva Eduardo 6.§2.4 | apt-get install falha sem hint |
+| #4.1 EACCES sem sudo | Coberto via nvm + npm prefix ✅ | 2 camadas |
+| #6.3 PAT colado / 2FA | Coberto via gh device flow ✅ | Design certo |
+| #7.1 repo não existe | **Fallback seeds quebrado** (#A3) | ❌ |
+| #7.5 CRLF | Coberto via `core.autocrlf input` ✅ | |
+| #8.1 sala 3D | **Release não existe** (#A1) — pior cenário ativo | ❌ |
+| #9.1 tmux existing | Coberto via "respeitar se saudável" ✅ | |
+| #9.2 painel claude race | **NÃO COBERTO** — sem capture-pane verify | médio risco |
+| #9.4 TERM/locale | **NÃO COBERTO** — sem default-terminal setta | médio |
+
+### Recomendação final: **NO-GO** para release v0.2.0 sem fixes mínimos.
+
+**3 razões (priorizadas)**:
+
+1. **#A1 (step 13)** + **#A3 (step 11 fallback)**: dois caminhos garantidos de falha em PC zerado real. Step 13 quebra na execução; step 11 funciona via clone (ok) MAS se o repo `imp-squad` algum dia ficar offline, o fallback seed aponta pra path errado. Resolver setando `decisions.escritorio3dStrategy = 'skip'` por default, e corrigindo seedsDir via env do Electron.
+
+2. **#A4 (UTF-16 mojibake em `wsl --status`/`wsl -l -v`)**: silenciosamente faz detect retornar false. Não quebra (idempotência salva), mas duplica trabalho e confunde logs. Em locale PT-BR é pior. Fix simples: `WSL_UTF8=1` env ou usar `wsl.exe` direto sem PowerShell.
+
+3. **#A2 (step 04 launcher hardcoded)**: cenário comum (JOs ou outro user com Ubuntu genérico instalado) leva a 10min de polling que NUNCA termina, sem feedback. Fix: detectar AppX presente e montar nome dinâmico.
+
+**Pós-fix**: rodar smoke novamente. Sem esses três, **release é GO** — os outros achados (#A5, #A6, #A7, #A8 + ressalvas Eduardo 1.7/2.4/9.2/9.4) são qualidade média e podem ir pra v0.3.0.
+
+---
+
+## Apêndice — comandos executados durante este smoke
+
+```bash
+# Step 00 — preflight
+powershell.exe '(Get-CimInstance Win32_Processor).VirtualizationFirmwareEnabled'  # → False (warning)
+powershell.exe '[Environment]::OSVersion.Version.Build'                            # → 19045
+powershell.exe '(Get-PSDrive C).Free / 1GB'                                        # → 55.03
+powershell.exe '...IsInRole...Administrator'                                       # → True
+
+# Step 05
+which tmux git curl jq gcc; tmux -V; git --version; curl --version | head -1
+
+# Step 06
+which node; node --version  # → /usr/bin/node v24.15.0 (sistema, não nvm)
+ls $HOME/.nvm/nvm.sh          # → ausente (nvm não instalado neste WSL)
+
+# Step 07
+npm config get prefix         # → /home/jos/.npm-global
+grep .npm-global ~/.bashrc    # → match
+
+# Step 08
+which claude; claude --version  # → /home/jos/.npm-global/bin/claude 2.1.150
+
+# Step 09
+claude --print "responda apenas: pong"  # → pong  ✅
+
+# Step 11/12
+git ls-remote https://github.com/kennrick69/imp-squad.git HEAD            # → d199acb... HEAD
+git ls-remote https://github.com/kennrick69/imp-orchestrator.git HEAD     # → d611562... HEAD
+curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/kennrick69/imp-squad  # → 404 anônimo, 200 com PAT
+
+# Step 13 (BLOCKER)
+curl -sIL https://github.com/kennrick69/escritorio-3d/releases/latest/download/escritorio-3d.zip  # → 404
+curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/kennrick69/escritorio-3d/releases/latest  # → 404
+
+# Step 14
+tmux ls                       # → no server running
+tmux -V                       # → 3.6
+
+# Step 15
+curl -s https://api.github.com/repos/kennrick69/imp-interface/releases/latest | grep browser_download_url
+# → IMP-Squad-Comando-0.3.1-portable.exe (assets OK)
+
+# Audit clone automático
+env -i HOME=/tmp/fake PATH=/usr/bin GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/kennrick69/imp-squad
+# → fatal: could not read Username for 'https://github.com' (confirma necessidade de credential helper)
+```

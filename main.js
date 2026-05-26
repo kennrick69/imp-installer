@@ -9,6 +9,7 @@ const runner = require('./src/runner');
 const preflight = require('./src/preflight');
 const { ALL_STEPS } = require('./src/executors');
 const { openInteractiveTerminal } = require('./src/shell');
+const { enrichError } = require('./src/error-catalog');
 
 const PRODUCT = 'IMP Squad Instalador';
 const STATE_DIR = path.join(os.homedir(), '.imp-installer');
@@ -129,14 +130,22 @@ function buildRunnerEvents() {
         }
       }
     },
-    onError: (err) => sendToRenderer('installer:onError', {
-      stepId: err.stepId,
-      headline: 'Algo deu errado',
-      what: err.error || String(err),
-      suggestions: err.suggestions || ['Tente novamente — pode ser instabilidade temporária.'],
-      canRetry: true,
-      canSkip: err.canSkip !== false,
-    }),
+    onError: (err) => {
+      // Eduardo 5.4: enriquece via catalog ANTES de mandar pra UI.
+      // Se o executor já anexou enriched (ex.: step_11 clone), usa direto.
+      const enriched = err.enriched
+        ? err.enriched
+        : enrichError(err.stepId, `${err.error || String(err)}\n${err.stderr || ''}`);
+      sendToRenderer('installer:onError', {
+        stepId: err.stepId,
+        headline: enriched.headline,
+        what: enriched.what,
+        suggestions: enriched.suggestions,
+        canRetry: enriched.canRetry,
+        canSkip: enriched.canSkip,
+        raw: enriched.raw,
+      });
+    },
     onState: (state) => sendToRenderer('installer:onState', state),
     requestSudoPassword,
   };
@@ -154,6 +163,7 @@ const PREFLIGHT_NAME_MAP = {
   internet_github: 'internet',
   virtualization: 'virtualization',
   antivirus: 'antivirus',
+  other_distros: 'other_distros',
 };
 
 ipcMain.handle('installer:start', async () => {
@@ -171,11 +181,7 @@ ipcMain.handle('installer:start', async () => {
   return { ok: true, checks };
 });
 
-ipcMain.handle('installer:resume', async () => {
-  const state = runner.startWizard(buildRunnerEvents());
-  sendToRenderer('installer:onScreen', { screen: 'progress' });
-  return { ok: true, state };
-});
+// installer:resume — handler ÚNICO definido mais abaixo (linha ~292) — pause/resume reais.
 
 ipcMain.handle('installer:runStep', async (_e, { stepId }) => {
   return runner.runStep(stepId, buildRunnerEvents());
@@ -276,7 +282,25 @@ ipcMain.handle('installer:openInterface', async () => {
 });
 
 ipcMain.handle('installer:pause', async () => {
-  return { ok: true };
+  // Eduardo 2.6: pause REAL agora — flag em _ctx.state.paused, checada por pauseGate.
+  return runner.pause();
+});
+
+ipcMain.handle('installer:resume', async () => {
+  // Antes era alias de start; agora separa: resume real é flip da flag pause.
+  // Mantemos compat: se ainda não há _ctx, faz startWizard.
+  if (!runner.getState() || !runner.isPaused()) {
+    runner.startWizard(buildRunnerEvents());
+    sendToRenderer('installer:onScreen', { screen: 'progress' });
+    return { ok: true };
+  }
+  return runner.resume();
+});
+
+ipcMain.handle('installer:reset', async () => {
+  // Eduardo 2.7: reset REAL — apaga state.json (preservando backup) e zera _ctx.
+  // Wizard chama em btn-fresh.
+  return runner.resetState();
 });
 
 ipcMain.handle('installer:closeApp', async () => {
