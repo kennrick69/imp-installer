@@ -303,6 +303,19 @@
             <ol class="manual-steps-list" id="manual-steps-list"></ol>
           </div>
 
+          <!-- PLANO B — caso o botão automático falhe -->
+          <div class="manual-fallback hidden" id="manual-fallback" role="region" aria-label="Plano B se a janela fechou">
+            <header class="mf-header">
+              <span class="mf-ico" aria-hidden="true">🛟</span>
+              <h3 id="manual-fallback-title">A janela fechou sozinha?</h3>
+            </header>
+            <div class="mf-command-row">
+              <code class="mf-code" id="manual-fallback-code"></code>
+              <button class="mf-copy" id="manual-fallback-copy" type="button">Copiar</button>
+            </div>
+            <ol class="mf-steps" id="manual-fallback-steps"></ol>
+          </div>
+
           <!-- Comandos copiáveis (se houver) -->
           <div class="manual-commands hidden" id="manual-commands">
             <h3>Pode precisar destes:</h3>

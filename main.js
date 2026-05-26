@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Menu, screen } = require('el
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
+const { spawn } = require('node:child_process');
 
 const runner = require('./src/runner');
 const preflight = require('./src/preflight');
@@ -215,6 +216,7 @@ function buildRunnerEvents() {
               instructions: [mi], // legacy compat — Camila ainda lê instructions[]
               steps: [{ num: 1, text: mi }],
               action: null,
+              fallback: null,
               commands: [],
               expected: null,
               note: null,
@@ -229,6 +231,7 @@ function buildRunnerEvents() {
               instructions: mi.map(String),
               steps: mi.map((t, i) => ({ num: i + 1, text: String(t) })),
               action: null,
+              fallback: null,
               commands: [],
               expected: null,
               note: null,
@@ -236,8 +239,9 @@ function buildRunnerEvents() {
               browser: step.manualBrowser || null,
             };
           } else if (mi && typeof mi === 'object') {
-            // Shape NOVO (Bruno v0.2.13). Mantém `instructions` (legacy) sincronizado
-            // pra UI antiga não quebrar.
+            // Shape NOVO (Bruno v0.2.13/14). Mantém `instructions` (legacy)
+            // sincronizado pra UI antiga não quebrar. Bruno v0.2.14: campo
+            // `fallback` novo (plano B em texto puro pro caso de janela fechar).
             const stepsArr = Array.isArray(mi.steps) ? mi.steps : [];
             payload = {
               stepId: step.id,
@@ -246,6 +250,7 @@ function buildRunnerEvents() {
               instructions: stepsArr.map(s => (s && s.text) ? String(s.text) : String(s)),
               steps: stepsArr,
               action: mi.action || null,
+              fallback: mi.fallback || null,
               commands: Array.isArray(mi.commands) ? mi.commands : [],
               expected: mi.expected || null,
               note: mi.note || null,
@@ -260,6 +265,7 @@ function buildRunnerEvents() {
               instructions: [],
               steps: [],
               action: null,
+              fallback: null,
               commands: [],
               expected: null,
               note: null,
@@ -518,17 +524,27 @@ safeHandle('installer:openTerminal', async (_e, { cmd } = {}) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// Bruno v0.2.13 — executeManualAction
+// Bruno v0.2.14 — executeManualAction (REFATORADO)
+//
 // Handler genérico pra botão de ação dos manualInstructions enriquecidos.
 // Camila chama com { kind, payload }:
 //   - kind='terminal' → abre WSL distro (opcionalmente rodando `cmd`)
 //   - kind='browser'  → shell.openExternal(payload.url)
-//   - kind='copy'     → no-op (renderer faz clipboard direto, mas mantemos
-//                       canal pra logging/telemetria futura)
-//   - kind='none'     → no-op (passos só-informativos)
+//   - kind='copy'     → no-op (renderer faz clipboard direto)
+//   - kind='none'     → no-op
 //
-// Termianl: usa openInteractiveTerminal já existente (wt.exe + fallback cmd.exe),
-// preservando o tratamento robusto que step_09/10 originais usavam.
+// Live-test v0.2.13: openInteractiveTerminal abriu janelas que sumiram antes
+// do JOs ler — ele viu a tela piscar sem entender o que era. Causa raiz:
+// /c (close) em vez de /k (keep). Agora forçamos /k e wt.exe sem auto-close.
+//
+// Estratégia:
+//   1. Tenta wt.exe (Windows Terminal — visual moderno, sempre stays-open).
+//   2. Fallback cmd.exe /k (KEEP OPEN após comando; CRÍTICO pro JOs ler).
+//
+// Com cmd: monta `wsl -d <distro> -- bash -lc "<cmd>; exec bash"`.
+//   - "exec bash" no fim mantém shell interativo vivo após cmd terminar,
+//     pra JOs ver output, ler erros, etc. Sem isso, wsl fechava na hora.
+// Sem cmd: `wsl -d <distro>` direto (já cai em shell interativo).
 // ───────────────────────────────────────────────────────────────────────
 safeHandle('installer:executeManualAction', async (_e, args = {}) => {
   const { kind, payload = {} } = args || {};
@@ -536,18 +552,34 @@ safeHandle('installer:executeManualAction', async (_e, args = {}) => {
   switch (kind) {
     case 'terminal': {
       const distro = payload.distro || 'Ubuntu';
-      const cmd = payload.cmd;
+      const cmd = payload.cmd; // opcional — comando inicial dentro do shell
+
+      // Args base do wsl. Se há cmd, embrulha em bash -lc com `exec bash` no
+      // fim pra shell ficar vivo após o comando — leitura do JOs.
+      // Sem cmd, wsl -d entra em shell interativo direto.
+      const wslArgs = ['-d', distro];
       if (cmd) {
-        // Roda comando inicial. openInteractiveTerminal já anexa
-        // "exit + read" no fim pra terminal não fechar sozinho.
-        const r = await openInteractiveTerminal(cmd, { distro, title: 'IMP — Passo manual' });
-        if (r && r.ok === false) return { ok: false, error: r.error || 'terminal não abriu' };
-        return { ok: true, distro, cmd };
+        wslArgs.push('--', 'bash', '-lc', `${cmd}; exec bash`);
       }
-      // Sem cmd: abre shell interativo limpo na distro.
-      const r = await openInteractiveTerminal('exec bash', { distro, title: 'IMP — Passo manual' });
-      if (r && r.ok === false) return { ok: false, error: r.error || 'terminal não abriu' };
-      return { ok: true, distro };
+
+      // PRIORIDADE 1: Windows Terminal (wt.exe). Mais bonito, sempre aberto.
+      try {
+        const wtArgs = ['-w', '0', 'new-tab', '--title', `IMP — ${distro}`, '--', 'wsl.exe', ...wslArgs];
+        const r1 = await trySpawnDetached('wt.exe', wtArgs);
+        if (r1.ok) return { ok: true, via: 'wt' };
+      } catch (_) { /* wt.exe não existe ou falhou — cai pro fallback */ }
+
+      // FALLBACK: cmd.exe /k (mantém janela viva após comando terminar).
+      // Estrutura: `start "" cmd /k wsl.exe -d <distro> [...]`
+      // /k = Keep open. CRÍTICO pra JOs ler/digitar sem janela sumir.
+      try {
+        const cmdArgs = ['/k', 'wsl.exe', ...wslArgs];
+        const r2 = await trySpawnDetached('cmd.exe', cmdArgs, { useStart: true });
+        if (r2.ok) return { ok: true, via: 'cmd' };
+        return { ok: false, error: r2.error || 'cmd.exe não abriu janela' };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
     }
     case 'browser': {
       const url = payload.url || payload.code;
@@ -566,6 +598,50 @@ safeHandle('installer:executeManualAction', async (_e, args = {}) => {
       return { ok: false, error: `kind desconhecido: ${kind}` };
   }
 }, { emitOnError: false });
+
+// Helper: spawn detached que considera SUCESSO se o processo sobrevive 800ms
+// sem erro. Pra terminais GUI (wt/cmd /k) isso é o sinal mais confiável —
+// não dá pra esperar exit_code porque a janela fica viva enquanto o usuário
+// usa. Se `useStart=true`, embrulha o cmd em `cmd.exe /c start "" <cmd> ...`
+// pra desanexar do parent e abrir JANELA VISÍVEL nova (importante pro cmd /k).
+function trySpawnDetached(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    try {
+      let child;
+      if (opts.useStart) {
+        // `start "" cmd /k ...` — primeiro arg vazio do start é o título da janela
+        // (obrigatório quando o exe está entre aspas, mas inofensivo aqui).
+        const startArgs = ['/c', 'start', '""', cmd, ...args];
+        child = spawn('cmd.exe', startArgs, {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+        });
+      } else {
+        child = spawn(cmd, args, {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+        });
+      }
+      let settled = false;
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: false, error: err.message });
+      });
+      // Se sobreviveu 800ms sem disparar 'error', considera sucesso e desanexa.
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { child.unref(); } catch (_) {}
+        resolve({ ok: true });
+      }, 800);
+    } catch (e) {
+      resolve({ ok: false, error: e.message });
+    }
+  });
+}
 
 safeHandle('installer:openBrowser', async (_e, { url } = {}) => {
   if (!url || !/^https?:\/\//i.test(url)) {

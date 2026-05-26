@@ -1188,6 +1188,15 @@ body {
   box-shadow: 0 6px 20px rgba(13, 148, 136, 0.45);
 }
 
+/* kind 'none' — botão informativo (steps 01/03 esperando algo) */
+.btn-manual-action.btn-passive {
+  background: linear-gradient(135deg, #475569 0%, #64748b 100%);
+  border-color: #475569;
+  box-shadow: none;
+  cursor: default;
+  opacity: 0.85;
+}
+
 .manual-action-hint {
   margin: 0;
   color: var(--text-secondary, #94a3b8);
@@ -1218,8 +1227,14 @@ body {
   color: var(--text-secondary, #94a3b8);
   line-height: 1.55;
 }
-.manual-steps-list li { font-size: 0.95em; }
+.manual-steps-list li {
+  font-size: 0.95em;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
 .manual-steps-list li strong { color: var(--text-primary, #e2e8f0); }
+.manual-steps-list li::marker { color: #14b8a6; font-weight: 700; }
+.manual-steps-list li + li { padding-top: 2px; }
 
 .manual-cmd-list {
   list-style: none;
@@ -1292,10 +1307,88 @@ body {
 .manual-expected .me-ico { color: #10b981; font-weight: 700; }
 
 .manual-note {
-  background: rgba(245, 158, 11, 0.08);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.30);
   border-left: 4px solid #f59e0b;
   color: var(--text-primary, #e2e8f0);
+  font-weight: 500;
 }
+.manual-note .mn-ico { color: #fbbf24; font-size: 1.15em; }
+.manual-note strong { color: #fbbf24; }
+
+/* ─── Plano B (fallback) — Camila v0.2.14 ─────────────────── */
+.manual-fallback {
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.30);
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  padding: 16px 18px;
+  margin: 4px 0 8px 0;
+}
+
+.manual-fallback .mf-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.manual-fallback .mf-ico { font-size: 1.3em; }
+
+.manual-fallback h3 {
+  margin: 0;
+  font-size: 1em;
+  font-weight: 600;
+  color: #fbbf24;
+}
+
+.manual-fallback .mf-command-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.30);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.manual-fallback .mf-code {
+  flex: 1;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 0.95em;
+  color: #e2e8f0;
+  background: transparent;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.manual-fallback .mf-copy {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  padding: 6px 14px;
+  background: var(--bg-card, #12121a);
+  border: 1px solid var(--border, #2a2d34);
+  border-radius: 4px;
+  color: #fbbf24;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.manual-fallback .mf-copy:hover { border-color: #fbbf24; }
+.manual-fallback .mf-copy.copied { background: #10b981; color: #fff; border-color: #10b981; }
+
+.manual-fallback .mf-steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary, #94a3b8);
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+
+.manual-fallback .mf-steps li::marker { color: #fbbf24; font-weight: 600; }
 
 /* ─── Verify + Skip ───────────────────────────────────────── */
 .manual-verify-row {

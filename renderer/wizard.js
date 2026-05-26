@@ -426,49 +426,59 @@
         }
       : ins;
 
-    // ─── Ação principal ────────────────────────────────────
+    // ─── Ação principal (Camila v0.2.14: garante visibilidade) ──
     const actionBtn  = $('#manual-action-btn');
     const actionRow  = actionBtn.closest('.manual-action-row');
     const actionHint = $('#manual-action-hint');
     if (data.action && data.action.label) {
       if (actionRow) actionRow.classList.remove('hidden');
       actionBtn.hidden = false;
-      actionBtn.disabled = false;
       actionBtn.textContent = data.action.label;
       actionHint.textContent = data.action.hint || 'Clique pra começar este passo.';
-      actionBtn.onclick = async () => {
-        const originalLabel = data.action.label;
+
+      // kind 'none' = label informativa, sem onClick (ex: "Aguardando…" nos steps 01/03)
+      if (data.action.kind === 'none') {
         actionBtn.disabled = true;
-        actionBtn.textContent = '⏳ Abrindo…';
-        try {
-          const fn = (api && typeof api.executeManualAction === 'function')
-            ? api.executeManualAction.bind(api)
-            : null;
-          if (!fn) {
-            toast('Não consegui abrir: ação não suportada pelo backend.', 'error');
-            actionBtn.disabled = false;
-            actionBtn.textContent = originalLabel;
-            return;
-          }
-          const r = await fn(data.action.kind, data.action.payload || {});
-          if (r && r.ok) {
-            actionBtn.textContent = '✓ Abri pra você — volte aqui depois';
-            setTimeout(() => {
+        actionBtn.onclick = null;
+        actionBtn.classList.add('btn-passive');
+      } else {
+        actionBtn.disabled = false;
+        actionBtn.classList.remove('btn-passive');
+        actionBtn.onclick = async () => {
+          const originalLabel = data.action.label;
+          actionBtn.disabled = true;
+          actionBtn.textContent = '⏳ Abrindo…';
+          try {
+            const fn = (api && typeof api.executeManualAction === 'function')
+              ? api.executeManualAction.bind(api)
+              : null;
+            if (!fn) {
+              toast('Não consegui abrir: ação não suportada pelo backend.', 'error');
               actionBtn.disabled = false;
               actionBtn.textContent = originalLabel;
-            }, 8000);
-          } else {
-            toast('Não consegui abrir: ' + ((r && r.error) || 'erro'), 'error');
+              return;
+            }
+            const r = await fn(data.action.kind, data.action.payload || {});
+            if (r && r.ok) {
+              actionBtn.textContent = '✓ Abri pra você — volte aqui depois';
+              setTimeout(() => {
+                actionBtn.disabled = false;
+                actionBtn.textContent = originalLabel;
+              }, 8000);
+            } else {
+              toast('Não consegui abrir: ' + ((r && r.error) || 'erro'), 'error');
+              actionBtn.disabled = false;
+              actionBtn.textContent = originalLabel;
+            }
+          } catch (e) {
+            toast('Erro: ' + (e?.message || ''), 'error');
             actionBtn.disabled = false;
             actionBtn.textContent = originalLabel;
           }
-        } catch (e) {
-          toast('Erro: ' + (e?.message || ''), 'error');
-          actionBtn.disabled = false;
-          actionBtn.textContent = originalLabel;
-        }
-      };
+        };
+      }
     } else {
+      // Sem shape de action — esconde de verdade.
       actionBtn.hidden = true;
       if (actionRow) actionRow.classList.add('hidden');
       actionHint.textContent = '';
@@ -531,6 +541,43 @@
       $('#manual-note-text').textContent = data.note;
     } else {
       noteBlock.classList.add('hidden');
+    }
+
+    // ─── PLANO B / fallback (Camila v0.2.14) ──────────────
+    // Se o botão automático falhar (UAC negado, janela fechou sozinha,
+    // sem permissão), JOs precisa de um caminho copiável manual.
+    const fb = data.fallback;
+    const fbBlock = $('#manual-fallback');
+    if (fbBlock) {
+      if (fb && (fb.command || (fb.steps && fb.steps.length))) {
+        fbBlock.classList.remove('hidden');
+        if (fb.title) $('#manual-fallback-title').textContent = fb.title;
+        const codeEl = $('#manual-fallback-code');
+        codeEl.textContent = fb.command || '';
+        const copyBtn = $('#manual-fallback-copy');
+        copyBtn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(fb.command || '');
+            copyBtn.textContent = '✓ Copiado';
+            copyBtn.classList.add('copied');
+            setTimeout(() => {
+              copyBtn.textContent = 'Copiar';
+              copyBtn.classList.remove('copied');
+            }, 1800);
+          } catch (e) {
+            toast('Não consegui copiar: ' + (e?.message || ''), 'error');
+          }
+        };
+        const fbSteps = $('#manual-fallback-steps');
+        fbSteps.innerHTML = '';
+        (fb.steps || []).forEach(s => {
+          const li = el('li');
+          li.textContent = typeof s === 'string' ? s : (s.text || '');
+          fbSteps.appendChild(li);
+        });
+      } else {
+        fbBlock.classList.add('hidden');
+      }
     }
 
     // ─── Reset verify ─────────────────────────────────────

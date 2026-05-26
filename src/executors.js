@@ -569,129 +569,66 @@ const step04UbuntuFirstBoot = {
   title: 'Primeira boot do Ubuntu (criar usuário UNIX)',
   description: 'Usuário precisa abrir Ubuntu uma vez para criar username/senha. Não automatizável.',
   category: 'MANUAL',
-  // Bruno v0.2.13: shape enriquecido (action/steps/expected/note). Camila usa
-  // pra renderizar botão grande + checklist + verify.
-  // Função pra que `ctx.state.distro` seja resolvido em runtime, não em load.
-  manualInstructions: (ctx) => ({
-    action: {
-      label: '🐧 Abrir Ubuntu',
-      kind: 'terminal',
-      payload: { distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu' },
-    },
-    steps: [
-      { num: 1, text: 'Uma janela preta do Ubuntu vai abrir' },
-      { num: 2, text: 'Digite um nome de usuário (letras minúsculas, sem espaço) + Enter' },
-      { num: 3, text: 'Digite uma senha + Enter — não aparece nada na tela, é normal no Linux' },
-      { num: 4, text: 'Digite a mesma senha de novo + Enter' },
-      { num: 5, text: 'Quando ver o prompt verde "usuario@PC:~$", feche a janela e volte aqui' },
-    ],
-    commands: [
-      { label: 'Comando pra conferir o usuário criado', code: 'whoami' },
-    ],
-    expected: 'Prompt verde "usuario@PC:~$" no terminal.',
-    note: 'ANOTE o usuário e a senha — vai usar várias vezes nos próximos passos (apt, sudo, etc.).',
-  }),
+  // Bruno v0.2.14: shape enriquecido com `fallback` (plano B se botão não funcionar).
+  // CRÍTICO: execute() é NO-OP — quem abre o terminal é executeManualAction (botão UI).
+  // Live-test v0.2.13 mostrou: Start-Process ubuntu2204.exe abria janela que fechava
+  // sozinha SEM JOs ver botão de controle. Agora UI dispara, terminal usa cmd /k
+  // (mantém aberto), JOs digita user/senha sem pressão, fecha, clica "Verificar".
+  manualInstructions: (ctx) => {
+    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
+    return {
+      action: {
+        label: '🐧 Abrir Ubuntu',
+        kind: 'terminal',
+        payload: { distro },
+      },
+      fallback: {
+        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
+        command: `wsl -d ${distro}`,
+        steps: [
+          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
+          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
+          '3. Volte aqui pra continuar nos passos acima',
+        ],
+      },
+      steps: [
+        { num: 1, text: 'Clique no botão verde 🐧 "Abrir Ubuntu" aqui em cima' },
+        { num: 2, text: 'Vai abrir uma JANELA PRETA. Espere uns segundos (pode aparecer "Installing...")' },
+        { num: 3, text: 'Vai aparecer "Enter new UNIX username:" — DIGITE um nome simples (ex: jose), tudo MINÚSCULO, sem espaço, e aperte Enter' },
+        { num: 4, text: 'Vai pedir senha: "New password:" — DIGITE uma senha. ⚠️ ATENÇÃO: a senha NÃO APARECE na tela enquanto você digita (sem bolinhas, sem nada). Isso é NORMAL no Linux, NÃO é erro! Aperte Enter' },
+        { num: 5, text: 'Vai pedir DE NOVO: "Retype new password:" — digite a MESMA senha e Enter' },
+        { num: 6, text: '✍️ ANOTE seu usuário e senha num papel AGORA — vai precisar várias vezes!' },
+        { num: 7, text: 'Quando aparecer texto verde tipo "jose@DESKTOP:~$", DEU CERTO! Pode fechar a janela preta e voltar aqui' },
+        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
+      ],
+      commands: [
+        { label: 'Comando pra conferir o usuário criado', code: 'whoami' },
+      ],
+      expected: 'Prompt verde "usuario@PC:~$" no terminal.',
+      note: 'ANOTE o usuário e a senha — vai usar várias vezes nos próximos passos (apt, sudo, etc.).',
+    };
+  },
   async detect(ctx) {
     try {
-      // Check default user is non-root and exists.
+      // Idempotente: true se default user já existe e é non-root.
+      // wsl whoami sem distro usa o default — que é o Ubuntu (step 01 setou).
+      // Não força recriar; se o user já foi criado antes, considera done.
       const { stdout } = await wsl(`whoami`, { distro: ctx.state.distro });
-      const u = stdout.trim();
+      const u = (stdout || '').trim();
       if (!u || u === 'root') return false;
       ctx.state.ubuntuUser = u;
-      ctx.save();
+      ctx.save && ctx.save();
       return true;
     } catch (_) { return false; }
   },
   async execute(ctx) {
-    // Open the Ubuntu console window so user can create account.
-    // Fix #A2: detectar dinamicamente qual launcher o WSL tem instalado.
-    // Em PCs com "Ubuntu" genérico (AppX CanonicalGroupLimited.Ubuntu) o launcher
-    // é `ubuntu.exe`; em "Ubuntu 22.04 LTS" (CanonicalGroupLimited.Ubuntu22.04LTS)
-    // é `ubuntu2204.exe`. Antigamente fallback hardcoded engolia falha silenciosa.
-    // Estratégia: descobrir via Get-Command quais .exe existem no PATH, e tentar
-    // na ordem 2204 → ubuntu-22.04 → ubuntu → wsl -d (último recurso).
-    let opened = false;
-    let launcherUsed = null;
-
-    // 1) Descobre launchers Ubuntu disponíveis (Get-Command devolve só os no PATH).
-    let availableLaunchers = [];
-    try {
-      const probe = `
-        $names = @()
-        Get-Command "ubuntu*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $names += $_.Name }
-        $names -join ';'
-      `;
-      const { stdout } = await powershell(probe, { timeout: 30_000 }).catch(() => ({ stdout: '' }));
-      availableLaunchers = (stdout || '').trim().split(';').filter(Boolean);
-      if (availableLaunchers.length) {
-        ctx.logger.info('step_04', `launchers Ubuntu encontrados: ${availableLaunchers.join(', ')}`);
-      }
-    } catch (_) {}
-
-    // 2) Monta ordem de tentativas: 2204 primeiro (matches D6 do roteiro), depois alt names, depois genérico.
-    const preferred = ['ubuntu2204.exe', 'ubuntu-22.04.exe', 'ubuntu.exe'];
-    const tryOrder = [];
-    // primeiro os preferidos que de fato existem
-    for (const p of preferred) {
-      if (availableLaunchers.some(n => n.toLowerCase() === p.toLowerCase())) tryOrder.push(p);
-    }
-    // se a probe falhou ou não achou nada, tenta cegamente na ordem preferida (Start-Process pode resolver via WindowsApps)
-    if (tryOrder.length === 0) tryOrder.push(...preferred);
-
-    for (const exe of tryOrder) {
-      try {
-        await powershell(`Start-Process ${exe}`, { timeout: 30_000 });
-        opened = true;
-        launcherUsed = exe;
-        ctx.logger.info('step_04', `abriu Ubuntu via ${exe}`);
-        break;
-      } catch (e) {
-        ctx.logger.warn('step_04', `${exe} falhou: ${e.message}`);
-      }
-    }
-
-    // 3) Último recurso: abre WSL direto pela distro via Windows Terminal (cria sessão e força primeiro setup).
-    if (!opened) {
-      try {
-        const distro = ctx.state.distro || 'Ubuntu-22.04';
-        ctx.logger.warn('step_04', `nenhum launcher .exe funcionou — tentando wsl.exe -d ${distro} via terminal`);
-        const { openInteractiveTerminal } = require('./shell');
-        await openInteractiveTerminal(`echo "Defina seu usuário Ubuntu abaixo:" && exec bash`, {
-          distro,
-          title: 'IMP — Primeira boot Ubuntu',
-        });
-        opened = true;
-        launcherUsed = `wsl.exe -d ${distro}`;
-      } catch (e) {
-        ctx.logger.error('step_04', `fallback wsl.exe também falhou: ${e.message}`);
-      }
-    }
-
-    if (!opened) {
-      throw new Error(
-        'Não consegui abrir o Ubuntu automaticamente. ' +
-        'Abra o Ubuntu pelo Menu Iniciar do Windows (procure "Ubuntu"), defina usuário+senha, e volte aqui.'
-      );
-    }
-
-    if (launcherUsed) ctx.state.ubuntuLauncher = launcherUsed;
-    ctx.save();
-
-    // Poll until detect() succeeds, with a 10-minute window.
-    // Emite progresso a cada 5s pro renderer não parecer travado (Eduardo 3.6).
-    const startTs = Date.now();
-    const deadline = startTs + 10 * 60 * 1000;
-    let lastLogTs = 0;
-    while (Date.now() < deadline) {
-      if (await this.detect(ctx)) return;
-      const elapsed = Math.floor((Date.now() - startTs) / 1000);
-      if (Date.now() - lastLogTs >= 5000) {
-        ctx.logger.info('step_04', `aguardando criação do usuário Ubuntu (${elapsed}s decorridos, timeout em 10 min)...`);
-        lastLogTs = Date.now();
-      }
-      await new Promise(r => setTimeout(r, 3000));
-    }
-    throw new Error('Ubuntu não respondeu em 10 min — abra o Ubuntu manualmente pelo menu Iniciar e complete o setup de usuário.');
+    // Manual step — abertura é via UI (botão clica → installer:executeManualAction).
+    // Apenas log; runner emite onStepUpdate(running) e a UI mostra manualInstructions.
+    // Live-test v0.2.13: ANTES esta função abria Start-Process ubuntu2204.exe e a
+    // janela fechava sozinha. Agora NO-OP. Quem abre é o handler executeManualAction
+    // do main.js usando cmd /k (mantém janela viva).
+    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
+    return;
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -856,30 +793,45 @@ const step09ClaudeLogin = {
   title: 'Login Claude Code (browser OAuth)',
   description: 'Abre terminal Windows com `claude` — usuário loga no browser e fecha.',
   category: 'MANUAL',
-  // Bruno v0.2.13: shape enriquecido. Botão dispara terminal já rodando `claude`.
-  manualInstructions: (ctx) => ({
-    action: {
-      label: '🔐 Abrir terminal pra login Claude',
-      kind: 'terminal',
-      payload: { distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu', cmd: 'claude' },
-    },
-    steps: [
-      { num: 1, text: 'Vai abrir um terminal com o Claude pedindo login' },
-      { num: 2, text: 'Ele mostra um link — copia (ou aperta Enter pra abrir no navegador)' },
-      { num: 3, text: 'Loga com sua conta Claude (Max ou Pro)' },
-      { num: 4, text: 'Cola o código de volta no terminal + Enter' },
-      { num: 5, text: 'Quando aparecer "Login successful" feche a janela e volte aqui' },
-    ],
-    commands: [
-      { label: 'Comando pra conferir login', code: 'claude --print "responda: pong"' },
-    ],
-    expected: '"Login successful" no terminal e `claude --print "pong"` retorna pong.',
-    note: 'Use uma conta Claude com plano ativo (Max/Pro/Team) — free não funciona pra Claude Code.',
-  }),
+  // Bruno v0.2.14: shape enriquecido com `fallback`. NO-OP execute (UI dispara).
+  manualInstructions: (ctx) => {
+    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
+    return {
+      action: {
+        label: '🔐 Abrir terminal pra login Claude',
+        kind: 'terminal',
+        payload: { distro, cmd: 'claude' },
+      },
+      fallback: {
+        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
+        command: `wsl -d ${distro} -- bash -lc 'claude'`,
+        steps: [
+          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
+          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
+          '3. Volte aqui pra continuar nos passos acima',
+        ],
+      },
+      steps: [
+        { num: 1, text: 'Clique no botão azul 🔐 "Abrir terminal pra login Claude" aqui em cima' },
+        { num: 2, text: 'Vai abrir uma JANELA PRETA com o Claude pedindo login' },
+        { num: 3, text: 'Ele mostra um LINK na tela — COPIE o link (selecione com o mouse, Ctrl+C)' },
+        { num: 4, text: 'Cole o link no navegador (Chrome/Edge) e LOGUE com sua conta Claude (Max ou Pro)' },
+        { num: 5, text: 'O navegador mostra um CÓDIGO — copie esse código' },
+        { num: 6, text: 'Volte na janela preta, COLE o código (botão direito do mouse cola) e aperte Enter' },
+        { num: 7, text: 'Quando aparecer "Login successful", DEU CERTO! Pode fechar a janela preta' },
+        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
+      ],
+      commands: [
+        { label: 'Comando pra conferir login', code: 'claude --print "responda: pong"' },
+      ],
+      expected: '"Login successful" no terminal e `claude --print "pong"` retorna pong.',
+      note: 'Use uma conta Claude com plano ativo (Max/Pro/Team) — free não funciona pra Claude Code.',
+    };
+  },
   async detect(ctx) {
     try {
       // claude --print is non-interactive; if not logged in it returns non-zero.
-      const { stdout, code } = await wsl(
+      const { stdout } = await wsl(
         `claude --print "responda apenas: pong" 2>/dev/null | tail -c 200`,
         { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 60_000 }
       ).catch(e => ({ stdout: '', code: e.code || 1 }));
@@ -887,14 +839,11 @@ const step09ClaudeLogin = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
-    await openInteractiveTerminal(`claude`, { distro: ctx.state.distro, title: 'IMP — Login Claude' });
-    // Poll for success (15 min window — user may pause).
-    const deadline = Date.now() + 15 * 60 * 1000;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 5000));
-      if (await this.detect(ctx)) return;
-    }
-    throw new Error('Timeout esperando login Claude — feche este passo manualmente quando o login estiver concluído.');
+    // Manual step — abertura é via UI (botão → installer:executeManualAction).
+    // Live-test v0.2.13: ANTES openInteractiveTerminal abria janela que sumia
+    // antes do JOs ler. Agora NO-OP, handler do main.js usa cmd /k.
+    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
+    return;
   },
   async validate(ctx) { return this.detect(ctx); },
 };
@@ -904,32 +853,46 @@ const step10GhAuth = {
   id: 'step_10_gh_auth',
   title: 'GitHub auth (gh CLI — Device Flow)',
   description: 'Instala gh CLI + gh auth login --web. Configura credential helper.',
-  category: 'HYBRID',
-  // Bruno v0.2.13: shape enriquecido. Botão abre terminal com `gh auth login`
-  // já rodando. URL device flow vai pros `commands` pra UI mostrar botão browser.
-  manualInstructions: (ctx) => ({
-    action: {
-      label: '🔑 Iniciar login GitHub (Device Flow)',
-      kind: 'terminal',
-      payload: {
-        distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu',
-        cmd: 'gh auth login --hostname github.com --git-protocol https --web',
+  category: 'MANUAL',
+  // Bruno v0.2.14: shape enriquecido com `fallback`. NO-OP execute (UI dispara).
+  manualInstructions: (ctx) => {
+    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
+    return {
+      action: {
+        label: '🔑 Iniciar login GitHub (Device Flow)',
+        kind: 'terminal',
+        payload: {
+          distro,
+          cmd: 'gh auth login --hostname github.com --git-protocol https --web',
+        },
       },
-    },
-    steps: [
-      { num: 1, text: 'Terminal abre rodando `gh auth login`' },
-      { num: 2, text: 'Ele mostra um código de 8 caracteres tipo "ABCD-1234" — COPIA' },
-      { num: 3, text: 'Abre github.com/login/device no navegador (botão abaixo)' },
-      { num: 4, text: 'Cola o código + autoriza com sua conta GitHub' },
-      { num: 5, text: 'Volta pro terminal, espera "Authentication complete", feche e volte aqui' },
-    ],
-    commands: [
-      { label: 'URL do Device Flow GitHub', code: 'https://github.com/login/device' },
-      { label: 'Comando pra conferir login', code: 'gh auth status' },
-    ],
-    expected: '"Authentication complete" no terminal e `gh auth status` mostra "Logged in to github.com".',
-    note: 'Use uma conta GitHub que tenha acesso ao repo kennrick69/imp-squad (squad privado).',
-  }),
+      fallback: {
+        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
+        command: `wsl -d ${distro} -- bash -lc 'gh auth login --web --git-protocol https'`,
+        steps: [
+          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
+          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
+          '3. Volte aqui pra continuar nos passos acima',
+        ],
+      },
+      steps: [
+        { num: 1, text: 'Clique no botão amarelo 🔑 "Iniciar login GitHub" aqui em cima' },
+        { num: 2, text: 'Vai abrir uma JANELA PRETA com o gh pedindo login' },
+        { num: 3, text: 'Ele mostra um CÓDIGO de 8 caracteres tipo "ABCD-1234" — COPIE esse código' },
+        { num: 4, text: 'Clique no botão "Abrir github.com/login/device" aqui embaixo (vai abrir no navegador)' },
+        { num: 5, text: 'Cole o código e LOGUE com sua conta GitHub (autorize o app)' },
+        { num: 6, text: 'Volte na janela preta — espere aparecer "Authentication complete"' },
+        { num: 7, text: 'DEU CERTO! Pode fechar a janela preta' },
+        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
+      ],
+      commands: [
+        { label: 'URL do Device Flow GitHub', code: 'https://github.com/login/device' },
+        { label: 'Comando pra conferir login', code: 'gh auth status' },
+      ],
+      expected: '"Authentication complete" no terminal e `gh auth status` mostra "Logged in to github.com".',
+      note: 'Use uma conta GitHub que tenha acesso ao repo kennrick69/imp-squad (squad privado).',
+    };
+  },
   async detect(ctx) {
     try {
       const { stdout } = await wsl(`gh auth status 2>&1 | grep -q "Logged in to github.com" && echo OK || echo MISSING`,
@@ -938,10 +901,16 @@ const step10GhAuth = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
-    // Install gh first if missing.
-    const installGh = `
-      set -e
-      if ! command -v gh >/dev/null; then
+    // Garante gh instalado ANTES de o user clicar o botão manual (auto-step).
+    // Login interativo é via UI (botão → installer:executeManualAction).
+    // Live-test v0.2.13: ANTES openInteractiveTerminal disparava aqui e a janela
+    // sumia. Agora só instala gh (silencioso, sem janela visível) e marca pra UI.
+    const ghCheck = await wsl(`command -v gh >/dev/null && echo OK || echo MISSING`,
+      { distro: ctx.state.distro, user: ctx.state.ubuntuUser }).catch(() => ({ stdout: 'MISSING' }));
+    if (!/OK/.test(ghCheck.stdout || '')) {
+      ctx.logger.info(this.id, 'gh CLI ausente — instalando antes do login manual');
+      const installGh = `
+        set -e
         (type -p wget >/dev/null || sudo apt-get install -y wget) \\
           && sudo mkdir -p -m 755 /etc/apt/keyrings \\
           && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \\
@@ -949,37 +918,29 @@ const step10GhAuth = {
           && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\
           && sudo apt-get update -y \\
           && sudo apt-get install -y gh
-      fi
-    `;
-    await withRetry(
-      () => sudoInWsl(installGh, {
-        distro: ctx.state.distro,
-        user: ctx.state.ubuntuUser,
-        passwordPromise: ctx.requestSudoPassword,
-        logger: ctx.logger,
-        timeout: 600_000,
-      }),
-      { label: 'install gh', attempts: 2, backoff: [5, 20], logger: ctx.logger }
-    );
-
-    // Open interactive terminal for device flow.
-    await openInteractiveTerminal(
-      `gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && git config --global core.autocrlf input`,
-      { distro: ctx.state.distro, title: 'IMP — Login GitHub' }
-    );
-    // Poll up to 15 min.
-    const deadline = Date.now() + 15 * 60 * 1000;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 5000));
-      if (await this.detect(ctx)) {
-        ctx.state.githubAuthMethod = 'device-flow';
-        ctx.save();
-        return;
-      }
+      `;
+      await withRetry(
+        () => sudoInWsl(installGh, {
+          distro: ctx.state.distro,
+          user: ctx.state.ubuntuUser,
+          passwordPromise: ctx.requestSudoPassword,
+          logger: ctx.logger,
+          timeout: 600_000,
+        }),
+        { label: 'install gh', attempts: 2, backoff: [5, 20], logger: ctx.logger }
+      );
     }
-    throw new Error('Timeout esperando gh auth login.');
+    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
+    return;
   },
-  async validate(ctx) { return this.detect(ctx); },
+  async validate(ctx) {
+    const ok = await this.detect(ctx);
+    if (ok) {
+      ctx.state.githubAuthMethod = 'device-flow';
+      ctx.save && ctx.save();
+    }
+    return ok;
+  },
 };
 
 // -------- step 11 — clone imp-squad ---------------------------------------
