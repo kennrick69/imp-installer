@@ -1,7 +1,7 @@
 {
   "name": "imp-installer",
   "productName": "IMP Squad \u2014 Instalador",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Instalador guiado da IMP Dev Squad (Windows zerado \u2192 squad rodando com 7 Claudes + interface).",
   "private": true,
   "main": "main.js",
@@ -54,6 +54,10 @@
       "artifactName": "IMP-Squad-Instalador-${version}-portable.exe",
       "icon": "assets/icon.ico",
       "requestedExecutionLevel": "requireAdministrator"
+    },
+    "portable": {
+      "requestExecutionLevel": "admin",
+      "unicode": true
     },
     "asar": true,
     "compression": "normal"
