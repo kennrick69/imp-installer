@@ -4,6 +4,46 @@ const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, schedule
 const preflight = require('./preflight');
 const { enrichError } = require('./error-catalog');
 
+// ───────────────────────────────────────────────────────────────────────
+// Wrapper: roda PowerShell e enriquece o erro com stdout+code+stderr.
+//
+// DISM e wsl.exe escrevem MUITOS erros em STDOUT, não stderr. Em particular,
+// erro 740 (ELEVATION_REQUIRED) sai com stderr vazio — o log do JOs no live
+// test mostrou exatamente isso: `{"stderr":""}` sem nenhuma pista do motivo.
+// Esta função SEMPRE inclui stdout + exit code na mensagem do erro, pra
+// debugar sem ficar adivinhando.
+//
+// Exit codes conhecidos (relevantes p/ steps 01/02/03):
+//   740   ERROR_ELEVATION_REQUIRED — falta admin (manifest deve resolver em v0.2.7)
+//   50    DISM: feature já em estado desejado / não suportado
+//   3010  DISM: sucesso mas precisa reboot (não-fatal)
+//   -1    wsl.exe: distro não instalada / erro genérico
+// ───────────────────────────────────────────────────────────────────────
+async function powershellVerbose(script, opts = {}) {
+  try {
+    return await powershell(script, opts);
+  } catch (e) {
+    const code = e.code != null ? e.code : '(unknown)';
+    const stdout = (e.stdout || '').trim();
+    const stderr = (e.stderr || '').trim();
+    const parts = [
+      `exit_code=${code}`,
+      stdout ? `stdout=${stdout.slice(0, 1500)}` : 'stdout=(empty)',
+      stderr ? `stderr=${stderr.slice(0, 1500)}` : 'stderr=(empty)',
+    ];
+    // Hint específico pra erro 740 — orienta o user/dev sem cavar log.
+    if (code === 740 || /elevation|0x[0-9a-f]*2e4|ELEVATION_REQUIRED/i.test(stdout + stderr)) {
+      parts.push('hint=ELEVATION_REQUIRED (code 740) — manifest deveria forçar elevação no boot');
+    }
+    const enriched = new Error(`${e.message} | ${parts.join(' | ')}`);
+    enriched.code = code;
+    enriched.stdout = stdout;
+    enriched.stderr = stderr;
+    enriched.originalMessage = e.message;
+    throw enriched;
+  }
+}
+
 // Each executor exports: { id, title, description, category, detect, execute, validate, manualInstructions? }
 //   detect():    Promise<boolean>  — true if step is already done (skip).
 //   execute():   Promise<void>     — perform work. May throw to mark error.
@@ -81,8 +121,10 @@ const step01EnableFeatures = {
   },
   async execute() {
     await requireAdminOrThrow();
-    await powershell(`dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`);
-    await powershell(`dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`);
+    // Bruno v0.2.7: powershellVerbose captura stdout+code (dism erra no stdout,
+    // não stderr — log do JOs no live test mostrou stderr vazio sem pista nenhuma).
+    await powershellVerbose(`dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`);
+    await powershellVerbose(`dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`);
   },
   async validate() { return this.detect(); },
 };
@@ -103,7 +145,8 @@ const step02SetWslDefaultV2 = {
   },
   async execute() {
     await requireAdminOrThrow();
-    await powershell(`wsl --set-default-version 2`);
+    // wsl.exe também erra no stdout (mojibake UTF-16 LE já é tratado em decodeWslOutput).
+    await powershellVerbose(`wsl --set-default-version 2`);
   },
   async validate() { return this.detect(); },
 };
@@ -136,7 +179,7 @@ const step03WslInstall = {
     } catch (_) {}
 
     await withRetry(
-      () => powershell(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
+      () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
       { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
     );
 

@@ -71,12 +71,31 @@ app.whenReady().then(() => {
   // que pode morrer com segurança. Síncrono e best-effort — se PS falhar
   // detectando privilégio, simplesmente não escreve o lock (e o velho
   // espera 60s e desiste, mantendo-se vivo).
+  //
+  // Bruno v0.2.7: com `requestedExecutionLevel: "requireAdministrator"` no
+  // manifest do .exe (package.json build.win), o Windows DEVE forçar UAC
+  // no duplo-clique e o .exe nascer elevado SEMPRE (a menos que EnableLUA=0
+  // ou GPO corporativo desabilite UAC). Logamos isso no boot pra confirmar
+  // que tá funcionando — JOs vê na 1a tela se nasceu elevado ou não.
   try {
     const isAdm = require('child_process').execSync(
       `powershell -NoProfile -Command "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"`,
       { timeout: 5000, encoding: 'utf8', windowsHide: true }
     );
-    if (/true/i.test(isAdm)) {
+    const elevatedAtBoot = /true/i.test(isAdm);
+    const bootLogFile = path.join(STATE_DIR, 'logs', `boot-${Date.now()}.log`);
+    try {
+      fs.mkdirSync(path.dirname(bootLogFile), { recursive: true });
+      fs.appendFileSync(
+        bootLogFile,
+        `[${new Date().toISOString()}] boot pid=${process.pid} elevated=${elevatedAtBoot}\n` +
+        `[${new Date().toISOString()}] ${elevatedAtBoot
+          ? 'Processo nasceu elevado (via manifest requireAdministrator ou relaunch UAC)'
+          : 'Processo NÃO nasceu elevado — manifest pode estar ausente OU UAC desabilitado por GPO'
+        }\n`
+      );
+    } catch (_) {}
+    if (elevatedAtBoot) {
       fs.mkdirSync(STATE_DIR, { recursive: true });
       fs.writeFileSync(
         ELEVATED_LOCK,
