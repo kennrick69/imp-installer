@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>IMP Squad — Instalador</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app" aria-live="polite">
+
+    <!-- =========================================================
+         TOPBAR (presente em todas as telas)
+    ========================================================== -->
+    <header id="topbar" role="banner">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">◆</span>
+        <strong>IMP Squad</strong>
+        <span class="brand-sep">/</span>
+        <span class="brand-sub">Instalador</span>
+        <span class="version" id="installer-version">v0.1.0</span>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn-mini" id="btn-open-logs" title="Ver logs detalhados (Ctrl+L)" aria-label="Abrir logs detalhados">
+          Logs
+        </button>
+        <button class="btn-mini" id="btn-export-logs" title="Exportar logs em arquivo" aria-label="Exportar logs">
+          Exportar
+        </button>
+      </div>
+    </header>
+
+    <!-- =========================================================
+         CONTAINER DAS TELAS
+         Apenas uma .screen visível por vez (classe .active)
+    ========================================================== -->
+    <main id="screens">
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 1 — BOAS-VINDAS
+      ────────────────────────────────────────────────────── -->
+      <section class="screen active" id="screen-welcome" aria-labelledby="welcome-title">
+        <div class="screen-inner welcome-wrap">
+          <div class="welcome-hero">
+            <div class="hero-mark" aria-hidden="true">◆</div>
+            <h1 id="welcome-title">Vamos montar a sua squad.</h1>
+            <p class="hero-sub">
+              Em alguns minutos seu computador estará com a IMP Dev Squad
+              instalada e funcionando. Eu cuido dos detalhes — você só
+              acompanha e me ajuda quando algo precisar de você.
+            </p>
+          </div>
+
+          <!-- Cartão de retomada (visível só se state.json existir) -->
+          <div class="resume-card hidden" id="resume-card" role="region" aria-label="Instalação anterior encontrada">
+            <div class="resume-icon" aria-hidden="true">↻</div>
+            <div class="resume-body">
+              <h3>Encontrei uma instalação anterior</h3>
+              <p id="resume-detail">Você parou no <strong id="resume-step-name">Passo X</strong>. Posso continuar de onde estava.</p>
+            </div>
+            <div class="resume-actions">
+              <button class="btn-primary" id="btn-resume">Retomar</button>
+              <button class="btn-ghost" id="btn-fresh">Começar do zero</button>
+            </div>
+          </div>
+
+          <!-- Resumo do que vai ser instalado -->
+          <div class="install-summary" aria-label="O que vai ser instalado">
+            <h3 class="summary-title">O que eu vou instalar pra você</h3>
+            <ul class="summary-grid" id="summary-grid">
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>WSL2 + Ubuntu 22.04</strong><span>Linux dentro do Windows, base de tudo</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Node 20 LTS + npm</strong><span>Runtime que a squad precisa</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Claude Code CLI</strong><span>Os 7 Claudes da squad rodam nele</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>tmux + git + utilitários</strong><span>Cola que segura os painéis</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Login no Claude e no GitHub</strong><span>Você autoriza, eu guardo seguro</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Repositórios da squad</strong><span>imp-squad e imp-orchestrator</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Sessão tmux com 7 painéis</strong><span>Cada Claude no seu lugar</span></div></li>
+              <li><span class="sg-ico" aria-hidden="true">◆</span><div><strong>Squad Comando (interface)</strong><span>Atalho no Desktop, pronto pra abrir</span></div></li>
+            </ul>
+          </div>
+
+          <!-- Tempo + admin notice -->
+          <div class="welcome-meta">
+            <div class="meta-pill">
+              <span class="mp-ico" aria-hidden="true">⏱</span>
+              <span>Tempo estimado: <strong>15 a 25 minutos</strong></span>
+            </div>
+            <div class="meta-pill">
+              <span class="mp-ico" aria-hidden="true">↺</span>
+              <span>1 reinício necessário no meio</span>
+            </div>
+          </div>
+
+          <!-- Aceite -->
+          <label class="consent" id="consent-row">
+            <input type="checkbox" id="consent-checkbox" />
+            <span>
+              Entendi que em alguns momentos o Windows vai pedir <strong>permissão de administrador</strong>
+              e que pode ser necessário <strong>reiniciar o computador</strong>.
+            </span>
+          </label>
+
+          <div class="welcome-cta">
+            <button class="btn-primary btn-large" id="btn-start" disabled aria-describedby="consent-row">
+              Começar instalação →
+            </button>
+            <button class="btn-ghost" id="btn-cancel-welcome">Sair</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 2 — PRÉ-FLIGHT
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-preflight" aria-labelledby="preflight-title">
+        <div class="screen-inner preflight-wrap">
+          <header class="screen-head">
+            <h2 id="preflight-title">Verificando seu computador</h2>
+            <p class="screen-sub">
+              Estou conferindo se tudo está pronto pra começar. Falhar agora é melhor
+              que falhar daqui a 20 minutos.
+            </p>
+          </header>
+
+          <ul class="preflight-grid" id="preflight-grid" role="list">
+            <li class="pf-card" data-check="windows" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Versão do Windows</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+            <li class="pf-card" data-check="admin" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Privilégio de administrador</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+            <li class="pf-card" data-check="disk" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Espaço em disco</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+            <li class="pf-card" data-check="internet" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Conexão com a internet</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+            <li class="pf-card" data-check="virtualization" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Virtualização (BIOS)</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+            <li class="pf-card" data-check="antivirus" data-state="pending">
+              <span class="pf-icon" aria-hidden="true">⏳</span>
+              <div class="pf-body">
+                <h4>Antivírus</h4>
+                <p class="pf-status">Verificando…</p>
+              </div>
+            </li>
+          </ul>
+
+          <div class="preflight-foot">
+            <button class="btn-ghost" id="btn-preflight-recheck">Conferir de novo</button>
+            <button class="btn-primary" id="btn-preflight-next" disabled>Avançar →</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 3 — PROGRESSO PRINCIPAL
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-progress" aria-labelledby="progress-title">
+        <div class="progress-layout">
+
+          <!-- Sidebar com os 17 passos -->
+          <aside class="steps-sidebar" aria-label="Etapas da instalação">
+            <header class="sidebar-head">
+              <h3 id="progress-title">Etapas</h3>
+              <span class="step-counter"><span id="step-done-count">0</span>/<span id="step-total-count">17</span></span>
+            </header>
+            <div class="overall-progress" aria-label="Progresso total">
+              <div class="overall-bar"><div class="overall-fill" id="overall-fill" style="width:0%"></div></div>
+            </div>
+            <ol class="step-list" id="step-list" role="list">
+              <!-- Renderizado por JS — template guardado abaixo -->
+            </ol>
+          </aside>
+
+          <!-- Painel central -->
+          <section class="step-detail" aria-live="polite">
+            <header class="detail-head">
+              <div class="detail-meta">
+                <span class="step-num" id="cur-step-num">0</span>
+                <span class="step-cat-badge" id="cur-step-cat" data-cat="auto">AUTO</span>
+              </div>
+              <h2 class="step-title" id="cur-step-title">Aguardando início…</h2>
+              <p class="step-desc" id="cur-step-desc">Em instantes começo a executar o primeiro passo.</p>
+            </header>
+
+            <div class="step-progress" aria-label="Progresso do passo atual">
+              <div class="step-bar"><div class="step-fill" id="step-fill" style="width:0%"></div></div>
+              <span class="step-eta" id="step-eta">—</span>
+            </div>
+
+            <section class="logs-pane" aria-label="Logs ao vivo">
+              <header class="logs-head">
+                <h4>Logs ao vivo</h4>
+                <label class="check"><input type="checkbox" id="autoscroll-toggle" checked /> auto-scroll</label>
+              </header>
+              <pre class="logs-body" id="logs-body" tabindex="0" aria-live="polite"></pre>
+            </section>
+
+            <footer class="detail-foot">
+              <button class="btn-ghost" id="btn-pause" aria-label="Pausar instalação">Pausar</button>
+              <button class="btn-ghost btn-danger" id="btn-skip" aria-label="Pular passo atual">Pular passo</button>
+              <div class="spacer"></div>
+              <span class="connection-pill" id="connection-pill" aria-live="polite">
+                <span class="cp-dot"></span><span>Trabalhando…</span>
+              </span>
+            </footer>
+          </section>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 4 — PASSO MANUAL
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-manual" aria-labelledby="manual-title">
+        <div class="screen-inner manual-wrap">
+          <header class="screen-head">
+            <span class="step-cat-badge inline" data-cat="manual">MANUAL</span>
+            <h2 id="manual-title">Preciso de você por um momento</h2>
+            <p class="screen-sub" id="manual-subtitle">Esse passo não dá pra automatizar com segurança. Eu te guio.</p>
+          </header>
+
+          <ol class="manual-steps" id="manual-steps" role="list">
+            <!-- Preenchido por JS -->
+          </ol>
+
+          <div class="manual-tools">
+            <button class="btn-ghost" id="btn-manual-open-terminal" hidden>
+              <span class="btn-ico" aria-hidden="true">▶</span> Abrir terminal pra mim
+            </button>
+            <button class="btn-ghost" id="btn-manual-open-browser" hidden>
+              <span class="btn-ico" aria-hidden="true">↗</span> Abrir navegador
+            </button>
+            <button class="btn-ghost" id="btn-manual-verify">
+              <span class="btn-ico" aria-hidden="true">✓</span> Verificar agora
+            </button>
+          </div>
+
+          <label class="confirm-big">
+            <input type="checkbox" id="manual-done-check" />
+            <span><strong>Já fiz isso.</strong> Pode continuar.</span>
+          </label>
+
+          <div class="manual-foot">
+            <button class="btn-ghost" id="btn-manual-help">Não estou conseguindo</button>
+            <button class="btn-primary" id="btn-manual-next" disabled>Próximo →</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 5 — ERRO
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-error" aria-labelledby="error-title">
+        <div class="screen-inner error-wrap">
+          <div class="error-card">
+            <div class="error-icon" aria-hidden="true">!</div>
+            <h2 id="error-title">Ops, travei no passo <span id="error-step-num">?</span></h2>
+            <p class="error-headline" id="error-headline">
+              Algo não deu certo. Vou te explicar e a gente decide juntos o próximo passo.
+            </p>
+
+            <div class="error-detail">
+              <h4>O que aconteceu</h4>
+              <p id="error-what">—</p>
+            </div>
+
+            <div class="error-detail">
+              <h4>O que você pode tentar</h4>
+              <ul id="error-suggestions">
+                <li>Tentar de novo — às vezes é só rede instável.</li>
+              </ul>
+            </div>
+
+            <div class="error-actions">
+              <button class="btn-primary" id="btn-error-retry">Tentar de novo</button>
+              <button class="btn-ghost" id="btn-error-skip">Pular este passo</button>
+              <button class="btn-ghost" id="btn-error-logs">Ver logs detalhados</button>
+              <button class="btn-ghost" id="btn-error-help">Pedir ajuda</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA 6 — FINAL
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-done" aria-labelledby="done-title">
+        <div class="screen-inner done-wrap">
+          <div class="done-burst" aria-hidden="true">
+            <div class="burst-ring"></div>
+            <div class="burst-ring delay-1"></div>
+            <div class="burst-ring delay-2"></div>
+            <div class="burst-check">✓</div>
+          </div>
+
+          <h1 id="done-title">Tudo pronto!</h1>
+          <p class="done-sub">
+            Sua IMP Dev Squad está instalada. <span id="done-time-pill" class="done-time-pill">Levou 21 min</span>
+          </p>
+
+          <ul class="done-checklist" id="done-checklist" role="list">
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> WSL2 + Ubuntu 22.04</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Node 20 + npm</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Claude Code CLI</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Login Claude + GitHub</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Repos clonados</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Sessão tmux com 7 painéis</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Squad Comando v0.3.1</li>
+            <li><span class="dc-ico ok" aria-hidden="true">✓</span> Atalho no Desktop</li>
+          </ul>
+
+          <div class="done-actions">
+            <button class="btn-primary btn-large" id="btn-open-interface">
+              Abrir IMP Squad Comando
+            </button>
+            <button class="btn-ghost" id="btn-install-sala3d">
+              Instalar Sala 3D (130 MB)
+            </button>
+            <button class="btn-ghost" id="btn-close-installer">Fechar</button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- =========================================================
+         MODAL — INSTALAR SALA 3D
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-sala3d" role="dialog" aria-modal="true" aria-labelledby="sala3d-title">
+      <div class="modal">
+        <header>
+          <h2 id="sala3d-title">Instalar Sala 3D?</h2>
+          <button class="close" data-close-modal="modal-sala3d" aria-label="Fechar">×</button>
+        </header>
+        <div class="body">
+          <p>
+            A sala 3D é o ambiente visual onde sua squad aparece como personagens.
+            <strong>Não é obrigatório</strong> — a IMP Squad funciona 100% sem ela.
+          </p>
+          <ul class="bullet-info">
+            <li>Tamanho do download: <strong>≈ 130 MB</strong></li>
+            <li>Espaço final em disco: <strong>≈ 180 MB</strong></li>
+            <li>Tempo estimado: 3–5 minutos (depende da internet)</li>
+          </ul>
+          <p class="hint">Posso instalar depois também — basta abrir o instalador de novo.</p>
+          <div class="dl-progress hidden" id="sala3d-progress" aria-live="polite">
+            <div class="dl-bar"><div class="dl-fill" id="sala3d-fill" style="width:0%"></div></div>
+            <span class="dl-text" id="sala3d-text">Baixando… 0%</span>
+          </div>
+        </div>
+        <footer>
+          <button class="btn-ghost" data-close-modal="modal-sala3d">Agora não</button>
+          <button class="btn-primary" id="btn-sala3d-confirm">Instalar</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         MODAL — LOGS DETALHADOS
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-logs" role="dialog" aria-modal="true" aria-labelledby="logs-title">
+      <div class="modal modal-wide">
+        <header>
+          <h2 id="logs-title">Logs detalhados</h2>
+          <button class="close" data-close-modal="modal-logs" aria-label="Fechar">×</button>
+        </header>
+        <div class="body logs-modal-body">
+          <div class="logs-filter">
+            <label>Filtrar por passo:
+              <select id="logs-filter-step">
+                <option value="all">Todos os passos</option>
+              </select>
+            </label>
+            <label>Nível:
+              <select id="logs-filter-level">
+                <option value="all">Tudo</option>
+                <option value="info">Info</option>
+                <option value="warn">Avisos</option>
+                <option value="error">Erros</option>
+              </select>
+            </label>
+            <button class="btn-mini" id="btn-logs-copy">Copiar</button>
+            <button class="btn-mini" id="btn-logs-export">Exportar .log</button>
+          </div>
+          <pre class="logs-modal-pane" id="logs-modal-pane" tabindex="0"></pre>
+        </div>
+        <footer>
+          <button class="btn-ghost" data-close-modal="modal-logs">Fechar</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         MODAL — CONFIRMAR PULAR PASSO
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-skip" role="dialog" aria-modal="true" aria-labelledby="skip-title">
+      <div class="modal">
+        <header>
+          <h2 id="skip-title">Pular este passo?</h2>
+          <button class="close" data-close-modal="modal-skip" aria-label="Fechar">×</button>
+        </header>
+        <div class="body">
+          <p class="warn-line">
+            <span class="warn-ico" aria-hidden="true">⚠</span>
+            <strong>Pular pode quebrar passos seguintes.</strong>
+          </p>
+          <p>Só pule se você tem certeza de que esse componente já está instalado de outra forma, ou se quer testar o resto e voltar nele depois.</p>
+          <label class="settings-field">
+            Motivo (opcional, vai pro log):
+            <input type="text" id="skip-reason" placeholder="Ex: já tenho Node 22 instalado" />
+          </label>
+        </div>
+        <footer>
+          <button class="btn-ghost" data-close-modal="modal-skip">Cancelar</button>
+          <button class="btn-primary btn-danger-strong" id="btn-skip-confirm">Pular mesmo assim</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         MODAL: SENHA SUDO (fix Eduardo 2.3)
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-sudo" role="dialog" aria-modal="true" aria-labelledby="sudo-title">
+      <div class="modal">
+        <header>
+          <h2 id="sudo-title">Sua senha do Ubuntu</h2>
+          <button class="close" data-close-modal="modal-sudo" aria-label="Fechar">×</button>
+        </header>
+        <div class="body">
+          <p id="sudo-prompt-text">A instalação precisa da sua senha do Ubuntu (sudo) pra continuar.</p>
+          <p class="hint">Senha não fica salva, não vai pro log e só roda comandos do passo atual.</p>
+          <label class="settings-field">
+            Senha
+            <input type="password" id="sudo-input" autocomplete="current-password" autofocus />
+          </label>
+        </div>
+        <footer>
+          <button class="btn-ghost" id="btn-sudo-cancel">Cancelar</button>
+          <button class="btn-primary" id="btn-sudo-confirm">Confirmar</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         TOAST CONTAINER
+    ========================================================== -->
+    <div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+  </div>
+
+  <script src="wizard.js"></script>
+</body>
+</html>

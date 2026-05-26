@@ -1,0 +1,59 @@
+{
+  "name": "imp-installer",
+  "productName": "IMP Squad — Instalador",
+  "version": "0.1.0",
+  "description": "Instalador guiado da IMP Dev Squad (Windows zerado → squad rodando com 7 Claudes + interface).",
+  "private": true,
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win --x64",
+    "pack": "electron-builder --dir",
+    "asar:check": "asar list dist/win-unpacked/resources/app.asar | grep -E 'src/|main.js|preload.js|renderer/'"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.imp.squad.installer",
+    "productName": "IMP Squad Instalador",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "!**/*.log",
+      "!**/*.map",
+      "!**/*.test.js",
+      "!**/.DS_Store",
+      "!**/node_modules/*/{test,tests,__tests__,docs,example,examples}/**",
+      "!**/*.{md,markdown}",
+      "!docs/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "IMP-Squad-Instalador-${version}-portable.exe"
+    },
+    "asar": true,
+    "compression": "normal"
+  },
+  "author": "IMP Dev Squad (Claudio, Marcos, Camila, Bruno, Patrícia, Eduardo)",
+  "license": "ISC"
+}
