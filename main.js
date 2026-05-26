@@ -8,7 +8,7 @@ const os = require('node:os');
 const runner = require('./src/runner');
 const preflight = require('./src/preflight');
 const { ALL_STEPS } = require('./src/executors');
-const { openInteractiveTerminal } = require('./src/shell');
+const { openInteractiveTerminal, isElevated, relaunchAsAdmin } = require('./src/shell');
 const { enrichError } = require('./src/error-catalog');
 
 const PRODUCT = 'IMP Squad Instalador';
@@ -131,11 +131,21 @@ function buildRunnerEvents() {
       }
     },
     onError: (err) => {
+      // Bruno live-test #3: erro NEEDS_ADMIN é tratamento ESPECIAL.
+      // Em vez do modal-error genérico, dispara modal-elevate na UI
+      // (Camila tem o `installer:onNeedsAdmin` listener no renderer).
+      const errMsg = `${err.error || String(err)}\n${err.stderr || ''}`;
+      const isAdminError = err.code === 'NEEDS_ADMIN'
+        || /NEEDS_ADMIN|precisa de administrador/i.test(errMsg);
+      if (isAdminError) {
+        sendToRenderer('installer:onNeedsAdmin', { stepId: err.stepId });
+        return; // não emite onError genérico
+      }
       // Eduardo 5.4: enriquece via catalog ANTES de mandar pra UI.
       // Se o executor já anexou enriched (ex.: step_11 clone), usa direto.
       const enriched = err.enriched
         ? err.enriched
-        : enrichError(err.stepId, `${err.error || String(err)}\n${err.stderr || ''}`);
+        : enrichError(err.stepId, errMsg);
       sendToRenderer('installer:onError', {
         stepId: err.stepId,
         headline: enriched.headline,
@@ -445,6 +455,46 @@ safeHandle('installer:pickFolder', async () => {
   });
   if (r.canceled || !r.filePaths[0]) return { ok: false };
   return { ok: true, path: r.filePaths[0] };
+}, { emitOnError: false });
+
+// ───────────────────────────────────────────────────────────────────────
+// Admin elevation handlers (Bruno — live-test #3, v0.2.4 -> v0.2.5)
+// ───────────────────────────────────────────────────────────────────────
+safeHandle('installer:isElevated', async () => {
+  return { ok: true, elevated: await isElevated() };
+}, { emitOnError: false });
+
+// Pending quit timer (Eduardo blocker fix v0.2.5): se JOs cancelar o UAC,
+// não queremos matar o instalador velho. Mantém referência pra cancelar.
+let _pendingQuitTimer = null;
+
+safeHandle('installer:relaunchAsAdmin', async () => {
+  const exePath = process.execPath;
+  const r = await relaunchAsAdmin(exePath);
+  if (r.ok) {
+    // 8s dá tempo confortável do UAC popup aparecer + JOs aceitar.
+    // Se ele cancelar o UAC, wizard pode chamar installer:cancelRelaunch.
+    if (_pendingQuitTimer) clearTimeout(_pendingQuitTimer);
+    _pendingQuitTimer = setTimeout(() => {
+      _pendingQuitTimer = null;
+      app.quit();
+    }, 8000);
+  }
+  return r;
+}, { emitOnError: false });
+
+safeHandle('installer:cancelRelaunch', async () => {
+  if (_pendingQuitTimer) {
+    clearTimeout(_pendingQuitTimer);
+    _pendingQuitTimer = null;
+    return { ok: true, cancelled: true };
+  }
+  return { ok: true, cancelled: false };
+}, { emitOnError: false });
+
+safeHandle('installer:quitApp', async () => {
+  setTimeout(() => app.quit(), 300);
+  return { ok: true };
 }, { emitOnError: false });
 
 ipcMain.handle('app:getVersion', async () => app.getVersion());

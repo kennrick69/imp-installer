@@ -31,6 +31,12 @@ const installer = {
   pickFolder: () => ipcRenderer.invoke('installer:pickFolder'),
   reset: () => ipcRenderer.invoke('installer:reset'),
 
+  // Admin elevation (Bruno live-test #3)
+  isElevated: () => ipcRenderer.invoke('installer:isElevated'),
+  relaunchAsAdmin: () => ipcRenderer.invoke('installer:relaunchAsAdmin'),
+  cancelRelaunch: () => ipcRenderer.invoke('installer:cancelRelaunch'),
+  quitApp: () => ipcRenderer.invoke('installer:quitApp'),
+
   sudoReply: (id, password, cancelled = false) =>
     ipcRenderer.invoke('installer:sudoReply', { id, password, cancelled }),
 
@@ -39,6 +45,7 @@ const installer = {
   onPreflight: on('installer:onPreflight'),
   onManualPrompt: on('installer:onManualPrompt'),
   onError: on('installer:onError'),
+  onNeedsAdmin: on('installer:onNeedsAdmin'),
   onComplete: on('installer:onComplete'),
   onState: on('installer:onState'),
   onScreen: on('installer:onScreen'),

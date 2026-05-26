@@ -1,6 +1,6 @@
 'use strict';
 
-const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote } = require('./shell');
+const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated } = require('./shell');
 const preflight = require('./preflight');
 const { enrichError } = require('./error-catalog');
 
@@ -13,6 +13,25 @@ const { enrichError } = require('./error-catalog');
 // `ctx` is passed at runtime and contains: { state, save, logger, events, requestSudoPassword, ... }
 
 const FOLDER_MARKER = '.imp-installer-managed';
+
+// ───────────────────────────────────────────────────────────────────────
+// Admin gate (Bruno — live-test #3, v0.2.4 -> v0.2.5)
+//
+// Steps 01/02/03 manipulam o Windows (dism enable-feature, wsl --install,
+// wsl --set-default-version) e EXIGEM token de admin. Se o EXE não estiver
+// elevado, throw error com flag NEEDS_ADMIN — main.js intercepta e emite
+// `installer:onNeedsAdmin` em vez do onError genérico, pra UI mostrar o
+// modal-elevate (botão "Reabrir como administrador") em vez do modal-error.
+// ───────────────────────────────────────────────────────────────────────
+async function requireAdminOrThrow() {
+  const elevated = await isElevated();
+  if (!elevated) {
+    const err = new Error('Este passo precisa de administrador. Reabra o instalador como administrador.');
+    err.code = 'NEEDS_ADMIN';
+    err.needsAdmin = true;
+    throw err;
+  }
+}
 
 function makeMarker(bashPathExpr) {
   return `mkdir -p ${bashPathExpr} && touch ${bashPathExpr}/${FOLDER_MARKER}`;
@@ -61,6 +80,7 @@ const step01EnableFeatures = {
     }
   },
   async execute() {
+    await requireAdminOrThrow();
     await powershell(`dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`);
     await powershell(`dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`);
   },
@@ -82,6 +102,7 @@ const step02SetWslDefaultV2 = {
     } catch (_) { return false; }
   },
   async execute() {
+    await requireAdminOrThrow();
     await powershell(`wsl --set-default-version 2`);
   },
   async validate() { return this.detect(); },
@@ -105,6 +126,7 @@ const step03WslInstall = {
     } catch (_) { return false; }
   },
   async execute(ctx) {
+    await requireAdminOrThrow();
     // Checa se há outra distro como default (Debian/Kali/etc) e avisa.
     try {
       const { stdout: list } = await powershell(`wsl -l -v 2>&1`).catch(() => ({ stdout: '' }));

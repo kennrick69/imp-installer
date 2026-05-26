@@ -7,6 +7,47 @@
 // Texto baseado em RISCOS-INSTALACAO.md (Patrícia).
 
 const ENTRIES = [
+  // ─── steps 01/02/03 — admin gate (Bruno live-test #3) ─────────────────
+  // Cobertura caso a flag NEEDS_ADMIN escape do interceptor em main.js
+  // (defesa em profundidade). Caminho normal: main.js trata e emite
+  // installer:onNeedsAdmin sem chegar aqui.
+  {
+    stepId: 'step_01_enable_features',
+    match: /precisa de administrador|NEEDS_ADMIN|Access.*denied|requires elevation/i,
+    headline: 'Preciso de administrador',
+    what: 'Este passo configura o Windows (WSL) e o sistema só permite isso com privilégios de administrador.',
+    suggestions: [
+      'Clico em "Reabrir como administrador" no aviso amarelo (recomendado)',
+      'OU feche este instalador, clique nele com botão direito e escolha "Executar como administrador"',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: 'step_02_set_wsl_default_v2',
+    match: /precisa de administrador|NEEDS_ADMIN|Access.*denied|requires elevation/i,
+    headline: 'Preciso de administrador',
+    what: 'Este passo configura o Windows (WSL) e o sistema só permite isso com privilégios de administrador.',
+    suggestions: [
+      'Clico em "Reabrir como administrador" no aviso amarelo (recomendado)',
+      'OU feche este instalador, clique nele com botão direito e escolha "Executar como administrador"',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: 'step_03_wsl_install',
+    match: /precisa de administrador|NEEDS_ADMIN|requires elevation/i,
+    headline: 'Preciso de administrador',
+    what: 'Este passo configura o Windows (WSL) e o sistema só permite isso com privilégios de administrador.',
+    suggestions: [
+      'Clico em "Reabrir como administrador" no aviso amarelo (recomendado)',
+      'OU feche este instalador, clique nele com botão direito e escolha "Executar como administrador"',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+
   // ─── step_03 — WSL install ─────────────────────────────────────────────
   {
     stepId: 'step_03_wsl_install',

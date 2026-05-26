@@ -256,6 +256,49 @@ function shSingleQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Admin elevation helpers (Bruno — live-test #3, v0.2.4 -> v0.2.5)
+//
+// Os steps 01 (dism enable-feature), 02 (wsl --set-default-version 2) e
+// 03 (wsl --install) EXIGEM token de admin no processo Windows. Os steps
+// 04-16 rodam dentro do WSL via `wsl bash -lc`, então NÃO precisam admin
+// Windows (no máximo precisam sudo Linux, que já temos via sudoInWsl).
+//
+// isElevated() — pergunta ao PowerShell se o processo atual está em
+//   role Administrator. Retorna boolean.
+// relaunchAsAdmin(exePath) — dispara um Start-Process -Verb RunAs num
+//   PowerShell separado. Fire-and-forget: o UAC popup aparece, e quando
+//   o user clica "Sim" o EXE reabre elevado. O processo original deve
+//   chamar app.quit() logo depois (main.js cuida).
+// ───────────────────────────────────────────────────────────────────────
+async function isElevated() {
+  try {
+    const r = await powershell(
+      `([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)`,
+      { timeout: 5000 }
+    );
+    return /true/i.test(r.stdout || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function relaunchAsAdmin(exePath) {
+  try {
+    const escaped = (exePath || '').replace(/'/g, "''");
+    const cmd = `Start-Process -FilePath '${escaped}' -Verb RunAs`;
+    // spawn em vez de execFile pra não esperar (Start-Process retorna rápido,
+    // mas o UAC bloqueia o exit code se aguardar; melhor fire-and-forget)
+    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], {
+      detached: true,
+      stdio: 'ignore'
+    }).unref();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 // Schedule the .exe to relaunch via HKCU\...\RunOnce after reboot.
 // RunOnce auto-clears its entry on first run, so this is naturally idempotent.
 //
@@ -291,4 +334,6 @@ module.exports = {
   shSingleQuote,
   scheduleRunOnceAfterReboot,
   decodeWslOutput,
+  isElevated,
+  relaunchAsAdmin,
 };

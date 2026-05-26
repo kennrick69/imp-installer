@@ -524,6 +524,49 @@
     </div>
 
     <!-- =========================================================
+         MODAL — ELEVAR PRIVILÉGIO (UAC) — Camila v0.2.5
+         Aparece quando o instalador detecta que NÃO está rodando
+         como admin (welcome pre-check ou steps 1/2/3 do backend).
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-elevate" role="dialog" aria-modal="true" aria-labelledby="elevate-title">
+      <div class="modal modal-elevate">
+        <header>
+          <h2 id="elevate-title">
+            <span class="elevate-shield" aria-hidden="true">🛡</span>
+            Preciso de administrador
+          </h2>
+        </header>
+        <div class="body">
+          <p class="elevate-lead">
+            O próximo passo configura o <strong>WSL2</strong> no Windows.
+            O sistema só permite isso com <strong>privilégio de administrador</strong> —
+            é a mesma proteção que aparece quando você instala um programa novo.
+          </p>
+          <div class="elevate-card">
+            <h4>O que vai acontecer ao clicar "Reabrir como administrador":</h4>
+            <ol>
+              <li>O Windows vai mostrar uma janela do <strong>Controle de Conta de Usuário (UAC)</strong></li>
+              <li>Você clica em <strong>"Sim"</strong></li>
+              <li>O instalador reabre automaticamente, agora com permissão</li>
+              <li>Sua progressão continua de onde estava (não precisa começar de novo)</li>
+            </ol>
+          </div>
+          <p class="elevate-alt">
+            Se preferir fazer manualmente: feche este instalador, clique com botão direito
+            no <code>.exe</code> e escolha <strong>"Executar como administrador"</strong>.
+          </p>
+        </div>
+        <footer>
+          <button class="btn-ghost" id="btn-elevate-cancel">Cancelar</button>
+          <button class="btn-ghost" id="btn-elevate-manual">Vou fazer manual</button>
+          <button class="btn-primary btn-large" id="btn-elevate-relaunch">
+            🛡 Reabrir como administrador
+          </button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
          TOAST CONTAINER
     ========================================================== -->
     <div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>

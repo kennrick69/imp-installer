@@ -497,6 +497,85 @@
   }
 
   // ───────────────────────────────────────────────────────────
+  // Modal elevate (Camila v0.2.5) — UAC re-launch
+  // Aparece em dois cenários:
+  //   (a) pre-check no clique de "Começar" (welcome → preflight)
+  //   (b) backend emite installer:onNeedsAdmin nos steps 1/2/3
+  // ───────────────────────────────────────────────────────────
+  function showElevateModal(_payload = {}) {
+    // Cancela auto-advance se ativo (segurança: não pode pular pra progress
+    // enquanto pedimos elevação)
+    if (typeof cancelPreflightAdvance === 'function') {
+      try { cancelPreflightAdvance(); } catch (_) {}
+    }
+    // Garante botão CTA num estado limpo caso modal reabra
+    const btn = $('#btn-elevate-relaunch');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🛡 Reabrir como administrador';
+    }
+    openModal('modal-elevate');
+  }
+
+  function bindElevateModal() {
+    $('#btn-elevate-relaunch').addEventListener('click', async () => {
+      const btn = $('#btn-elevate-relaunch');
+      const manualBtn = $('#btn-elevate-manual');
+      const cancelBtn = $('#btn-elevate-cancel');
+      btn.disabled = true;
+      btn.textContent = 'Aguardando UAC…';
+      // Eduardo blocker fix v0.2.5: troca botões pra permitir cancelar
+      // se JOs clicar Não no UAC (ou demorar pra abrir popup).
+      if (manualBtn) manualBtn.hidden = true;
+      if (cancelBtn) {
+        cancelBtn.textContent = 'Cancelei o UAC — voltar';
+        cancelBtn.dataset.cancelRelaunch = '1';
+      }
+      try {
+        const r = api.relaunchAsAdmin ? await api.relaunchAsAdmin() : null;
+        if (r && r.ok) {
+          toast('Aguardando você aceitar no UAC (até 8s)…', 'info', 7000);
+          // backend agenda quit em 8s; se JOs cancelar UAC, click "Cancelei"
+        } else {
+          resetElevateModalButtons();
+          toast('Não consegui solicitar elevação: ' + ((r && r.error) || 'erro'), 'error');
+        }
+      } catch (e) {
+        resetElevateModalButtons();
+        toast('Erro ao elevar: ' + (e?.message || ''), 'error');
+      }
+    });
+
+    $('#btn-elevate-manual').addEventListener('click', () => {
+      closeModal('modal-elevate');
+      toast('Feche este instalador e abra com botão direito → Executar como administrador.', 'info', 9000);
+    });
+
+    $('#btn-elevate-cancel').addEventListener('click', async () => {
+      const cancelBtn = $('#btn-elevate-cancel');
+      // Se está em modo "Cancelei o UAC", cancela o quit pendente do main
+      if (cancelBtn && cancelBtn.dataset.cancelRelaunch === '1') {
+        try {
+          if (api.cancelRelaunch) await api.cancelRelaunch();
+        } catch (_) {}
+        resetElevateModalButtons();
+        toast('Cancelado. Você pode tentar de novo ou fazer manual.', 'info', 5000);
+        return;
+      }
+      closeModal('modal-elevate');
+    });
+  }
+
+  function resetElevateModalButtons() {
+    const btn = $('#btn-elevate-relaunch');
+    const manualBtn = $('#btn-elevate-manual');
+    const cancelBtn = $('#btn-elevate-cancel');
+    if (btn) { btn.disabled = false; btn.textContent = '🛡 Reabrir como administrador'; }
+    if (manualBtn) manualBtn.hidden = false;
+    if (cancelBtn) { cancelBtn.textContent = 'Cancelar'; delete cancelBtn.dataset.cancelRelaunch; }
+  }
+
+  // ───────────────────────────────────────────────────────────
   // Connection pill (rodapé do progresso)
   // ───────────────────────────────────────────────────────────
   function setConnection(state, label) {
@@ -860,7 +939,24 @@
     consent.addEventListener('change', () => {
       startBtn.disabled = !consent.checked;
     });
-    startBtn.addEventListener('click', () => runPreflightFlow());
+    startBtn.addEventListener('click', async () => {
+      // Pre-check elevate (Camila v0.2.5): se backend expõe isElevated e
+      // o processo NÃO está elevado, abre modal UAC antes de seguir.
+      // Mantém retro-compat: se api.isElevated não existir, segue direto.
+      if (typeof api.isElevated === 'function') {
+        try {
+          const r = await api.isElevated();
+          if (r && r.ok && r.elevated === false) {
+            showElevateModal();
+            return;
+          }
+        } catch (e) {
+          // se a checagem falhar, não bloqueia — segue pro preflight
+          console.warn('[wizard] isElevated falhou, seguindo sem pre-check:', e);
+        }
+      }
+      runPreflightFlow();
+    });
     $('#btn-cancel-welcome').addEventListener('click', () => {
       if (api.closeApp) api.closeApp();
       else window.close();
@@ -1169,6 +1265,11 @@
       showErrorModal(payload || {});
     });
 
+    // Bruno v0.2.5 — backend pede UAC quando steps 1/2/3 detectam falta de admin
+    api.onNeedsAdmin && api.onNeedsAdmin((payload) => {
+      showElevateModal(payload);
+    });
+
     api.onComplete && api.onComplete((summary) => {
       // summary = { durationSeconds, sala3dInstalled }
       if (summary?.durationSeconds) {
@@ -1247,6 +1348,7 @@
     bindProgress();
     bindManual();
     bindError();
+    bindElevateModal();
     bindDone();
     bindTopbar();
     bindBackendEvents();

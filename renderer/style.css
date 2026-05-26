@@ -1755,3 +1755,86 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ════════════════════════════════════════════════════════════
+   Modal elevate UAC (Camila — v0.2.5)
+   Aparece quando o instalador não está rodando como admin.
+   Header amarelo-âmbar (warning), card teal com passos UAC,
+   alternativa manual em rodapé tracejado, CTA principal teal.
+   ════════════════════════════════════════════════════════════ */
+.modal.modal-elevate {
+  max-width: 540px;
+}
+
+.modal.modal-elevate header h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #fbbf24;
+}
+
+.modal.modal-elevate .elevate-shield {
+  font-size: 1.4em;
+  filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.4));
+}
+
+.modal.modal-elevate .elevate-lead {
+  color: var(--text, #e2e8f0);
+  font-size: 0.98em;
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+
+.modal.modal-elevate .elevate-card {
+  background: rgba(13, 148, 136, 0.08);
+  border: 1px solid rgba(13, 148, 136, 0.25);
+  border-left: 4px solid #0D9488;
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+
+.modal.modal-elevate .elevate-card h4 {
+  margin: 0 0 8px 0;
+  font-size: 0.92em;
+  color: #14b8a6;
+  font-weight: 600;
+}
+
+.modal.modal-elevate .elevate-card ol {
+  margin: 0;
+  padding-left: 22px;
+  font-size: 0.92em;
+  line-height: 1.6;
+  color: var(--text-secondary, #94a3b8);
+}
+
+.modal.modal-elevate .elevate-card ol li {
+  margin: 4px 0;
+}
+
+.modal.modal-elevate .elevate-alt {
+  font-size: 0.88em;
+  color: var(--text-secondary, #94a3b8);
+  border-top: 1px dashed var(--border, #2a2d34);
+  padding-top: 12px;
+  margin-top: 16px;
+  line-height: 1.5;
+}
+
+.modal.modal-elevate .elevate-alt code {
+  background: rgba(13, 148, 136, 0.12);
+  color: #14b8a6;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+
+#btn-elevate-relaunch {
+  background: linear-gradient(135deg, #0D9488 0%, #14b8a6 100%);
+  box-shadow: 0 4px 16px rgba(13, 148, 136, 0.35);
+}
+
+#btn-elevate-relaunch:hover {
+  box-shadow: 0 6px 22px rgba(13, 148, 136, 0.5);
+}
