@@ -119,14 +119,25 @@ function getState() {
 }
 
 function listSteps() {
-  return ALL_STEPS.map(s => ({
-    id: s.id,
-    title: s.title,
-    description: s.description,
-    category: s.category,
-    manualInstructions: s.manualInstructions || null,
-    status: _ctx ? (_ctx.state.steps[s.id] || 'pending') : 'pending',
-  }));
+  // Bruno v0.2.13: manualInstructions pode ser função(ctx) pra resolver
+  // ctx.state.distro em runtime. Resolve aqui antes de mandar pra UI.
+  // String/Array/Object passam direto.
+  const ctxLike = { state: (_ctx && _ctx.state) || {} };
+  return ALL_STEPS.map(s => {
+    let mi = s.manualInstructions || null;
+    if (typeof mi === 'function') {
+      try { mi = mi(ctxLike); }
+      catch (_) { mi = null; }
+    }
+    return {
+      id: s.id,
+      title: s.title,
+      description: s.description,
+      category: s.category,
+      manualInstructions: mi,
+      status: _ctx ? (_ctx.state.steps[s.id] || 'pending') : 'pending',
+    };
+  });
 }
 
 function emitStepUpdate(ctx, step, status, extra) {

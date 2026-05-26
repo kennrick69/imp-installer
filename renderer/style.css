@@ -1137,78 +1137,191 @@ body {
 .connection-pill.state-err .cp-dot    { background: var(--err); box-shadow: 0 0 6px var(--err-glow); animation: none; }
 
 /* ════════════════════════════════════════════════════════════
-   TELA 4 — MANUAL
+   TELA 4 — MANUAL (v0.3 — padrão autossuficiente JOs)
+   Layout: badge → título → AÇÃO grande → passos → comandos →
+           expected → note → verify → skip
    ════════════════════════════════════════════════════════════ */
-.manual-wrap .screen-head { align-items: flex-start; }
-.manual-steps {
-  list-style: none;
+.manual-wrap {
   display: flex; flex-direction: column;
-  gap: 12px;
-  counter-reset: m-step;
+  gap: 20px;
+  padding: 24px;
 }
-.manual-step {
-  background: var(--grad-card);
-  border: 1px solid var(--border);
+.manual-wrap .screen-head { align-items: flex-start; }
+.manual-head { display: flex; flex-direction: column; gap: 6px; }
+
+.manual-badge {
+  display: inline-block;
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  padding: 4px 12px;
   border-radius: 12px;
-  padding: 14px 16px 14px 48px;
-  position: relative;
-  counter-increment: m-step;
-}
-.manual-step::before {
-  content: counter(m-step);
-  position: absolute; left: 14px; top: 14px;
-  width: 24px; height: 24px;
-  background: var(--accent);
-  color: #FFF;
-  border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 11px; font-weight: 700;
-}
-.manual-step h4 {
-  font-size: 14px;
-  margin-bottom: 4px;
-}
-.manual-step p {
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.55;
-}
-.manual-step code {
-  background: var(--bg-dark);
-  border: 1px solid var(--border);
-  padding: 1px 6px; border-radius: 4px;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: var(--accent-hover);
+  font-size: 0.85em;
+  font-weight: 600;
+  margin-bottom: 8px;
+  align-self: flex-start;
 }
 
-.manual-tools {
-  display: flex; flex-wrap: wrap; gap: 8px;
-}
-.confirm-big {
-  display: flex; gap: 14px; align-items: center;
+/* ─── Bloco da AÇÃO principal ─────────────────────────────── */
+.manual-action-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding: 18px 20px;
-  background: var(--bg-card);
-  border: 2px solid var(--accent);
-  border-radius: 12px;
+  background: rgba(13, 148, 136, 0.10);
+  border: 1px solid rgba(13, 148, 136, 0.30);
+  border-left: 4px solid #0D9488;
+  border-radius: 8px;
+}
+
+.btn-manual-action {
+  font-size: 1.05em;
+  padding: 12px 24px;
+  min-width: 280px;
+  align-self: flex-start;
+  background: linear-gradient(135deg, #0D9488 0%, #14b8a6 100%);
+  border-color: #0D9488;
+  box-shadow: 0 4px 16px rgba(13, 148, 136, 0.35);
+}
+.btn-manual-action:hover:not(:disabled) {
+  background: linear-gradient(135deg, #14b8a6 0%, #2dd4bf 100%);
+  border-color: #14b8a6;
+  box-shadow: 0 6px 20px rgba(13, 148, 136, 0.45);
+}
+
+.manual-action-hint {
+  margin: 0;
+  color: var(--text-secondary, #94a3b8);
+  font-size: 0.92em;
+}
+
+/* ─── Caixa de passos + comandos ──────────────────────────── */
+.manual-steps-box,
+.manual-commands {
+  background: var(--bg-card, #12121a);
+  border: 1px solid var(--border, #2a2d34);
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+.manual-steps-box h3,
+.manual-commands h3 {
+  margin: 0 0 10px 0;
+  font-size: 0.95em;
+  color: var(--text-primary, #e2e8f0);
+}
+
+.manual-steps-list {
+  margin: 0;
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text-secondary, #94a3b8);
+  line-height: 1.55;
+}
+.manual-steps-list li { font-size: 0.95em; }
+.manual-steps-list li strong { color: var(--text-primary, #e2e8f0); }
+
+.manual-cmd-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.manual-cmd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(13, 148, 136, 0.06);
+  border: 1px solid rgba(13, 148, 136, 0.20);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.manual-cmd-item .mci-label {
+  flex: 0 0 auto;
+  color: #14b8a6;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.manual-cmd-item .mci-code {
+  flex: 1;
+  font-family: 'Consolas', 'Monaco', ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.9em;
+  background: rgba(0, 0, 0, 0.30);
+  padding: 4px 8px;
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: nowrap;
+  color: var(--text-primary, #e2e8f0);
+}
+
+.manual-cmd-item .mci-copy {
+  flex: 0 0 auto;
+  font-size: 0.82em;
+  padding: 4px 10px;
+  background: var(--bg-card, #12121a);
+  border: 1px solid var(--border, #2a2d34);
+  border-radius: 4px;
+  color: var(--text-primary, #e2e8f0);
   cursor: pointer;
-  transition: background .15s, box-shadow .15s;
-  font-size: 14px;
+  font-family: inherit;
 }
-.confirm-big:hover {
-  background: var(--bg-card-hover);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+.manual-cmd-item .mci-copy:hover { border-color: var(--border-strong, #353A4A); }
+.manual-cmd-item .mci-copy.copied { background: #10b981; color: #fff; border-color: #10b981; }
+
+/* ─── Expected + Note ─────────────────────────────────────── */
+.manual-expected, .manual-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  line-height: 1.5;
 }
-.confirm-big input[type=checkbox] {
-  width: 22px; height: 22px;
-  accent-color: var(--accent);
-  cursor: pointer;
-  flex-shrink: 0;
+.manual-expected {
+  background: rgba(16, 185, 129, 0.10);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-left: 4px solid #10b981;
+  color: var(--text-primary, #e2e8f0);
 }
-.confirm-big strong { color: var(--accent-hover); }
-.manual-foot {
-  display: flex; justify-content: space-between; gap: 10px;
+.manual-expected .me-ico { color: #10b981; font-weight: 700; }
+
+.manual-note {
+  background: rgba(245, 158, 11, 0.08);
+  border-left: 4px solid #f59e0b;
+  color: var(--text-primary, #e2e8f0);
 }
+
+/* ─── Verify + Skip ───────────────────────────────────────── */
+.manual-verify-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border, #2a2d34);
+}
+
+.manual-verify-status {
+  flex: 1;
+  font-size: 0.92em;
+  color: var(--text-secondary, #94a3b8);
+}
+.manual-verify-status[data-tone="ok"]  { color: #10b981; }
+.manual-verify-status[data-tone="err"] { color: #ef4444; }
+
+.manual-skip-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -4px;
+}
+.btn-subtle { opacity: 0.6; font-size: 0.85em; }
+.btn-subtle:hover { opacity: 1; }
 
 /* ════════════════════════════════════════════════════════════
    TELA 5 — ERRO

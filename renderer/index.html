@@ -285,36 +285,51 @@
       ────────────────────────────────────────────────────── -->
       <section class="screen" id="screen-manual" aria-labelledby="manual-title">
         <div class="screen-inner manual-wrap">
-          <header class="screen-head">
-            <span class="step-cat-badge inline" data-cat="manual">MANUAL</span>
-            <h2 id="manual-title">Preciso de você por um momento</h2>
-            <p class="screen-sub" id="manual-subtitle">Esse passo não dá pra automatizar com segurança. Eu te guio.</p>
+          <header class="screen-head manual-head">
+            <span class="manual-badge">⚠ Passo manual</span>
+            <h2 id="manual-title">—</h2>
+            <p class="screen-sub" id="manual-subtitle">—</p>
           </header>
 
-          <ol class="manual-steps" id="manual-steps" role="list">
-            <!-- Preenchido por JS -->
-          </ol>
-
-          <div class="manual-tools">
-            <button class="btn-ghost" id="btn-manual-open-terminal" hidden>
-              <span class="btn-ico" aria-hidden="true">▶</span> Abrir terminal pra mim
-            </button>
-            <button class="btn-ghost" id="btn-manual-open-browser" hidden>
-              <span class="btn-ico" aria-hidden="true">↗</span> Abrir navegador
-            </button>
-            <button class="btn-ghost" id="btn-manual-verify">
-              <span class="btn-ico" aria-hidden="true">✓</span> Verificar agora
-            </button>
+          <!-- Botão de AÇÃO grande (primeira coisa visível) -->
+          <div class="manual-action-row">
+            <button class="btn-primary btn-large btn-manual-action" id="manual-action-btn">—</button>
+            <p class="manual-action-hint" id="manual-action-hint">Clique pra começar este passo.</p>
           </div>
 
-          <label class="confirm-big">
-            <input type="checkbox" id="manual-done-check" />
-            <span><strong>Já fiz isso.</strong> Pode continuar.</span>
-          </label>
+          <!-- Instruções numeradas (passos do que vai acontecer) -->
+          <div class="manual-steps-box">
+            <h3>O que vai acontecer:</h3>
+            <ol class="manual-steps-list" id="manual-steps-list"></ol>
+          </div>
 
-          <div class="manual-foot">
-            <button class="btn-ghost" id="btn-manual-help">Não estou conseguindo</button>
-            <button class="btn-primary" id="btn-manual-next" disabled>Próximo →</button>
+          <!-- Comandos copiáveis (se houver) -->
+          <div class="manual-commands hidden" id="manual-commands">
+            <h3>Pode precisar destes:</h3>
+            <ul class="manual-cmd-list" id="manual-cmd-list"></ul>
+          </div>
+
+          <!-- Expected -->
+          <div class="manual-expected hidden" id="manual-expected">
+            <span class="me-ico" aria-hidden="true">✓</span>
+            <span><strong>Você vai saber que deu certo quando:</strong> <span id="manual-expected-text">—</span></span>
+          </div>
+
+          <!-- Note -->
+          <div class="manual-note hidden" id="manual-note">
+            <span class="mn-ico" aria-hidden="true">💡</span>
+            <span id="manual-note-text">—</span>
+          </div>
+
+          <!-- Bloco de verificação -->
+          <div class="manual-verify-row">
+            <button class="btn-ghost" id="manual-verify-btn">🔍 Verificar agora</button>
+            <span class="manual-verify-status" id="manual-verify-status"></span>
+            <button class="btn-primary" id="manual-done-btn" disabled>✓ Já fiz, continuar →</button>
+          </div>
+
+          <div class="manual-skip-row">
+            <button class="btn-ghost btn-subtle" id="manual-skip-btn">Pular este passo</button>
           </div>
         </div>
       </section>

@@ -403,40 +403,186 @@
   // Manual screen — prompt vindo do backend
   // ───────────────────────────────────────────────────────────
   function showManualPrompt(prompt) {
-    // prompt = { stepId, title, subtitle, instructions: [{title, body, code}], terminal:{cmd}, browser:{url} }
+    // prompt = {stepId, title, subtitle, instructions: {action, steps, commands, expected, note}}
+    // Mantém backward-compat: se `instructions` vier como array antigo, normaliza pra { steps: [...] }.
     showScreen('manual');
     const meta = STEP_BY_ID[prompt.stepId] || {};
-    $('#manual-title').textContent    = prompt.title    || `Preciso de você no passo ${meta.num || ''}`;
-    $('#manual-subtitle').textContent = prompt.subtitle || 'Esse passo não dá pra automatizar com segurança. Eu te guio.';
+    setCurrentStep(prompt.stepId);
 
-    const list = $('#manual-steps');
-    list.innerHTML = '';
-    (prompt.instructions || []).forEach(ins => {
-      const li = el('li', { className: 'manual-step' });
-      li.append(el('h4', {}, ins.title || ''));
-      if (ins.body) li.append(el('p', {}, ins.body));
-      if (ins.code) {
-        const p = el('p');
-        p.appendChild(el('code', {}, ins.code));
-        li.append(p);
-      }
-      list.appendChild(li);
+    // Guarda stepId atual no elemento (útil pra debugger / contexto)
+    $('#screen-manual').dataset.stepId = prompt.stepId;
+
+    $('#manual-title').textContent    = prompt.title    || `Preciso de você no passo ${meta.num || ''}`;
+    $('#manual-subtitle').textContent = prompt.subtitle || 'Este passo precisa que você faça algo no Windows ou no Ubuntu. Eu te guio.';
+
+    const ins = prompt.instructions || {};
+    const data = Array.isArray(ins)
+      ? { steps: ins.map((t, i) => ({
+            num: i + 1,
+            text: typeof t === 'string'
+              ? t
+              : (t.title || t.body || '')
+          }))
+        }
+      : ins;
+
+    // ─── Ação principal ────────────────────────────────────
+    const actionBtn  = $('#manual-action-btn');
+    const actionRow  = actionBtn.closest('.manual-action-row');
+    const actionHint = $('#manual-action-hint');
+    if (data.action && data.action.label) {
+      if (actionRow) actionRow.classList.remove('hidden');
+      actionBtn.hidden = false;
+      actionBtn.disabled = false;
+      actionBtn.textContent = data.action.label;
+      actionHint.textContent = data.action.hint || 'Clique pra começar este passo.';
+      actionBtn.onclick = async () => {
+        const originalLabel = data.action.label;
+        actionBtn.disabled = true;
+        actionBtn.textContent = '⏳ Abrindo…';
+        try {
+          const fn = (api && typeof api.executeManualAction === 'function')
+            ? api.executeManualAction.bind(api)
+            : null;
+          if (!fn) {
+            toast('Não consegui abrir: ação não suportada pelo backend.', 'error');
+            actionBtn.disabled = false;
+            actionBtn.textContent = originalLabel;
+            return;
+          }
+          const r = await fn(data.action.kind, data.action.payload || {});
+          if (r && r.ok) {
+            actionBtn.textContent = '✓ Abri pra você — volte aqui depois';
+            setTimeout(() => {
+              actionBtn.disabled = false;
+              actionBtn.textContent = originalLabel;
+            }, 8000);
+          } else {
+            toast('Não consegui abrir: ' + ((r && r.error) || 'erro'), 'error');
+            actionBtn.disabled = false;
+            actionBtn.textContent = originalLabel;
+          }
+        } catch (e) {
+          toast('Erro: ' + (e?.message || ''), 'error');
+          actionBtn.disabled = false;
+          actionBtn.textContent = originalLabel;
+        }
+      };
+    } else {
+      actionBtn.hidden = true;
+      if (actionRow) actionRow.classList.add('hidden');
+      actionHint.textContent = '';
+      actionBtn.onclick = null;
+    }
+
+    // ─── Passos numerados ─────────────────────────────────
+    const stepsList = $('#manual-steps-list');
+    stepsList.innerHTML = '';
+    (data.steps || []).forEach((s) => {
+      const li = el('li', {});
+      li.textContent = typeof s === 'string' ? s : (s.text || '');
+      stepsList.appendChild(li);
     });
 
-    // Botões opcionais
-    const tBtn = $('#btn-manual-open-terminal');
-    const bBtn = $('#btn-manual-open-browser');
-    tBtn.hidden = !prompt.terminal;
-    bBtn.hidden = !prompt.browser;
-    tBtn.onclick = () => prompt.terminal && api.openTerminal(prompt.terminal.cmd);
-    bBtn.onclick = () => prompt.browser  && api.openBrowser(prompt.browser.url);
+    // ─── Comandos copiáveis ───────────────────────────────
+    const cmdBlock = $('#manual-commands');
+    const cmdList  = $('#manual-cmd-list');
+    cmdList.innerHTML = '';
+    if (data.commands && data.commands.length) {
+      cmdBlock.classList.remove('hidden');
+      data.commands.forEach((c) => {
+        const item = el('li', { className: 'manual-cmd-item' });
+        item.appendChild(el('span', { className: 'mci-label' }, c.label || 'Comando'));
+        item.appendChild(el('code', { className: 'mci-code' }, c.code || ''));
+        const copyBtn = el('button', { className: 'mci-copy', type: 'button' }, 'Copiar');
+        copyBtn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(c.code || '');
+            copyBtn.textContent = '✓ Copiado';
+            copyBtn.classList.add('copied');
+            setTimeout(() => {
+              copyBtn.textContent = 'Copiar';
+              copyBtn.classList.remove('copied');
+            }, 1800);
+          } catch (e) {
+            toast('Não consegui copiar: ' + (e?.message || ''), 'error');
+          }
+        };
+        item.appendChild(copyBtn);
+        cmdList.appendChild(item);
+      });
+    } else {
+      cmdBlock.classList.add('hidden');
+    }
 
-    // Reseta confirmação
-    $('#manual-done-check').checked = false;
-    $('#btn-manual-next').disabled  = true;
+    // ─── Expected ─────────────────────────────────────────
+    const expBlock = $('#manual-expected');
+    if (data.expected) {
+      expBlock.classList.remove('hidden');
+      $('#manual-expected-text').textContent = data.expected;
+    } else {
+      expBlock.classList.add('hidden');
+    }
 
-    // Guarda stepId atual pro botão "verificar"
-    $('#screen-manual').dataset.stepId = prompt.stepId;
+    // ─── Note ─────────────────────────────────────────────
+    const noteBlock = $('#manual-note');
+    if (data.note) {
+      noteBlock.classList.remove('hidden');
+      $('#manual-note-text').textContent = data.note;
+    } else {
+      noteBlock.classList.add('hidden');
+    }
+
+    // ─── Reset verify ─────────────────────────────────────
+    const status = $('#manual-verify-status');
+    status.textContent = '';
+    status.removeAttribute('data-tone');
+    $('#manual-done-btn').disabled = true;
+
+    // ─── Bind: Verify ─────────────────────────────────────
+    $('#manual-verify-btn').onclick = async () => {
+      status.textContent = '⏳ Verificando…';
+      status.removeAttribute('data-tone');
+      try {
+        const r = await api.markManualDone(prompt.stepId);
+        if (r && r.status === 'done') {
+          status.textContent = '✓ Verificado! Pode continuar.';
+          status.dataset.tone = 'ok';
+          $('#manual-done-btn').disabled = false;
+        } else {
+          status.textContent = '✗ Ainda não detectei. ' + ((r && r.error) || 'Faz o passo manual e tenta de novo.');
+          status.dataset.tone = 'err';
+        }
+      } catch (e) {
+        status.textContent = '✗ Erro: ' + (e?.message || '');
+        status.dataset.tone = 'err';
+      }
+    };
+
+    // ─── Bind: Done (avança pro próximo passo) ────────────
+    $('#manual-done-btn').onclick = () => {
+      const nextId = getNextStepId(prompt.stepId);
+      if (nextId && api.runStep) {
+        api.runStep(nextId);
+      } else {
+        // sem próximo / sem runStep — apenas volta pro progress
+        showScreen('progress');
+      }
+    };
+
+    // ─── Bind: Skip ───────────────────────────────────────
+    $('#manual-skip-btn').onclick = () => {
+      if (confirm('Pular este passo manual pode quebrar passos seguintes. Continuar?')) {
+        if (api.skip) api.skip(prompt.stepId, 'usuário pulou manual');
+      }
+    };
+  }
+
+  function getNextStepId(currentId) {
+    const idx = STEPS.findIndex(s => s.id === currentId);
+    if (idx < 0) return null;
+    const next = STEPS[idx + 1];
+    return next ? next.id : null;
   }
 
   // ───────────────────────────────────────────────────────────
@@ -1121,43 +1267,12 @@
 
   // ───────────────────────────────────────────────────────────
   // Manual — bindings
+  // v0.3: bindings vivem dentro do showManualPrompt() porque cada
+  // prompt traz seu próprio stepId/action. Mantemos bindManual()
+  // como hook reservado pra futuros listeners globais.
   // ───────────────────────────────────────────────────────────
   function bindManual() {
-    const check = $('#manual-done-check');
-    check.addEventListener('change', () => {
-      $('#btn-manual-next').disabled = !check.checked;
-    });
-    $('#btn-manual-verify').addEventListener('click', async () => {
-      const stepId = $('#screen-manual').dataset.stepId;
-      if (!stepId) return;
-      toast('Verificando…', 'info', 2000);
-      try {
-        const result = await api.runStep(stepId);
-        if (result && result.ok) {
-          toast('Tudo certo!', 'success');
-          check.checked = true;
-          $('#btn-manual-next').disabled = false;
-        } else {
-          toast('Ainda não está pronto. Confira os passos acima.', 'warn');
-        }
-      } catch (e) {
-        toast('Verificação falhou: ' + (e?.message || ''), 'error');
-      }
-    });
-    $('#btn-manual-next').addEventListener('click', async () => {
-      const stepId = $('#screen-manual').dataset.stepId;
-      if (!stepId) return;
-      try {
-        await api.markManualDone(stepId);
-        showScreen('progress');
-      } catch (e) {
-        toast('Não consegui marcar como feito: ' + (e?.message || ''), 'error');
-      }
-    });
-    $('#btn-manual-help').addEventListener('click', () => {
-      openLogsModal();
-      toast('Mostre os logs pro time se precisar de ajuda.', 'info', 6000);
-    });
+    // intencionalmente vazio — vide showManualPrompt()
   }
 
   // ───────────────────────────────────────────────────────────

@@ -314,9 +314,19 @@ const step01EnableFeatures = {
   title: 'Instalar WSL2 + Ubuntu (features + kernel + distro)',
   description: 'wsl --install -d Ubuntu-22.04 (moderno: faz features, kernel e distro de uma vez). Fallback dism se Windows for antigo.',
   category: 'HYBRID', // pode disparar reboot
-  manualInstructions:
-    'A instalação do WSL pode pedir um reboot do Windows. ' +
-    'Salve seu trabalho. Quando o PC voltar, este instalador abre sozinho e retoma de onde parou.',
+  // Bruno v0.2.13: shape NOVO (action/steps/expected/note). action.kind=none —
+  // step roda sozinho; só mostra instruções pro caso de reboot pendente.
+  manualInstructions: {
+    action: { label: 'Aguardando instalação do WSL…', kind: 'none', payload: {} },
+    steps: [
+      { num: 1, text: 'O instalador vai baixar e instalar o WSL2 + Ubuntu (pode demorar 2–5 min)' },
+      { num: 2, text: 'Ao final, o Windows pode pedir um REBOOT' },
+      { num: 3, text: 'Salve seu trabalho aberto (Word, navegador, etc.)' },
+      { num: 4, text: 'Quando o PC reiniciar, este instalador abre sozinho e retoma de onde parou' },
+    ],
+    expected: 'Mensagem "wsl --install OK" e/ou pedido de reboot do Windows.',
+    note: 'Não feche o instalador. Se o reboot for solicitado, reinicie o Windows.',
+  },
   async detect() {
     return _ubuntuInstalled();
   },
@@ -512,9 +522,17 @@ const step03WslInstall = {
   title: 'WSL2 + Ubuntu instalados',
   description: 'Já feito pelo passo 1. Mantido por compatibilidade com instalações antigas.',
   category: 'HYBRID',
-  manualInstructions:
-    'Se o Windows pediu reboot no passo 1, salve seu trabalho e reinicie. ' +
-    'Quando o PC voltar, este instalador abre sozinho e retoma de onde parou.',
+  // Bruno v0.2.13: shape enriquecido. Mostra apenas se reboot pendente.
+  manualInstructions: {
+    action: { label: 'Reiniciar Windows', kind: 'none', payload: {} },
+    steps: [
+      { num: 1, text: 'Se o Windows pediu reboot no passo anterior, salve seu trabalho aberto' },
+      { num: 2, text: 'Reinicie o Windows agora (Iniciar → Reiniciar)' },
+      { num: 3, text: 'Quando o PC voltar, este instalador abre sozinho e retoma de onde parou' },
+    ],
+    expected: 'Após o reboot, instalador volta automaticamente neste passo marcado como OK.',
+    note: 'Não tem botão automático pra reiniciar — você reinicia o Windows manualmente quando estiver pronto.',
+  },
   async detect(ctx) {
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
     return _ubuntuInstalled();
@@ -551,9 +569,28 @@ const step04UbuntuFirstBoot = {
   title: 'Primeira boot do Ubuntu (criar usuário UNIX)',
   description: 'Usuário precisa abrir Ubuntu uma vez para criar username/senha. Não automatizável.',
   category: 'MANUAL',
-  manualInstructions:
-    'Abra a janela do Ubuntu que apareceu, defina seu usuário (em minúsculas, ex: jos) e uma senha. ' +
-    'Quando ver o prompt "<user>@PC:~$", volte aqui — o instalador detecta sozinho e segue.',
+  // Bruno v0.2.13: shape enriquecido (action/steps/expected/note). Camila usa
+  // pra renderizar botão grande + checklist + verify.
+  // Função pra que `ctx.state.distro` seja resolvido em runtime, não em load.
+  manualInstructions: (ctx) => ({
+    action: {
+      label: '🐧 Abrir Ubuntu',
+      kind: 'terminal',
+      payload: { distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu' },
+    },
+    steps: [
+      { num: 1, text: 'Uma janela preta do Ubuntu vai abrir' },
+      { num: 2, text: 'Digite um nome de usuário (letras minúsculas, sem espaço) + Enter' },
+      { num: 3, text: 'Digite uma senha + Enter — não aparece nada na tela, é normal no Linux' },
+      { num: 4, text: 'Digite a mesma senha de novo + Enter' },
+      { num: 5, text: 'Quando ver o prompt verde "usuario@PC:~$", feche a janela e volte aqui' },
+    ],
+    commands: [
+      { label: 'Comando pra conferir o usuário criado', code: 'whoami' },
+    ],
+    expected: 'Prompt verde "usuario@PC:~$" no terminal.',
+    note: 'ANOTE o usuário e a senha — vai usar várias vezes nos próximos passos (apt, sudo, etc.).',
+  }),
   async detect(ctx) {
     try {
       // Check default user is non-root and exists.
@@ -819,9 +856,26 @@ const step09ClaudeLogin = {
   title: 'Login Claude Code (browser OAuth)',
   description: 'Abre terminal Windows com `claude` — usuário loga no browser e fecha.',
   category: 'MANUAL',
-  manualInstructions:
-    'Um terminal vai abrir com o Claude pedindo login. Faça login no browser que abrir, ' +
-    'depois feche a janela do terminal. O instalador segue automaticamente.',
+  // Bruno v0.2.13: shape enriquecido. Botão dispara terminal já rodando `claude`.
+  manualInstructions: (ctx) => ({
+    action: {
+      label: '🔐 Abrir terminal pra login Claude',
+      kind: 'terminal',
+      payload: { distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu', cmd: 'claude' },
+    },
+    steps: [
+      { num: 1, text: 'Vai abrir um terminal com o Claude pedindo login' },
+      { num: 2, text: 'Ele mostra um link — copia (ou aperta Enter pra abrir no navegador)' },
+      { num: 3, text: 'Loga com sua conta Claude (Max ou Pro)' },
+      { num: 4, text: 'Cola o código de volta no terminal + Enter' },
+      { num: 5, text: 'Quando aparecer "Login successful" feche a janela e volte aqui' },
+    ],
+    commands: [
+      { label: 'Comando pra conferir login', code: 'claude --print "responda: pong"' },
+    ],
+    expected: '"Login successful" no terminal e `claude --print "pong"` retorna pong.',
+    note: 'Use uma conta Claude com plano ativo (Max/Pro/Team) — free não funciona pra Claude Code.',
+  }),
   async detect(ctx) {
     try {
       // claude --print is non-interactive; if not logged in it returns non-zero.
@@ -851,10 +905,31 @@ const step10GhAuth = {
   title: 'GitHub auth (gh CLI — Device Flow)',
   description: 'Instala gh CLI + gh auth login --web. Configura credential helper.',
   category: 'HYBRID',
-  manualInstructions:
-    'Vou abrir um terminal com `gh auth login --web`. Ele vai mostrar um código curto ' +
-    '(ex.: ABCD-1234) e abrir o GitHub no seu browser. Cole o código, autorize com sua conta ' +
-    'GitHub, e feche a janela do terminal. O instalador detecta sozinho e segue.',
+  // Bruno v0.2.13: shape enriquecido. Botão abre terminal com `gh auth login`
+  // já rodando. URL device flow vai pros `commands` pra UI mostrar botão browser.
+  manualInstructions: (ctx) => ({
+    action: {
+      label: '🔑 Iniciar login GitHub (Device Flow)',
+      kind: 'terminal',
+      payload: {
+        distro: (ctx && ctx.state && ctx.state.distro) || 'Ubuntu',
+        cmd: 'gh auth login --hostname github.com --git-protocol https --web',
+      },
+    },
+    steps: [
+      { num: 1, text: 'Terminal abre rodando `gh auth login`' },
+      { num: 2, text: 'Ele mostra um código de 8 caracteres tipo "ABCD-1234" — COPIA' },
+      { num: 3, text: 'Abre github.com/login/device no navegador (botão abaixo)' },
+      { num: 4, text: 'Cola o código + autoriza com sua conta GitHub' },
+      { num: 5, text: 'Volta pro terminal, espera "Authentication complete", feche e volte aqui' },
+    ],
+    commands: [
+      { label: 'URL do Device Flow GitHub', code: 'https://github.com/login/device' },
+      { label: 'Comando pra conferir login', code: 'gh auth status' },
+    ],
+    expected: '"Authentication complete" no terminal e `gh auth status` mostra "Logged in to github.com".',
+    note: 'Use uma conta GitHub que tenha acesso ao repo kennrick69/imp-squad (squad privado).',
+  }),
   async detect(ctx) {
     try {
       const { stdout } = await wsl(`gh auth status 2>&1 | grep -q "Logged in to github.com" && echo OK || echo MISSING`,

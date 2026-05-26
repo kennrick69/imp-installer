@@ -188,16 +188,86 @@ function buildRunnerEvents() {
       if (upd.status === 'running') {
         const step = ALL_STEPS.find(s => s.id === upd.id);
         if (step && step.manualInstructions) {
-          sendToRenderer('installer:onManualPrompt', {
-            stepId: step.id,
-            title: step.title,
-            subtitle: step.description,
-            instructions: Array.isArray(step.manualInstructions)
-              ? step.manualInstructions
-              : [String(step.manualInstructions)],
-            terminal: step.manualTerminal || null,
-            browser: step.manualBrowser || null,
-          });
+          // Bruno v0.2.13: shape ENRIQUECIDO (action/steps/commands/expected/note).
+          // manualInstructions agora pode ser:
+          //   - string (legacy) → wrap em { steps:[{num:1,text:str}] }
+          //   - array (legacy) → wrap em steps[]
+          //   - object {action,steps,commands,expected,note} → passa direto
+          //   - function(ctx) → invoca pra resolver ctx.state.distro em runtime
+          let mi = step.manualInstructions;
+          if (typeof mi === 'function') {
+            try {
+              // Re-bind: usa o state real do runner pra preencher payload.distro etc.
+              const ctxLike = { state: runner.getState() || {} };
+              mi = mi(ctxLike);
+            } catch (e) {
+              console.error('[main.js] manualInstructions(ctx) explodiu:', e);
+              mi = { steps: [{ num: 1, text: '(erro ao resolver instruções manuais)' }] };
+            }
+          }
+
+          let payload;
+          if (typeof mi === 'string') {
+            payload = {
+              stepId: step.id,
+              title: step.title,
+              subtitle: step.description,
+              instructions: [mi], // legacy compat — Camila ainda lê instructions[]
+              steps: [{ num: 1, text: mi }],
+              action: null,
+              commands: [],
+              expected: null,
+              note: null,
+              terminal: step.manualTerminal || null,
+              browser: step.manualBrowser || null,
+            };
+          } else if (Array.isArray(mi)) {
+            payload = {
+              stepId: step.id,
+              title: step.title,
+              subtitle: step.description,
+              instructions: mi.map(String),
+              steps: mi.map((t, i) => ({ num: i + 1, text: String(t) })),
+              action: null,
+              commands: [],
+              expected: null,
+              note: null,
+              terminal: step.manualTerminal || null,
+              browser: step.manualBrowser || null,
+            };
+          } else if (mi && typeof mi === 'object') {
+            // Shape NOVO (Bruno v0.2.13). Mantém `instructions` (legacy) sincronizado
+            // pra UI antiga não quebrar.
+            const stepsArr = Array.isArray(mi.steps) ? mi.steps : [];
+            payload = {
+              stepId: step.id,
+              title: step.title,
+              subtitle: step.description,
+              instructions: stepsArr.map(s => (s && s.text) ? String(s.text) : String(s)),
+              steps: stepsArr,
+              action: mi.action || null,
+              commands: Array.isArray(mi.commands) ? mi.commands : [],
+              expected: mi.expected || null,
+              note: mi.note || null,
+              terminal: step.manualTerminal || null,
+              browser: step.manualBrowser || null,
+            };
+          } else {
+            payload = {
+              stepId: step.id,
+              title: step.title,
+              subtitle: step.description,
+              instructions: [],
+              steps: [],
+              action: null,
+              commands: [],
+              expected: null,
+              note: null,
+              terminal: step.manualTerminal || null,
+              browser: step.manualBrowser || null,
+            };
+          }
+          sendToRenderer('installer:onManualPrompt', payload);
         }
       }
     },
@@ -446,6 +516,56 @@ safeHandle('installer:openTerminal', async (_e, { cmd } = {}) => {
   await openInteractiveTerminal(cmd);
   return { ok: true };
 });
+
+// ───────────────────────────────────────────────────────────────────────
+// Bruno v0.2.13 — executeManualAction
+// Handler genérico pra botão de ação dos manualInstructions enriquecidos.
+// Camila chama com { kind, payload }:
+//   - kind='terminal' → abre WSL distro (opcionalmente rodando `cmd`)
+//   - kind='browser'  → shell.openExternal(payload.url)
+//   - kind='copy'     → no-op (renderer faz clipboard direto, mas mantemos
+//                       canal pra logging/telemetria futura)
+//   - kind='none'     → no-op (passos só-informativos)
+//
+// Termianl: usa openInteractiveTerminal já existente (wt.exe + fallback cmd.exe),
+// preservando o tratamento robusto que step_09/10 originais usavam.
+// ───────────────────────────────────────────────────────────────────────
+safeHandle('installer:executeManualAction', async (_e, args = {}) => {
+  const { kind, payload = {} } = args || {};
+  if (!kind) return { ok: false, error: 'kind obrigatório' };
+  switch (kind) {
+    case 'terminal': {
+      const distro = payload.distro || 'Ubuntu';
+      const cmd = payload.cmd;
+      if (cmd) {
+        // Roda comando inicial. openInteractiveTerminal já anexa
+        // "exit + read" no fim pra terminal não fechar sozinho.
+        const r = await openInteractiveTerminal(cmd, { distro, title: 'IMP — Passo manual' });
+        if (r && r.ok === false) return { ok: false, error: r.error || 'terminal não abriu' };
+        return { ok: true, distro, cmd };
+      }
+      // Sem cmd: abre shell interativo limpo na distro.
+      const r = await openInteractiveTerminal('exec bash', { distro, title: 'IMP — Passo manual' });
+      if (r && r.ok === false) return { ok: false, error: r.error || 'terminal não abriu' };
+      return { ok: true, distro };
+    }
+    case 'browser': {
+      const url = payload.url || payload.code;
+      if (!url || !/^https?:\/\//i.test(url)) return { ok: false, error: 'url inválida' };
+      shell.openExternal(url);
+      return { ok: true, url };
+    }
+    case 'copy': {
+      // Renderer faz copy via Clipboard API; main confirma só pra telemetria.
+      return { ok: true };
+    }
+    case 'none': {
+      return { ok: true };
+    }
+    default:
+      return { ok: false, error: `kind desconhecido: ${kind}` };
+  }
+}, { emitOnError: false });
 
 safeHandle('installer:openBrowser', async (_e, { url } = {}) => {
   if (!url || !/^https?:\/\//i.test(url)) {

@@ -23,6 +23,10 @@ const installer = {
   listSteps: () => ipcRenderer.invoke('installer:listSteps'),
   openTerminal: (cmd) => ipcRenderer.invoke('installer:openTerminal', { cmd }),
   openBrowser: (url) => ipcRenderer.invoke('installer:openBrowser', { url }),
+  // Bruno v0.2.13: ação genérica do botão de manualInstructions enriquecidos.
+  // kind: 'terminal'|'browser'|'copy'|'none', payload depende do kind.
+  executeManualAction: (kind, payload) =>
+    ipcRenderer.invoke('installer:executeManualAction', { kind, payload }),
   exportLogs: () => ipcRenderer.invoke('installer:exportLogs'),
   installSala3D: () => ipcRenderer.invoke('installer:installSala3D'),
   openInterface: () => ipcRenderer.invoke('installer:openInterface'),
