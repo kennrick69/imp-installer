@@ -13,7 +13,8 @@ const LOCK_NAME = '.installer.lock';
 // downstream — ex.: pular step_05 (apt) garante que step_06 (node via nvm via apt deps)
 // falhe; pular step_03 (wsl_install) deixa o sistema sem distro Linux.
 const CRITICAL_STEPS = new Set([
-  'step_03_wsl_install',
+  'step_01_enable_features', // v0.2.9: agora faz wsl --install (era só features)
+  'step_03_wsl_install',     // mantido crítico pra fluxo legacy fallback
   'step_05_apt_base',
   'step_06_node_nvm',
   'step_08_claude_cli',
@@ -176,9 +177,18 @@ async function runStep(stepId, events) {
 
   await pauseGate(_ctx);
 
-  // Reboot gate: step 03 sets rebootRequired=true. Subsequent steps cannot run
-  // until rebootDone is also true. main.js flips rebootDone on next launch.
-  if (_ctx.state.rebootRequired && !_ctx.state.rebootDone && step.id !== 'step_03_wsl_install') {
+  // Reboot gate: step 01 (refactor v0.2.9 — unified wsl --install) ou step 03
+  // (fallback legacy) podem setar rebootRequired=true. Steps subsequentes não
+  // podem rodar até rebootDone também ser true. main.js flipa rebootDone no
+  // próximo launch via RunOnce. Os 3 primeiros steps (01/02/03) são liberados
+  // pra que a UI possa re-detectar e marcar como done após reboot.
+  const REBOOT_GATE_EXEMPT = new Set([
+    'step_00_preflight',
+    'step_01_enable_features',
+    'step_02_set_wsl_default_v2',
+    'step_03_wsl_install',
+  ]);
+  if (_ctx.state.rebootRequired && !_ctx.state.rebootDone && !REBOOT_GATE_EXEMPT.has(step.id)) {
     const msg = 'Reboot pendente — reinicie o Windows antes de continuar.';
     emitStepUpdate(_ctx, step, 'blocked_user_action', { reason: 'reboot_pending' });
     if (_ctx.events && typeof _ctx.events.onError === 'function') {
@@ -290,9 +300,11 @@ async function runAll(events) {
     const r = await runStep(step.id, _ctx.events);
     results.push(r);
     if (r.status === 'error') break;
-    // After step 03, halt; user must reboot.
-    if (step.id === 'step_03_wsl_install' && _ctx.state.rebootRequired && !_ctx.state.rebootDone) {
-      _ctx.logger.info('runner', 'pausando — aguardando reboot do usuário');
+    // v0.2.9: step_01 (refactor unificado) ou step_03 (fallback legacy) podem
+    // setar rebootRequired. Pausa execução; user precisa reiniciar Windows.
+    if ((step.id === 'step_01_enable_features' || step.id === 'step_03_wsl_install')
+        && _ctx.state.rebootRequired && !_ctx.state.rebootDone) {
+      _ctx.logger.info('runner', `pausando após ${step.id} — aguardando reboot do usuário`);
       break;
     }
   }

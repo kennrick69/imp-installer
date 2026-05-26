@@ -13,19 +13,51 @@ const { enrichError } = require('./error-catalog');
 // Esta função SEMPRE inclui stdout + exit code na mensagem do erro, pra
 // debugar sem ficar adivinhando.
 //
+// Bruno v0.2.9 (live-test #2 fix CAUSA 1 — encoding):
+// Windows pt-BR retorna stdout do dism/wsl em codepage 850/1252 (legacy DOS).
+// Node lê como UTF-8 → mojibake ("Manuten��o"). Prependamos `chcp 65001 > $null`
+// pra forçar a sessão PS pra UTF-8 ANTES de invocar a ferramenta. Inofensivo
+// pra comandos sem acentos.
+//
+// Bruno v0.2.9 (CAUSA 2 — exit 3010): DISM/wsl --install retornam 3010 quando
+// têm SUCESSO mas precisam reboot pra ativar. Tratamos como sucesso e flag
+// rebootRequired=true em vez de erro. Os steps que chamam powershellVerbose
+// devem checar `r.rebootRequired` no resultado.
+//
 // Exit codes conhecidos (relevantes p/ steps 01/02/03):
+//   0     sucesso, sem reboot
 //   740   ERROR_ELEVATION_REQUIRED — falta admin (manifest deve resolver em v0.2.7)
 //   50    DISM: feature já em estado desejado / não suportado
-//   3010  DISM: sucesso mas precisa reboot (não-fatal)
+//   3010  DISM/wsl --install: sucesso mas precisa reboot (tratado como OK)
 //   -1    wsl.exe: distro não instalada / erro genérico
 // ───────────────────────────────────────────────────────────────────────
 async function powershellVerbose(script, opts = {}) {
+  // CAUSA 1 fix: força UTF-8 na sessão PS. `chcp 65001 > $null` muda code page
+  // do console pra UTF-8 antes do comando real, eliminando mojibake pt-BR na
+  // saída do dism/wsl. `$ErrorActionPreference = 'Continue'` garante que
+  // mudar chcp não derrube o script se algo der ruim no chcp (raríssimo).
+  const wrapped = `chcp 65001 > $null; ${script}`;
   try {
-    return await powershell(script, opts);
+    const r = await powershell(wrapped, opts);
+    // CAUSA 2 fix: alguns comandos (raro mas possível) retornam 3010 SEM throw
+    // — flag pra caller saber.
+    if (r && r.code === 3010) {
+      r.rebootRequired = true;
+    }
+    return r;
   } catch (e) {
     const code = e.code != null ? e.code : '(unknown)';
     const stdout = (e.stdout || '').trim();
     const stderr = (e.stderr || '').trim();
+
+    // CAUSA 2 fix: exit 3010 NÃO é erro — é "sucesso, precisa reboot".
+    // Sintetiza um resultado de sucesso e devolve em vez de throw.
+    if (code === 3010) {
+      return {
+        stdout, stderr, code: 3010, rebootRequired: true,
+      };
+    }
+
     const parts = [
       `exit_code=${code}`,
       stdout ? `stdout=${stdout.slice(0, 1500)}` : 'stdout=(empty)',
@@ -41,6 +73,27 @@ async function powershellVerbose(script, opts = {}) {
     enriched.stderr = stderr;
     enriched.originalMessage = e.message;
     throw enriched;
+  }
+}
+
+// Helper: detecta se `wsl --install` moderno está disponível neste Windows.
+// Win10 build 19041+ e Win11 têm. Retorna true se wsl.exe aceita --install.
+async function wslInstallSupported() {
+  try {
+    // `wsl --help` lista subcomandos. Se contém "--install" é a versão moderna.
+    const r = await powershell(`chcp 65001 > $null; wsl --help 2>&1`, { timeout: 15_000 });
+    return /--install/i.test(r.stdout || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+// Helper: lista distros instaladas (UTF-16 LE decodada via shell.js).
+async function wslListVerbose() {
+  try {
+    return await powershell(`chcp 65001 > $null; wsl -l -v 2>&1`, { timeout: 15_000 });
+  } catch (e) {
+    return { stdout: e.stdout || '', stderr: e.stderr || '', code: e.code || 1 };
   }
 }
 
@@ -100,106 +153,209 @@ const step00Preflight = {
   },
 };
 
-// -------- step 01 — enable WSL features -----------------------------------
-const step01EnableFeatures = {
-  id: 'step_01_enable_features',
-  title: 'Habilitar features WSL + VirtualMachinePlatform',
-  description: 'dism.exe habilita Microsoft-Windows-Subsystem-Linux e VirtualMachinePlatform.',
-  category: 'AUTO',
-  async detect() {
-    const script = `
-      $w  = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux).State
-      $vm = (Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform).State
-      "$w|$vm"
-    `;
+// ───────────────────────────────────────────────────────────────────────
+// Bruno v0.2.9 — REFATORAÇÃO steps 01/02/03 (live-test #2)
+//
+// CAUSA RAIZ (live-test JOs em v0.2.8): dism.exe /enable-feature falhava em
+// ~29.4% com exit 1, stderr vazio, stdout em mojibake pt-BR ("Manuten��o").
+// Diagnóstico cirúrgico identificou 3 fatores:
+//   1) Encoding pt-BR (cp850/1252) lido como UTF-8 → mojibake
+//   2) Exit 3010 (sucesso-com-reboot) tratado como erro
+//   3) Abordagem dism+wsl --set-default+wsl --install (3 passos) é a forma
+//      ANTIGA. Microsoft recomenda `wsl --install` desde Win10 19041 (2021),
+//      que faz tudo numa tacada e gerencia reboot.
+//
+// ESTRATÉGIA CONSERVADORA: preservamos os 3 IDs (step_01/02/03) pra não quebrar
+// state.json existente nem a UI da Camila (wizard.js mapeia por ID). Mas:
+//   - step_01 agora faz TUDO (wsl --install ou fallback dism)
+//   - step_02 e step_03 viram NO-OPs (detect=true após step_01)
+//
+// Compatibilidade total com state.json antigo (steps já 'done' continuam done).
+// ───────────────────────────────────────────────────────────────────────
+
+// Compartilhado: marca reboot + agenda RunOnce. Idempotente.
+async function _markRebootAndScheduleRunOnce(ctx, stepId) {
+  ctx.state.rebootRequired = true;
+  ctx.state.rebootDone = false;
+  ctx.save();
+  if (ctx.exePath) {
     try {
-      const { stdout } = await powershell(script);
-      return /Enabled\|Enabled/i.test(stdout.trim());
-    } catch (_) {
-      return false;
+      await scheduleRunOnceAfterReboot(ctx.exePath);
+      ctx.logger.info(stepId, 'RunOnce agendado — instalador re-abre após reboot');
+    } catch (e) {
+      ctx.logger.warn(stepId, `RunOnce schedule falhou: ${e.message}`);
     }
-  },
-  async execute() {
-    await requireAdminOrThrow();
-    // Bruno v0.2.7: powershellVerbose captura stdout+code (dism erra no stdout,
-    // não stderr — log do JOs no live test mostrou stderr vazio sem pista nenhuma).
-    await powershellVerbose(`dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`);
-    await powershellVerbose(`dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`);
-  },
-  async validate() { return this.detect(); },
-};
+  }
+}
 
-// -------- step 02 — wsl default v2 ----------------------------------------
-const step02SetWslDefaultV2 = {
-  id: 'step_02_set_wsl_default_v2',
-  title: 'wsl --set-default-version 2',
-  description: 'Garante que distros novas instalem como WSL2.',
-  category: 'AUTO',
-  async detect() {
-    try {
-      // shell.js decodeWslOutput desfaz mojibake UTF-16 LE de wsl.exe (#A4).
-      // Regex tolera EN ("Default Version") e PT-BR ("Versão padrão").
-      const { stdout } = await powershell(`wsl --status 2>&1`);
-      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute() {
-    await requireAdminOrThrow();
-    // wsl.exe também erra no stdout (mojibake UTF-16 LE já é tratado em decodeWslOutput).
-    await powershellVerbose(`wsl --set-default-version 2`);
-  },
-  async validate() { return this.detect(); },
-};
+// Compartilhado: detecta Ubuntu-22.04 instalado (qualquer um dos 3 steps
+// considera "feito" se isso é true, porque step_01 unificado já cuidou).
+async function _ubuntuInstalled() {
+  const r = await wslListVerbose();
+  // decodeWslOutput em shell.js cobre o UTF-16 LE de wsl.exe (#A4).
+  return /Ubuntu-22\.04/i.test(r.stdout || '');
+}
 
-// -------- step 03 — install WSL + Ubuntu (reboot trigger) -----------------
-const step03WslInstall = {
-  id: 'step_03_wsl_install',
-  title: 'Instalar WSL2 + Ubuntu-22.04 (requer reboot)',
-  description: 'Baixa kernel WSL2 + imagem Ubuntu-22.04. Pós-execução o Windows precisa reiniciar.',
-  category: 'HYBRID',
+// -------- step 01 — Install WSL2 + Ubuntu (unified, modern) ---------------
+const step01EnableFeatures = {
+  id: 'step_01_enable_features', // ID preservado pra compat com state.json/UI
+  title: 'Instalar WSL2 + Ubuntu (features + kernel + distro)',
+  description: 'wsl --install -d Ubuntu-22.04 (moderno: faz features, kernel e distro de uma vez). Fallback dism se Windows for antigo.',
+  category: 'HYBRID', // pode disparar reboot
   manualInstructions:
-    'Depois que o WSL terminar de instalar, o Windows VAI precisar reiniciar. ' +
+    'A instalação do WSL pode pedir um reboot do Windows. ' +
     'Salve seu trabalho. Quando o PC voltar, este instalador abre sozinho e retoma de onde parou.',
   async detect() {
-    try {
-      // decodeWslOutput em shell.js cobre o UTF-16 LE de wsl.exe (#A4).
-      const { stdout } = await powershell(`wsl -l -v 2>&1`);
-      // Ubuntu-22.04 present and version 2 (locale-agnostic: o "2" é numérico).
-      return /Ubuntu-22\.04[\s\S]*\b2\b/m.test(stdout) || /Ubuntu[\s\S]*\b2\b/m.test(stdout);
-    } catch (_) { return false; }
+    return _ubuntuInstalled();
   },
   async execute(ctx) {
     await requireAdminOrThrow();
-    // Checa se há outra distro como default (Debian/Kali/etc) e avisa.
+
+    // Aviso amigável se outra distro for default.
     try {
-      const { stdout: list } = await powershell(`wsl -l -v 2>&1`).catch(() => ({ stdout: '' }));
-      if (list && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(list)) {
-        ctx.logger.warn('step_03', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu-22.04 mesmo assim e setar como default.');
+      const r = await wslListVerbose();
+      if (r.stdout && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(r.stdout)) {
+        ctx.logger.warn('step_01', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu-22.04 e setar como default.');
       }
     } catch (_) {}
 
+    // Caminho moderno: `wsl --install -d Ubuntu-22.04 --no-launch`.
+    // --no-launch evita Ubuntu GUI abrir no primeiro boot (step_04 cuida disso).
+    const modern = await wslInstallSupported();
+    if (modern) {
+      ctx.logger.info('step_01', 'rodando: wsl --install -d Ubuntu-22.04 --no-launch');
+      const r = await withRetry(
+        () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
+        { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+      );
+
+      // 3010 vira r.rebootRequired=true (powershellVerbose trata).
+      // Mas wsl --install pode terminar com 0 e ainda assim sinalizar reboot
+      // no stdout ("restart your computer", "reinicie", etc.). Cobrimos ambos.
+      const stdoutLower = (r.stdout || '').toLowerCase();
+      const wantsReboot = r.rebootRequired
+        || r.code === 3010
+        || /restart|reinici|reboot/i.test(stdoutLower);
+
+      if (wantsReboot) {
+        ctx.logger.info('step_01', 'wsl --install OK — reboot pendente');
+      } else {
+        ctx.logger.info('step_01', 'wsl --install OK — sem reboot necessário');
+      }
+
+      // Força Ubuntu-22.04 como default (idempotente).
+      try {
+        await powershellVerbose(`wsl --set-default Ubuntu-22.04`).catch(() => {});
+      } catch (_) {}
+
+      // Mesmo que wsl --install não tenha sinalizado reboot, é mais SEGURO
+      // forçar reboot pra primeira instalação WSL — features de virtualização
+      // só ativam de verdade após restart. Custo: 1 reboot extra. Benefício:
+      // zero "WslRegisterDistribution failed" no step_04.
+      await _markRebootAndScheduleRunOnce(ctx, 'step_01');
+      return;
+    }
+
+    // PARTE D — Fallback: Windows antigo (build <19041, raro). Volta pro
+    // método dism+wsl --set-default+wsl --install que era v0.2.8.
+    ctx.logger.warn('step_01', 'wsl --install não suportado neste Windows — usando fallback dism (legacy)');
+    await _executeLegacyDismFlow(ctx);
+    await _markRebootAndScheduleRunOnce(ctx, 'step_01');
+  },
+  async validate(ctx) {
+    // Se reboot pendente, segura aqui — runner libera quando rebootDone.
+    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    return _ubuntuInstalled();
+  },
+};
+
+// Fallback legacy (dism). Só usado quando wsl --install indisponível.
+async function _executeLegacyDismFlow(ctx) {
+  ctx.logger.info('step_01', 'fallback: dism /enable-feature Microsoft-Windows-Subsystem-Linux');
+  await powershellVerbose(
+    `dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`,
+    { timeout: 600_000 }
+  );
+  ctx.logger.info('step_01', 'fallback: dism /enable-feature VirtualMachinePlatform');
+  await powershellVerbose(
+    `dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`,
+    { timeout: 600_000 }
+  );
+  ctx.logger.info('step_01', 'fallback: wsl --set-default-version 2');
+  await powershellVerbose(`wsl --set-default-version 2`).catch(() => {
+    ctx.logger.warn('step_01', 'wsl --set-default-version 2 falhou — pode precisar reboot antes');
+  });
+  ctx.logger.info('step_01', 'fallback: wsl --install -d Ubuntu-22.04 --no-launch');
+  await withRetry(
+    () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
+    { label: 'wsl --install (legacy)', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+  );
+  try {
+    await powershellVerbose(`wsl --set-default Ubuntu-22.04`).catch(() => {});
+  } catch (_) {}
+}
+
+// -------- step 02 — wsl default v2 (NO-OP no fluxo moderno) ---------------
+// Mantido pra compat com state.json + wizard.js. `wsl --install` já configura
+// default version 2. Detect retorna true se Ubuntu-22.04 está instalado (step_01
+// fez), então este step pula com `skipped` sem executar nada.
+const step02SetWslDefaultV2 = {
+  id: 'step_02_set_wsl_default_v2',
+  title: 'WSL default version 2',
+  description: 'Já configurado pelo passo 1 (wsl --install). Mantido por compatibilidade.',
+  category: 'AUTO',
+  async detect(ctx) {
+    // Se reboot pendente, considera detectado (libera o caminho).
+    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    // Se Ubuntu-22.04 instalado, o `wsl --install` já setou default version 2.
+    if (await _ubuntuInstalled()) return true;
+    // Caso fluxo legacy (sem wsl --install), checa via wsl --status.
+    try {
+      const { stdout } = await powershell(`chcp 65001 > $null; wsl --status 2>&1`);
+      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(stdout);
+    } catch (_) { return false; }
+  },
+  async execute(ctx) {
+    // Defensiva: se detect retornou false (cenário raro de state corrompido),
+    // roda set-default-version explícito.
+    await requireAdminOrThrow();
+    await powershellVerbose(`wsl --set-default-version 2`).catch((e) => {
+      ctx.logger.warn('step_02', `set-default-version 2 falhou: ${e.message}`);
+    });
+  },
+  async validate(ctx) { return this.detect(ctx); },
+};
+
+// -------- step 03 — install WSL + Ubuntu (NO-OP no fluxo moderno) --------
+// Mantido pra compat. `wsl --install` do step_01 já baixou e instalou.
+// Detect retorna true → step é pulado como `skipped`.
+const step03WslInstall = {
+  id: 'step_03_wsl_install',
+  title: 'WSL2 + Ubuntu instalados',
+  description: 'Já feito pelo passo 1. Mantido por compatibilidade com instalações antigas.',
+  category: 'HYBRID',
+  manualInstructions:
+    'Se o Windows pediu reboot no passo 1, salve seu trabalho e reinicie. ' +
+    'Quando o PC voltar, este instalador abre sozinho e retoma de onde parou.',
+  async detect(ctx) {
+    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    return _ubuntuInstalled();
+  },
+  async execute(ctx) {
+    // Não deveria chegar aqui se step_01 funcionou. Fallback defensivo:
+    // se Ubuntu não tá instalado, tenta uma vez (raro: state corrompido).
+    await requireAdminOrThrow();
+    ctx.logger.warn('step_03', 'step_01 deveria ter instalado Ubuntu — rodando fallback');
     await withRetry(
       () => powershellVerbose(`wsl --install -d Ubuntu-22.04 --no-launch`, { timeout: 600_000 }),
-      { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger }
+      { label: 'wsl --install (step_03 fallback)', attempts: 2, backoff: [10, 30], logger: ctx.logger }
     );
-
-    // Força Ubuntu-22.04 como default (idempotente; ignora erro se já é).
-    try {
-      await powershell(`wsl --set-default Ubuntu-22.04`).catch(() => {});
-    } catch (_) {}
-
-    // Mark reboot required; runner will halt and schedule RunOnce.
-    ctx.state.rebootRequired = true;
-    ctx.state.rebootDone = false;
-    ctx.save();
-
-    if (ctx.exePath) {
-      try { await scheduleRunOnceAfterReboot(ctx.exePath); } catch (e) {
-        ctx.logger.warn('reboot', `RunOnce schedule falhou: ${e.message}`);
-      }
-    }
+    await _markRebootAndScheduleRunOnce(ctx, 'step_03');
   },
-  async validate() { return this.detect(); },
+  async validate(ctx) {
+    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    return _ubuntuInstalled();
+  },
 };
 
 // -------- step 04 — Ubuntu first boot (manual) ----------------------------
