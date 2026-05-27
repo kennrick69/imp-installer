@@ -44,7 +44,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Confirmar 7-Zip + tar disponíveis
         shell: pwsh
@@ -86,7 +85,7 @@ jobs:
           Get-Content "runtime\runtime.7z.sha256"
 
       - name: Install npm dependencies
-        run: npm ci --ignore-scripts
+        run: npm install --no-audit --no-fund --ignore-scripts
 
       - name: Build Electron portable .exe (electron-builder)
         run: npm run dist:win
