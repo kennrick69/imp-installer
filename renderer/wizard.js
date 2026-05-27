@@ -249,16 +249,16 @@
       step_03_wsl_install:       'Baixando o kernel WSL2 e o Ubuntu. Vai precisar reiniciar.',
       step_04_ubuntu_first_boot: 'Criando seu usuário Linux. Vou abrir o Ubuntu pra você.',
       step_05_apt_base:          'Instalando tmux, git, curl e ferramentas de build.',
-      step_06_node:              'Instalando o Node 20 LTS via NodeSource.',
-      step_07_npm_global:        'Configurando o npm pra instalar pacotes sem sudo.',
+      step_06_node_nvm:          'Instalando o Node 20 LTS via nvm.',
+      step_07_npm_prefix:        'Configurando o npm pra instalar pacotes sem sudo.',
       step_08_claude_cli:        'Instalando o Claude Code CLI globalmente.',
       step_09_claude_login:      'Vou abrir o login do Claude pra você autenticar com sua conta Max.',
-      step_10_github_auth:       'Conectando ao GitHub com Device Flow (seguro).',
+      step_10_gh_auth:           'Conectando ao GitHub com Device Flow (seguro).',
       step_11_clone_squad:       'Clonando o repositório imp-squad em C:\\Projetos.',
-      step_12_clone_orch:        'Clonando o imp-orchestrator e rodando npm install.',
+      step_12_clone_orchestrator: 'Clonando o imp-orchestrator e rodando npm install.',
       step_13_sala3d:            'A sala 3D é opcional — você pode instalar agora ou depois.',
       step_14_tmux_session:      'Criando a sessão tmux "imp" com os 7 painéis da squad.',
-      step_15_interface_dl:      'Baixando o Squad Comando e criando atalho no Desktop.',
+      step_15_download_interface: 'Baixando o Squad Comando e criando atalho no Desktop.',
       step_16_e2e:               'Abrindo o Squad Comando e validando que conecta na squad.'
     };
     return map[meta.id] || '';
@@ -415,16 +415,28 @@
     $('#manual-title').textContent    = prompt.title    || `Preciso de você no passo ${meta.num || ''}`;
     $('#manual-subtitle').textContent = prompt.subtitle || 'Este passo precisa que você faça algo no Windows ou no Ubuntu. Eu te guio.';
 
+    // BUG v0.2.14: main.js envia action/fallback/steps/commands/etc TOP-LEVEL no prompt
+    // (não dentro de prompt.instructions). Antes a gente lia prompt.instructions e
+    // perdia tudo — botão fantasma garantido.
+    // Fix v0.2.15: lê PRIORITARIAMENTE top-level + fallback pra prompt.instructions
+    // (compat com shape legacy + smoke test passa).
     const ins = prompt.instructions || {};
-    const data = Array.isArray(ins)
-      ? { steps: ins.map((t, i) => ({
-            num: i + 1,
-            text: typeof t === 'string'
-              ? t
-              : (t.title || t.body || '')
-          }))
-        }
-      : ins;
+    const insIsArray = Array.isArray(ins);
+    const insIsObj = !insIsArray && ins && typeof ins === 'object';
+    const data = {
+      action:   prompt.action   || (insIsObj && ins.action)   || null,
+      fallback: prompt.fallback || (insIsObj && ins.fallback) || null,
+      commands: Array.isArray(prompt.commands) ? prompt.commands :
+                (insIsObj && Array.isArray(ins.commands)) ? ins.commands : [],
+      expected: prompt.expected || (insIsObj && ins.expected) || null,
+      note:     prompt.note     || (insIsObj && ins.note)     || null,
+      steps:    Array.isArray(prompt.steps) ? prompt.steps :
+                (insIsObj && Array.isArray(ins.steps)) ? ins.steps :
+                insIsArray ? ins.map((t, i) => ({
+                  num: i + 1,
+                  text: typeof t === 'string' ? t : (t.title || t.body || t.text || '')
+                })) : [],
+    };
 
     // ─── Ação principal (Camila v0.2.14: garante visibilidade) ──
     const actionBtn  = $('#manual-action-btn');
@@ -725,6 +737,9 @@
   let _elevateCountdownTimer = null;
   function showElevateStatus(text, tone = 'info') {
     const el = $('#elevate-status');
+    // BUG Patrícia v0.2.15: classe `.hidden` (display:none !important) sobrescreve
+    // el.hidden=false. Remove classe pra status do modal-elevate aparecer.
+    if (el) el.classList.remove('hidden');
     const txt = $('#elevate-status-text');
     if (!el || !txt) return;
     el.hidden = false;
@@ -734,7 +749,7 @@
   function hideElevateStatus() {
     const el = $('#elevate-status');
     const cd = $('#elevate-countdown');
-    if (el) el.hidden = true;
+    if (el) { el.hidden = true; el.classList.add('hidden'); }
     if (cd) cd.textContent = '';
     if (_elevateCountdownTimer) { clearInterval(_elevateCountdownTimer); _elevateCountdownTimer = null; }
   }
@@ -1531,7 +1546,12 @@
     });
 
     // Eventos opcionais que o main.js pode disparar
-    api.onScreen && api.onScreen((name) => showScreen(name));
+    // Eduardo v0.2.15: main envia {screen:'preflight'} mas wizard tratava como string.
+    // showScreen({screen:'preflight'}) virava showScreen({}) → quebra silente.
+    api.onScreen && api.onScreen((payload) => {
+      const name = (payload && typeof payload === 'object') ? payload.screen : payload;
+      if (name) showScreen(name);
+    });
     api.onToast  && api.onToast(({ message, kind }) => toast(message, kind));
 
     // Fix Eduardo 2.3 — modal de sudo (passos 05, 10 precisam)
