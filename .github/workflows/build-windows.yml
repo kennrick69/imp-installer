@@ -1,0 +1,163 @@
+name: Build Windows .exe (com runtime MSYS2 embutido)
+
+# Bruno, dev — FRENTE 1 — pocket autossuficiente
+#
+# Pipeline ponta-a-ponta:
+#   1. Roda scripts/build-runtime.ps1 no Windows Server 2022 hosted runner
+#      (MSYS2 base + pacman -Syu + tmux/git/node + claude.exe → runtime.7z ~265MB)
+#   2. npm ci + npm run dist:win (electron-builder empacota .exe portable
+#      com runtime.7z embutido via extraResources)
+#   3. Sobe .exe (~340MB) como artifact (retém 30d)
+#   4. Se trigger foi push de tag vX.Y.Z, publica GitHub Release com .exe anexado
+#
+# Disparo:
+#   - git push origin v0.3.1  →  build + release automático
+#   - GitHub UI → Actions → "Build Windows .exe" → Run workflow (manual)
+#
+# Tempo estimado: 15-25 min por run.
+# Custo: Windows runner = 2x minutos. Free tier (2000 min/mês) cobre ~40 builds.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag pra criar release manual (opcional, ex: v0.3.1-test). Vazio = só artifact.'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build runtime + .exe portable
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Confirmar 7-Zip + tar disponíveis
+        shell: pwsh
+        run: |
+          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
+            Write-Host "7z.exe não encontrado no PATH — instalando via choco..."
+            choco install -y 7zip --no-progress
+            $env:Path = "C:\Program Files\7-Zip;$env:Path"
+          }
+          $sevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
+          if (-not $sevenZip) {
+            if (Test-Path 'C:\Program Files\7-Zip\7z.exe') {
+              "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            } else {
+              throw "7z.exe ainda não disponível após install."
+            }
+          }
+          Write-Host "7-Zip: $((Get-Command 7z.exe).Source)"
+          Write-Host "tar  : $((Get-Command tar).Source)"
+
+      - name: Build Runtime (MSYS2 + tmux + git + node + claude)
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          .\scripts\build-runtime.ps1
+
+      - name: Confirmar runtime.7z gerado
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "runtime\runtime.7z")) {
+            throw "runtime.7z não foi gerado pelo build-runtime.ps1"
+          }
+          if (-not (Test-Path "runtime\runtime.7z.sha256")) {
+            throw "runtime.7z.sha256 não foi gerado"
+          }
+          $rt = Get-Item "runtime\runtime.7z"
+          $sizeMB = [math]::Round($rt.Length / 1MB, 1)
+          Write-Host "OK runtime.7z = $sizeMB MB"
+          Get-Content "runtime\runtime.7z.sha256"
+
+      - name: Install npm dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build Electron portable .exe (electron-builder)
+        run: npm run dist:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Confirma .exe gerado
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "dist\IMP-Squad-Instalador-*-portable.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "Conteúdo de dist\:"
+            Get-ChildItem dist\ -ErrorAction SilentlyContinue | Format-Table Name,Length
+            throw ".exe portable não foi gerado"
+          }
+          $sizeMB = [math]::Round($exe.Length / 1MB, 1)
+          Write-Host "OK $($exe.Name) — $sizeMB MB"
+
+      - name: Upload .exe como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IMP-Squad-Instalador-portable
+          path: dist/IMP-Squad-Instalador-*-portable.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload runtime.7z.sha256 como artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-sha256
+          path: runtime/runtime.7z.sha256
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Publish GitHub Release (se trigger foi tag vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/IMP-Squad-Instalador-*-portable.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+      - name: Publish GitHub Release (manual dispatch com release_tag)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/IMP-Squad-Instalador-*-portable.exe
+          tag_name: ${{ github.event.inputs.release_tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: true
+
+      - name: Sumário
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "===================================================="
+          Write-Host "  IMP Squad Instalador — build sumário"
+          Write-Host "===================================================="
+          Write-Host "Ref     : ${{ github.ref }}"
+          Write-Host "Event   : ${{ github.event_name }}"
+          Write-Host "Runner  : ${{ runner.os }}"
+          if (Test-Path "runtime\runtime.7z") {
+            $rt = Get-Item "runtime\runtime.7z"
+            Write-Host ("Runtime : {0:N1} MB" -f ($rt.Length / 1MB))
+          }
+          $exe = Get-ChildItem "dist\IMP-Squad-Instalador-*-portable.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Write-Host ("EXE     : $($exe.Name) — {0:N1} MB" -f ($exe.Length / 1MB))
+          }
