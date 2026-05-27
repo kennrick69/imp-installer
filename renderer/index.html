@@ -281,6 +281,135 @@
       </section>
 
       <!-- ─────────────────────────────────────────────────────
+           TELA — REBOOT FORÇADO (Camila noturna 2026-05-27)
+           Aparece quando WSL precisa de reboot pra ativar kernel.
+           Visual amber: aviso forte + plano B sempre presente.
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-reboot" aria-labelledby="reboot-title">
+        <div class="screen-inner reboot-wrap">
+          <div class="reboot-hero">
+            <div class="reboot-icon" aria-hidden="true">↻</div>
+            <h1 id="reboot-title">Vamos reiniciar o Windows</h1>
+            <p class="reboot-lead">
+              Habilitei as features do WSL, mas o Windows precisa <strong>reiniciar</strong>
+              pra ativar o kernel novo. Sem o reboot, o resto da instalação não vai funcionar.
+            </p>
+          </div>
+
+          <div class="reboot-good-news">
+            <span class="rbg-ico" aria-hidden="true">✓</span>
+            <div>
+              <strong>Boa notícia:</strong> depois do reboot, eu <strong>reabro sozinho</strong>
+              e continuo do passo onde paramos. Você não perde nada.
+            </div>
+          </div>
+
+          <div class="reboot-checklist" role="region" aria-label="Antes de reiniciar">
+            <h3>Antes de clicar:</h3>
+            <ul>
+              <li>Salve trabalhos abertos (Word, Excel, navegadores…)</li>
+              <li>Feche o que estiver no meio de fazer</li>
+              <li>Se for notebook, deixe o cabo de força ligado</li>
+            </ul>
+          </div>
+
+          <div class="reboot-actions">
+            <button class="btn-primary btn-large" id="btn-reboot-now">
+              💾 Salvar progresso e reiniciar agora
+            </button>
+            <button class="btn-ghost" id="btn-reboot-later">
+              Vou reiniciar manualmente daqui a pouco
+            </button>
+          </div>
+
+          <!-- PLANO B sempre visível -->
+          <div class="reboot-fallback">
+            <header class="rbf-header">
+              <span class="rbf-ico" aria-hidden="true">🛟</span>
+              <h3>Plano B — se o botão não funcionar</h3>
+            </header>
+            <p class="rbf-intro">
+              Aperte <kbd>Win</kbd>+<kbd>R</kbd>, cole o comando abaixo e dê Enter.
+              O Windows vai reiniciar em 10 segundos.
+            </p>
+            <div class="rbf-cmd-row">
+              <code class="rbf-code" id="reboot-fallback-code">shutdown /r /t 10</code>
+              <button class="rbf-copy" id="reboot-fallback-copy" type="button">Copiar</button>
+            </div>
+            <ol class="rbf-steps">
+              <li>Aperte <kbd>Win</kbd>+<kbd>R</kbd> (abre a janelinha "Executar")</li>
+              <li>Cole o comando e dê <kbd>Enter</kbd></li>
+              <li>Quando voltar do reboot, clique no atalho da IMP Squad de novo</li>
+            </ol>
+          </div>
+
+          <p class="reboot-resume-hint">
+            Salvei seu progresso. Vou retomar no <strong>Passo <span id="reboot-resume-step">03</span></strong>
+            quando você voltar.
+          </p>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
+           TELA — MIGRAÇÃO WSL legado→moderno (Camila noturna 2026-05-27)
+           Aparece quando wslIsLegacy === true. Backend baixa MSI
+           da MS e emite onWslUpgradeProgress pra atualizar barra.
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-wsl-upgrade" aria-labelledby="wsl-up-title">
+        <div class="screen-inner wsl-upgrade-wrap">
+          <header class="wsl-up-head">
+            <div class="wsl-up-icon" aria-hidden="true">⚙</div>
+            <h1 id="wsl-up-title">Atualizando o WSL</h1>
+            <p class="wsl-up-sub">
+              Seu computador tem uma versão antiga do WSL (a que veio com o Windows).
+              Vou baixar e instalar a versão mais nova — oficial da Microsoft.
+            </p>
+          </header>
+
+          <div class="wsl-up-meta">
+            <span class="wum-pill"><span class="wum-ico">⏱</span> 1–2 minutos</span>
+            <span class="wum-pill"><span class="wum-ico">📦</span> ~50 MB</span>
+            <span class="wum-pill"><span class="wum-ico">🔒</span> aka.ms/wsl2kernel (oficial MS)</span>
+          </div>
+
+          <div class="wsl-up-progress" aria-live="polite">
+            <header>
+              <span class="wup-stage" id="wsl-up-stage">⏳ Baixando wsl_update_x64.msi…</span>
+              <span class="wup-pct" id="wsl-up-pct">0%</span>
+            </header>
+            <div class="wup-bar"><div class="wup-fill" id="wsl-up-fill" style="width:0%"></div></div>
+            <span class="wup-detail" id="wsl-up-detail">0 MB de 51 MB</span>
+          </div>
+
+          <!-- log peek dedicado pra essa tela -->
+          <section class="wsl-up-log" aria-label="Atividade ao vivo">
+            <header>Atividade ao vivo</header>
+            <div class="wul-body" id="wsl-up-log-body" tabindex="0"></div>
+          </section>
+
+          <p class="wsl-up-zen">Não precisa fazer nada — eu cuido.</p>
+
+          <!-- PLANO B -->
+          <div class="wsl-up-fallback">
+            <header class="wuf-header">
+              <span class="wuf-ico">🛟</span>
+              <h3>Plano B — se travar mais que 3 minutos</h3>
+            </header>
+            <ol class="wuf-steps">
+              <li>Clique no botão abaixo (abre o link oficial da Microsoft)</li>
+              <li>Baixe o arquivo <code>wsl_update_x64.msi</code></li>
+              <li>Dê duplo-clique nele e siga o instalador</li>
+              <li>Volte aqui e clique em "Já fiz, continuar"</li>
+            </ol>
+            <div class="wuf-actions">
+              <button class="btn-ghost" id="btn-wsl-up-open-link">Abrir aka.ms/wsl2kernel</button>
+              <button class="btn-primary" id="btn-wsl-up-manual-done">✓ Já fiz, continuar →</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
            TELA 4 — PASSO MANUAL
       ────────────────────────────────────────────────────── -->
       <section class="screen" id="screen-manual" aria-labelledby="manual-title">
@@ -546,6 +675,21 @@
             <div class="error-headline" id="error-headline-text">—</div>
           </div>
           <p class="error-what" id="error-what-text">—</p>
+
+          <!-- PLANO B (Camila noturna 2026-05-27) — visível quando payload.fallback existe -->
+          <div class="error-fallback hidden" id="error-fallback" role="region" aria-label="Plano B manual">
+            <header class="ef-header">
+              <span class="ef-ico" aria-hidden="true">🛟</span>
+              <h4>Plano B — você roda manual</h4>
+            </header>
+            <div class="ef-cmd-row">
+              <code class="ef-code" id="error-fallback-code"></code>
+              <button class="ef-copy" id="error-fallback-copy" type="button">Copiar</button>
+            </div>
+            <ol class="ef-steps" id="error-fallback-steps" hidden></ol>
+            <p class="ef-hint">Depois de rodar o comando, clique em <strong>"Tentei manual, verifica"</strong> abaixo.</p>
+          </div>
+
           <h4 class="error-section-title">O que tentar</h4>
           <ul class="error-suggestions" id="error-suggestions-list"></ul>
           <details class="error-raw-wrap" hidden>
@@ -555,6 +699,7 @@
         </div>
         <footer>
           <button class="btn-ghost" id="btn-error-skip" hidden>Ignorar e continuar</button>
+          <button class="btn-ghost" id="btn-error-fallback-verify" hidden>✓ Tentei manual, verifica</button>
           <button class="btn-ghost" id="btn-error-logs">Ver logs detalhados</button>
           <button class="btn-primary" id="btn-error-retry">Tentar de novo</button>
         </footer>

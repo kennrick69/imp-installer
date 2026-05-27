@@ -36,6 +36,14 @@ function emptyState() {
       claudeCliVia: 'native',         // curl install.sh
       escritorio3dStrategy: 'release-asset-on-demand',
     },
+    // Bruno (noturna 2026-05-27) — fluxo WSL legacy→moderno explícito
+    wslState: null,                   // 'absent' | 'legacy' | 'modern' | 'functional' | 'broken'
+    featuresEnabled: null,            // { wsl: bool, vmp: bool, checkedAt: ts }
+    wslMigrationAttempted: false,
+    wslMsiVersion: null,
+    rebootRequiredReason: null,
+    rebootCount: 0,                   // cap em 3 pra evitar loop infinito
+    distroState: null,                // 'none' | 'installed' | 'user_created'
     steps: {}, // stepId -> 'pending' | 'running' | 'done' | 'error' | 'skipped' | 'blocked_user_action'
     stepDetails: {}, // stepId -> { startedAt, finishedAt, lastError, attempts }
     lastStepCompleted: null,

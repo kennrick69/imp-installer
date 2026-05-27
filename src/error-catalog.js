@@ -224,6 +224,47 @@ const ENTRIES = [
     canSkip: false,
   },
 
+  // ─── WSL legacy/MSI/loop (Bruno noturna 2026-05-27 — fluxo WSL moderno) ──
+  {
+    stepId: '*',
+    match: /WSL_LEGACY_DETECTED|wsl[\s_-]?state=legacy|inbox legad/i,
+    headline: 'Seu Windows tem WSL antigo',
+    what: 'O Windows 10 veio com uma versão antiga do WSL (inbox/legacy). O instalador vai baixar a versão moderna automaticamente.',
+    suggestions: [
+      'Clique em "Tentar de novo" — o instalador vai baixar e instalar o WSL2 moderno.',
+      'A instalação pode pedir 1 reboot do Windows pra ativar o kernel novo.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /WSL_MSI_INSTALL_FAILED|MSI install exit|n[ãa]o consegui (baixar|instalar) o WSL/i,
+    headline: 'Não consegui instalar o WSL2 (MSI)',
+    what: 'Falhei ao baixar/instalar o pacote MSI do WSL moderno do GitHub Microsoft.',
+    suggestions: [
+      'Verifique sua conexão (abra https://github.com).',
+      'Se a empresa usa proxy/firewall, libere github.com e githubusercontent.com.',
+      'Antivírus muito agressivo (Avast, Norton) pode bloquear MSI baixado — desligue temporariamente.',
+      'Tente de novo em alguns minutos.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /WSL_TOO_MANY_REBOOTS|Reinícios excessivos|rebootCount/i,
+    headline: 'Reinícios excessivos sem sucesso',
+    what: 'Já fizemos 3+ reinícios e o WSL ainda não está funcionando. Algo no Windows está impedindo o WSL de subir.',
+    suggestions: [
+      'Verifique se a virtualização (Intel VT-x / AMD-V / SVM) está habilitada no BIOS.',
+      'Se tem VirtualBox/VMware instalado, ele pode estar conflitando com Hyper-V — desinstale e tente de novo.',
+      'Exporte os logs e mande pro JOs — diagnóstico mais profundo necessário.',
+    ],
+    canRetry: false,
+    canSkip: false,
+  },
+
   // ─── WSL não funcional (Bruno v0.2.16 — live-test #3 causa raiz real) ──
   // Sintoma: features WSL habilitadas + distro listada, MAS qualquer comando
   // `wsl` mostra apenas a tela de help. Causa raiz: reboot do Windows nunca

@@ -3,7 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated, wslExec } = require('./shell');
+const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated, wslExec, detectWslState, installWslModernViaMsi, forceRebootWindows, cancelReboot } = require('./shell');
 const preflight = require('./preflight');
 const { enrichError } = require('./error-catalog');
 
@@ -379,10 +379,22 @@ const step00Preflight = {
 // ───────────────────────────────────────────────────────────────────────
 
 // Compartilhado: marca reboot + agenda RunOnce. Idempotente.
-async function _markRebootAndScheduleRunOnce(ctx, stepId) {
+async function _markRebootAndScheduleRunOnce(ctx, stepId, reason) {
   ctx.state.rebootRequired = true;
   ctx.state.rebootDone = false;
+  if (reason) {
+    ctx.state.rebootRequiredReason = reason;
+    ctx.state.rebootBlockingReason = reason; // legacy alias usado pela UI v0.2.16
+  }
+  // Bruno (noturna 2026-05-27): contador pra detectar loop infinito de reboot.
+  ctx.state.rebootCount = (ctx.state.rebootCount || 0) + 1;
   ctx.save();
+  if (ctx.state.rebootCount > 3) {
+    ctx.logger.error(stepId, `WSL_TOO_MANY_REBOOTS — ${ctx.state.rebootCount} reboots e ainda não funcional`);
+    const err = new Error(`Reinícios excessivos (${ctx.state.rebootCount}). Algo no Windows está impedindo o WSL — peça ajuda manual.`);
+    err.code = 'WSL_TOO_MANY_REBOOTS';
+    throw err;
+  }
   if (ctx.exePath) {
     try {
       await scheduleRunOnceAfterReboot(ctx.exePath);
@@ -391,6 +403,79 @@ async function _markRebootAndScheduleRunOnce(ctx, stepId) {
       ctx.logger.warn(stepId, `RunOnce schedule falhou: ${e.message}`);
     }
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// ensureFeatures — garante Microsoft-Windows-Subsystem-Linux + VirtualMachinePlatform
+// habilitadas no Windows.
+//
+// Bruno (noturna 2026-05-27): MSI moderno do WSL exige essas duas features
+// habilitadas. Em Win10 19045 com inbox legacy a feature WSL já está ON
+// (foi assim que o inbox apareceu), mas VirtualMachinePlatform pode não estar.
+//
+// Idempotente: dism /enable-feature em feature já enabled retorna rápido (exit 0).
+// dism pode retornar 3010 (sucesso + reboot pendente). Tratamos como sucesso e
+// sinalizamos pro caller via state.featuresEnabled.
+//
+// Atualiza ctx.state.featuresEnabled = { wsl, vmp, checkedAt }.
+// Retorna: true se AMBAS estão Enabled (não Pending); false se alguma precisa reboot.
+async function ensureFeatures(ctx) {
+  ctx.logger.info('ensureFeatures', 'dism /enable-feature Microsoft-Windows-Subsystem-Linux');
+  try {
+    await powershellVerbose(
+      `dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`,
+      { timeout: 600_000 }
+    );
+  } catch (e) {
+    // exit 3010 já é tratado como sucesso por powershellVerbose; outro exit = erro real.
+    ctx.logger.warn('ensureFeatures', `dism Microsoft-Windows-Subsystem-Linux: ${e.message}`);
+  }
+
+  ctx.logger.info('ensureFeatures', 'dism /enable-feature VirtualMachinePlatform');
+  try {
+    await powershellVerbose(
+      `dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`,
+      { timeout: 600_000 }
+    );
+  } catch (e) {
+    ctx.logger.warn('ensureFeatures', `dism VirtualMachinePlatform: ${e.message}`);
+  }
+
+  // Checa estado REAL via Get-WindowsOptionalFeature (não basta dism retornar 0).
+  let wslEnabled = false;
+  let vmpEnabled = false;
+  try {
+    const r1 = await powershellVerbose(
+      `Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux | Select-Object -ExpandProperty State`,
+      { timeout: 30_000 }
+    );
+    wslEnabled = /^Enabled\s*$/m.test(r1.stdout || '');
+  } catch (e) {
+    ctx.logger.warn('ensureFeatures', `check WSL feature: ${e.message}`);
+  }
+  try {
+    const r2 = await powershellVerbose(
+      `Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform | Select-Object -ExpandProperty State`,
+      { timeout: 30_000 }
+    );
+    vmpEnabled = /^Enabled\s*$/m.test(r2.stdout || '');
+  } catch (e) {
+    ctx.logger.warn('ensureFeatures', `check VMP feature: ${e.message}`);
+  }
+
+  ctx.state.featuresEnabled = { wsl: wslEnabled, vmp: vmpEnabled, checkedAt: Date.now() };
+  ctx.save && ctx.save();
+  ctx.logger.info('ensureFeatures', `wsl=${wslEnabled} vmp=${vmpEnabled}`);
+  return wslEnabled && vmpEnabled;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// wslIsFunctionalLite — checagem rápida pós-install. Usa detectWslState
+// + wsl --status pra decidir se WSL responde válido.
+async function wslIsFunctionalLite() {
+  const st = await detectWslState();
+  if (st.state !== 'modern') return { ok: false, state: st.state, reason: `wsl state=${st.state}` };
+  return await wslIsFunctional();
 }
 
 // Compartilhado: detecta QUALQUER distro Ubuntu instalada (qualquer um dos 3
@@ -424,13 +509,98 @@ const step01EnableFeatures = {
     expected: 'Mensagem "wsl --install OK" e/ou pedido de reboot do Windows.',
     note: 'Não feche o instalador. Se o reboot for solicitado, reinicie o Windows.',
   },
-  async detect() {
-    return _ubuntuInstalled();
+  async detect(ctx) {
+    // Bruno (noturna 2026-05-27): SUCESSO = WSL é MODERN + funcional + Ubuntu
+    // já presente. Se for legacy/absent, força execute() pra migrar via MSI.
+    const st = await detectWslState({ logger: ctx && ctx.logger });
+    if (st.state === 'modern') {
+      const fn = await wslIsFunctional();
+      if (fn.ok && await _ubuntuInstalled()) return true;
+    }
+    return false;
   },
   async execute(ctx) {
     await requireAdminOrThrow();
 
-    // Aviso amigável se outra distro for default.
+    // Bruno (noturna 2026-05-27): NOVO fluxo cascata
+    //   1) detectWslState — sabe se é absent/legacy/modern
+    //   2) ensureFeatures — habilita WSL + VMP (com reboot se necessário)
+    //   3) Se legacy/absent → installWslModernViaMsi
+    //   4) Se modern → wsl --update (cura)
+    //   5) Valida funcional; se não, reboot
+    //   6) Instala Ubuntu se ainda não
+    const state0 = await detectWslState({ logger: ctx.logger });
+    ctx.logger.info('step_01', `WSL state detectado: ${state0.state} (exe=${state0.exePath || '(nenhum)'})`);
+    ctx.state.wslState = state0.state;
+    ctx.save && ctx.save();
+
+    // 2) Habilita features Windows (idempotente)
+    const featuresOk = await ensureFeatures(ctx);
+    if (!featuresOk) {
+      ctx.logger.warn('step_01', 'features WSL/VMP recém-habilitadas — reboot OBRIGATÓRIO');
+      await _markRebootAndScheduleRunOnce(
+        ctx, 'step_01',
+        'Features WSL habilitadas — reinicie o Windows pra ativar'
+      );
+      return;
+    }
+
+    // 3) Se legacy ou absent → instala WSL moderno via MSI
+    if (state0.state === 'legacy' || state0.state === 'absent') {
+      ctx.logger.info('step_01', `wslState=${state0.state} → instalando WSL moderno via MSI...`);
+      ctx.state.wslMigrationAttempted = true;
+      ctx.save && ctx.save();
+      const msi = await installWslModernViaMsi({ logger: ctx.logger });
+      if (!msi.ok) {
+        const err = new Error(`Não consegui instalar o WSL moderno via MSI. ${msi.error || ''}`);
+        err.code = 'WSL_MSI_INSTALL_FAILED';
+        throw err;
+      }
+      ctx.state.wslMsiVersion = msi.version;
+      ctx.save && ctx.save();
+      ctx.logger.info('step_01', `MSI ${msi.version} instalado (exit=${msi.exitCode})`);
+
+      // MSI moderno SEMPRE precisa reboot pra ativar kernel novo em Win10 legacy.
+      // Tenta validar primeiro; se falhar, força reboot.
+      const fn0 = await wslIsFunctional();
+      if (!fn0.ok || msi.rebootRequired) {
+        await _markRebootAndScheduleRunOnce(
+          ctx, 'step_01',
+          'WSL moderno instalado — reinicie o Windows pra ativar o kernel'
+        );
+        return;
+      }
+      ctx.state.wslState = 'modern';
+      ctx.save && ctx.save();
+    }
+
+    // 4) wsl --update como CURA antes de marcar reboot (best case: sem reboot)
+    if (ctx.state.wslState === 'modern' || state0.state === 'modern') {
+      ctx.logger.info('step_01', 'tentando wsl --update pra ativar kernel sem reboot...');
+      try {
+        const upd = await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger, label: 'wsl --update' });
+        ctx.logger.info('step_01', `wsl --update exit=${upd.exit_code}`);
+      } catch (e) {
+        ctx.logger.warn('step_01', `wsl --update falhou (segue): ${e.message}`);
+      }
+    }
+
+    // 5) Valida funcional. Se não, reboot.
+    const fn1 = await wslIsFunctional();
+    if (!fn1.ok) {
+      ctx.logger.warn('step_01', `WSL não funcional após install/update: ${fn1.reason}`);
+      await writeWslDiagLog(ctx);
+      await _markRebootAndScheduleRunOnce(
+        ctx, 'step_01',
+        `WSL ainda não responde corretamente: ${fn1.reason}`
+      );
+      return;
+    }
+    ctx.state.wslState = 'functional';
+    ctx.save && ctx.save();
+    ctx.logger.info('step_01', 'WSL moderno + funcional');
+
+    // 6) Aviso amigável se outra distro for default.
     try {
       const r = await wslListVerbose();
       if (r.stdout && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(r.stdout)) {
@@ -438,13 +608,10 @@ const step01EnableFeatures = {
       }
     } catch (_) {}
 
-    // Caminho moderno: `wsl --install -d <distro> --no-launch`.
-    // --no-launch evita Ubuntu GUI abrir no primeiro boot (step_04 cuida disso).
-    //
-    // Bruno v0.2.11: wslInstallSupported() retorna {supported,reason,evidence}
-    // pra logar exatamente por que decidiu moderno vs legacy.
-    const decision = await wslInstallSupported(ctx.logger);
-    ctx.logger.info('step_01', `wsl --install decision: ${decision.supported ? 'USAR_MODERNO' : 'USAR_LEGACY'} (motivo: ${decision.reason})`);
+    // Decision: agora moderno, pode usar `wsl --install -d`. Mantém lógica antiga
+    // pra instalar Ubuntu (idempotente).
+    const decision = { supported: true, reason: 'WSL moderno + funcional após migração' };
+    ctx.logger.info('step_01', `wsl --install decision: USAR_MODERNO (motivo: ${decision.reason})`);
 
     if (decision.supported) {
       // Bruno v0.2.12: descoberta DINÂMICA do nome de distro Ubuntu.
@@ -535,44 +702,53 @@ const step01EnableFeatures = {
 
       // WSL ainda não funcional → reboot OBRIGATÓRIO. Grava diagnóstico
       // pra JOs poder mandar o log se mesmo após reboot algo persistir.
-      ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
-      ctx.save && ctx.save();
       const diagFile = await writeWslDiagLog(ctx);
       ctx.logger.warn('step_01',
         `reboot OBRIGATÓRIO — ${fn.reason}${diagFile ? ` (diag: ${diagFile})` : ''}`);
 
-      // Mesmo que wsl --install não tenha sinalizado reboot, é mais SEGURO
-      // forçar reboot pra primeira instalação WSL — features de virtualização
-      // só ativam de verdade após restart. Custo: 1 reboot extra. Benefício:
-      // zero "WslRegisterDistribution failed" no step_04.
-      await _markRebootAndScheduleRunOnce(ctx, 'step_01');
+      await _markRebootAndScheduleRunOnce(
+        ctx, 'step_01',
+        `WSL ainda não funcional: ${fn.reason}`
+      );
       return;
     }
 
-    // PARTE D — Fallback: Windows antigo (build <19041, raro). Volta pro
-    // método dism+wsl --set-default+wsl --install que era v0.2.8.
-    ctx.logger.warn('step_01', `wsl --install não suportado (motivo: ${decision.reason}) — usando fallback dism (legacy)`);
-    await _executeLegacyDismFlow(ctx);
-    await _markRebootAndScheduleRunOnce(ctx, 'step_01');
+    // Caminho não-moderno é IMPOSSÍVEL aqui (já migramos via MSI acima),
+    // mas mantemos fallback defensivo caso algo bizarro aconteça.
+    ctx.logger.error('step_01', `decision.supported=false após migração — fluxo inesperado`);
+    throw new Error('Fluxo inesperado: WSL não ficou moderno após migração MSI');
   },
   async validate(ctx) {
     // Se reboot pendente, segura aqui — runner libera quando rebootDone.
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Bruno v0.2.16: TESTE REAL — feature habilitada + distro listada NÃO
-    // basta. Tem que checar se `wsl --status` retorna saída válida (i.e.,
-    // não a tela de help). Se WSL não funcional, marca rebootRequired e
-    // valida=false força UI a mostrar mensagem de reboot.
+    // Bruno (noturna 2026-05-27): TESTE REAL — detectWslState precisa ser
+    // 'modern' E `wsl --status` precisa responder válido (não help).
+    const st = await detectWslState({ logger: ctx.logger });
+    if (st.state !== 'modern') {
+      ctx.logger.warn(this.id, `WSL state=${st.state} — ainda precisa migração`);
+      if (!ctx.state.rebootDone) {
+        ctx.state.rebootRequired = true;
+        ctx.state.rebootRequiredReason = `WSL state=${st.state}`;
+        ctx.state.rebootBlockingReason = `WSL state=${st.state}`;
+        ctx.save && ctx.save();
+      }
+      await writeWslDiagLog(ctx);
+      return false;
+    }
     const fn = await wslIsFunctional();
     if (!fn.ok) {
       ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
       if (!ctx.state.rebootDone) {
         ctx.state.rebootRequired = true;
+        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
         ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
         ctx.save && ctx.save();
       }
       await writeWslDiagLog(ctx);
       return false;
     }
+    ctx.state.wslState = 'functional';
+    ctx.save && ctx.save();
     return _ubuntuInstalled();
   },
 };
@@ -626,47 +802,40 @@ async function _executeLegacyDismFlow(ctx) {
 // fez), então este step pula com `skipped` sem executar nada.
 const step02SetWslDefaultV2 = {
   id: 'step_02_set_wsl_default_v2',
-  title: 'WSL default version 2',
-  description: 'Já configurado pelo passo 1 (wsl --install). Mantido por compatibilidade.',
+  title: 'WSL funcional (validação)',
+  description: 'Já configurado pelo passo 1. NO-OP: valida que wsl --status responde válido.',
   category: 'AUTO',
   async detect(ctx) {
     // Se reboot pendente, considera detectado (libera o caminho).
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Se Ubuntu instalado, o `wsl --install` já setou default version 2.
-    if (await _ubuntuInstalled()) return true;
-    // Caso fluxo legacy (sem wsl --install), checa via wsl --status.
-    // Bruno v0.2.12: wslExec direto (UTF-16 LE decodado).
-    try {
-      const r = await wslExec(['--status'], { timeout: 10_000 });
-      return /(?:Default Version|Vers[aã]o padr[aã]o)\s*:\s*2/i.test(r.stdout || '');
-    } catch (_) { return false; }
+    // Bruno (noturna 2026-05-27): TESTE REAL — wslIsFunctional cobre tudo.
+    const fn = await wslIsFunctional();
+    return fn.ok;
   },
   async execute(ctx) {
-    // Defensiva: se detect retornou false (cenário raro de state corrompido),
-    // roda set-default-version explícito.
-    await requireAdminOrThrow();
-    // Bruno v0.2.12: wslExec direto em vez de powershellVerbose.
-    const r = await wslExec(['--set-default-version', '2'], { timeout: 30_000, logger: ctx.logger });
-    if (r.exit_code !== 0) {
-      ctx.logger.warn('step_02', `set-default-version 2 falhou: exit=${r.exit_code} stderr=${(r.stderr || '').slice(0, 200)}`);
-    }
+    // Bruno (noturna 2026-05-27): NO-OP — step_01 unificado já faz tudo.
+    // Se chegou aqui sem detect=true, é porque WSL não está funcional.
+    // Re-roda wsl --update como cura best-effort e re-valida.
+    ctx.logger.info('step_02', 'NO-OP — step_01 cuida da instalação. Tentando wsl --update como cura...');
+    try {
+      await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger });
+    } catch (_) {}
   },
   async validate(ctx) {
-    // Bruno v0.2.16: respeita reboot pendente.
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // TESTE REAL — wsl --status precisa retornar saída válida (não help).
     const fn = await wslIsFunctional();
     if (!fn.ok) {
       ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
       if (!ctx.state.rebootDone) {
         ctx.state.rebootRequired = true;
+        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
         ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
         ctx.save && ctx.save();
       }
       await writeWslDiagLog(ctx);
       return false;
     }
-    return this.detect(ctx);
+    return true;
   },
 };
 
@@ -676,7 +845,7 @@ const step02SetWslDefaultV2 = {
 const step03WslInstall = {
   id: 'step_03_wsl_install',
   title: 'WSL2 + Ubuntu instalados',
-  description: 'Já feito pelo passo 1. Mantido por compatibilidade com instalações antigas.',
+  description: 'Instala Ubuntu se ainda não. Gate: wsl --status precisa estar funcional.',
   category: 'HYBRID',
   // Bruno v0.2.13: shape enriquecido. Mostra apenas se reboot pendente.
   manualInstructions: {
@@ -694,33 +863,67 @@ const step03WslInstall = {
     return _ubuntuInstalled();
   },
   async execute(ctx) {
-    // Não deveria chegar aqui se step_01 funcionou. Fallback defensivo:
-    // se Ubuntu não tá instalado, tenta uma vez (raro: state corrompido).
     await requireAdminOrThrow();
-    ctx.logger.warn('step_03', 'step_01 deveria ter instalado Ubuntu — rodando fallback');
+    // Bruno (noturna 2026-05-27): GATE OBRIGATÓRIO — wslIsFunctional precisa
+    // passar ANTES de tentar `wsl --install -d`. Sem isso, o comando dá
+    // mojibake/help inválido.
+    const fn = await wslIsFunctional();
+    if (!fn.ok) {
+      ctx.logger.warn('step_03', `gate: WSL não funcional (${fn.reason}) — marcando reboot`);
+      await _markRebootAndScheduleRunOnce(
+        ctx, 'step_03',
+        `WSL não funcional: ${fn.reason}`
+      );
+      return;
+    }
+
     // Bruno v0.2.12: descoberta dinâmica + wslExec.
     let distro = await discoverUbuntuDistroName(ctx.logger);
     const chosen = distro || 'Ubuntu';
     ctx.state.distro = chosen;
     ctx.state.ubuntuDistroName = chosen;
+    ctx.state.distroState = 'none';
     ctx.save && ctx.save();
     const installArgs = distro
       ? ['--install', '-d', distro, '--no-launch']
       : ['--install', '--no-launch'];
-    await withRetry(
+    ctx.logger.info('step_03', `wsl ${installArgs.join(' ')}`);
+    const r = await withRetry(
       () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install (step_03)' }),
-      { label: 'wsl --install (step_03 fallback)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
+      { label: 'wsl --install (step_03)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
     );
-    await _markRebootAndScheduleRunOnce(ctx, 'step_03');
+
+    const fullOut = ((r.stdout || '') + ' ' + (r.stderr || ''));
+    const alreadyInstalled = /already installed|j[áa] (est[áa]|foi) instalad|already exists|j[áa] existe/i.test(fullOut);
+    const wantsReboot = r.exit_code === 3010 || /restart|reinici|reboot/i.test(fullOut.toLowerCase());
+
+    if (r.exit_code !== 0 && r.exit_code !== 3010 && !alreadyInstalled) {
+      throw new Error(`wsl --install (step_03) falhou: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 500)}`);
+    }
+
+    if (alreadyInstalled || await _ubuntuInstalled()) {
+      ctx.state.distroState = 'installed';
+      ctx.save && ctx.save();
+    }
+    try {
+      await wslExec(['--set-default', chosen], { timeout: 30_000, logger: ctx.logger });
+    } catch (_) {}
+
+    if (wantsReboot) {
+      await _markRebootAndScheduleRunOnce(
+        ctx, 'step_03',
+        'wsl --install solicitou reboot do Windows'
+      );
+    }
   },
   async validate(ctx) {
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Bruno v0.2.16: TESTE REAL — wsl --status precisa ser válido.
     const fn = await wslIsFunctional();
     if (!fn.ok) {
       ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
       if (!ctx.state.rebootDone) {
         ctx.state.rebootRequired = true;
+        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
         ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
         ctx.save && ctx.save();
       }
@@ -1504,4 +1707,7 @@ module.exports = {
   // Bruno v0.2.16 — helpers diagnósticos (usados por validate dos 01/02/03)
   wslIsFunctional,
   writeWslDiagLog,
+  // Bruno (noturna 2026-05-27) — fluxo WSL legacy→moderno
+  ensureFeatures,
+  wslIsFunctionalLite,
 };

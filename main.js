@@ -9,7 +9,7 @@ const { spawn } = require('node:child_process');
 const runner = require('./src/runner');
 const preflight = require('./src/preflight');
 const { ALL_STEPS } = require('./src/executors');
-const { openInteractiveTerminal, isElevated, relaunchAsAdmin } = require('./src/shell');
+const { openInteractiveTerminal, isElevated, relaunchAsAdmin, detectWslState, forceRebootWindows, cancelReboot, scheduleRunOnceAfterReboot } = require('./src/shell');
 const { enrichError } = require('./src/error-catalog');
 
 const PRODUCT = 'IMP Squad Instalador';
@@ -861,6 +861,64 @@ safeHandle('installer:cancelRelaunch', async () => {
 safeHandle('installer:quitApp', async () => {
   setTimeout(() => app.quit(), 300);
   return { ok: true };
+}, { emitOnError: false });
+
+// ───────────────────────────────────────────────────────────────────────
+// WSL legacy→moderno handlers (Bruno noturna 2026-05-27)
+// Camila usa estes pra: tela "Reboot Necessário", indicador "WSL legacy
+// detectado", progresso do download MSI.
+// ───────────────────────────────────────────────────────────────────────
+
+// Detecta estado do WSL pro renderer (Camila usa pra mostrar "Seu Windows
+// tem WSL antigo — vou atualizar"). NÃO faz efeito colateral.
+safeHandle('installer:detectWslState', async () => {
+  const st = await detectWslState({ logger: null });
+  return {
+    ok: true,
+    state: st.state,        // 'absent' | 'legacy' | 'modern'
+    exePath: st.exePath || null,
+    evidence: st.evidence,
+  };
+}, { emitOnError: false });
+
+// Agenda RunOnce + força reboot Windows + quita o app.
+// Camila chama quando JOs clica "Reiniciar agora" na tela de reboot.
+safeHandle('installer:scheduleRebootAndQuit', async (_e, args = {}) => {
+  const delaySeconds = Number.isFinite(args.delaySeconds) ? args.delaySeconds : 30;
+  const reason = args.reason || 'Reinício pelo Instalador IMP — salve seu trabalho';
+  try {
+    // 1) Agenda RunOnce com o exe certo (portable ou execPath)
+    const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+    try {
+      await scheduleRunOnceAfterReboot(exePath);
+      sendToRenderer('installer:onLog', {
+        ts: new Date().toISOString(), level: 'info', component: 'reboot',
+        message: `RunOnce agendado — instalador volta após reboot: ${exePath}`,
+      });
+    } catch (e) {
+      sendToRenderer('installer:onLog', {
+        ts: new Date().toISOString(), level: 'warn', component: 'reboot',
+        message: `RunOnce schedule falhou (não-bloqueante): ${e.message}`,
+      });
+    }
+    // 2) Dispara shutdown /r /t <delay>
+    const r = await forceRebootWindows({ delaySeconds, reason });
+    if (!r.ok) return { ok: false, error: r.error };
+    sendToRenderer('installer:onLog', {
+      ts: new Date().toISOString(), level: 'info', component: 'reboot',
+      message: `Reboot agendado em ${delaySeconds}s — motivo: ${reason}`,
+    });
+    // 3) Quit do app antes do reboot pegar — dá 1.5s pra UI ver
+    setTimeout(() => app.quit(), 1500);
+    return { ok: true, delaySeconds };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}, { emitOnError: false });
+
+// Cancela reboot pendente (shutdown /a). Camila usa se JOs clicar "Cancelar".
+safeHandle('installer:cancelReboot', async () => {
+  return await cancelReboot({ logger: null });
 }, { emitOnError: false });
 
 ipcMain.handle('app:getVersion', async () => app.getVersion());

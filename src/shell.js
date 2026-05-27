@@ -467,6 +467,194 @@ async function relaunchAsAdmin(opts = {}) {
   });
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// detectWslState — classifica o WSL em 3 estados pra decisão de install.
+//
+// Bruno (noturna 2026-05-27): a v0.2.16 confiava em `wsl --status` pra
+// dizer se está funcional, mas no LEGACY o `wsl.exe` ignora --status e
+// cospe a tela de help. Precisamos CLASSIFICAR explicitamente os 3
+// estados ANTES de decidir caminho de instalação.
+//
+// Estados:
+//   'absent'  → wsl.exe não existe (Get-Command retorna null)
+//   'legacy'  → binário inbox Windows 10 antigo (não tem --version/--status)
+//   'modern'  → binário moderno (MSI/Store/winget) — responde --version
+//
+// Retorna: { state, evidence, exePath }
+async function detectWslState(opts = {}) {
+  const { logger } = opts;
+  const evidence = {};
+  let exePath = '';
+
+  // 1) Binário existe?
+  try {
+    const r = await execP('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command',
+       `Get-Command wsl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source`],
+      { timeout: 5000 });
+    exePath = ((r && r.stdout) || '').trim();
+    evidence.getCommand = { exePath };
+  } catch (e) {
+    evidence.getCommand = { error: e.message };
+    if (logger) logger.info('detectWslState', `absent (Get-Command falhou: ${e.message})`);
+    return { state: 'absent', evidence, exePath: '' };
+  }
+  if (!exePath) {
+    if (logger) logger.info('detectWslState', 'absent (wsl.exe não encontrado no PATH)');
+    return { state: 'absent', evidence, exePath: '' };
+  }
+
+  // 2) wsl --version (só MODERN responde com texto válido)
+  const versionR = await wslExec(['--version'], { timeout: 8000, logger });
+  evidence.version = {
+    exit: versionR.exit_code,
+    stdoutSample: (versionR.stdout || '').slice(0, 200),
+  };
+  if (versionR.exit_code === 0 &&
+      /WSL\s+vers[aã]o|WSL\s+version|kernel\s+vers/i.test(versionR.stdout || '')) {
+    if (logger) logger.info('detectWslState', `modern (sinal: wsl --version OK)`);
+    return { state: 'modern', evidence, exePath };
+  }
+
+  // 3) Fallback --status (também só responde válido em moderno)
+  const statusR = await wslExec(['--status'], { timeout: 8000, logger });
+  evidence.status = {
+    exit: statusR.exit_code,
+    stdoutSample: (statusR.stdout || '').slice(0, 200),
+  };
+  const out = statusR.stdout || '';
+  const isHelpEcho =
+    /Usage:|Uso:|Copyright.*Microsoft.*Windows Subsystem.*Linux/i.test(out) ||
+    (/--install/i.test(out) && /--list/i.test(out) && /--status/i.test(out));
+  if (statusR.exit_code === 0 && !isHelpEcho &&
+      /Default\s+(Distribution|Version)|Distribu[ií][cç][aã]o\s+padr|Vers[aã]o\s+padr/i.test(out)) {
+    if (logger) logger.info('detectWslState', `modern (sinal: wsl --status mostra default)`);
+    return { state: 'modern', evidence, exePath };
+  }
+
+  // 4) Binário existe mas não responde --version nem --status → LEGACY (inbox)
+  if (logger) logger.info('detectWslState', `legacy (binário existe mas não responde flags modernas)`);
+  return { state: 'legacy', evidence, exePath };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// installWslModernViaMsi — baixa+instala MSI WSL moderno do GitHub Microsoft.
+//
+// Bruno (noturna 2026-05-27): Win10 19045 com inbox legacy não suporta
+// `wsl --update` (descartado), Store appx exige conta MS (descartado),
+// `wsl --install` do inbox ignora --no-launch (não-confiável). MSI é o
+// caminho programático mais confiável.
+//
+// Estratégia:
+//   1) GitHub API resolve URL do MSI x64 latest
+//   2) Invoke-WebRequest com TLS 1.2 forçado (Win10 antigo)
+//   3) Start-Process msiexec /qn /norestart, exit 3010 = sucesso+reboot
+//
+// Pré-req: features Windows (Subsystem-Linux + VirtualMachinePlatform) já
+// habilitadas. Caller (executors.js) garante via ensureFeatures().
+//
+// Retorna: { ok, version, exitCode, msiPath, rebootRequired, error? }
+async function installWslModernViaMsi(opts = {}) {
+  const { logger, timeout = 600_000 } = opts;
+  const psScript = `
+    $ErrorActionPreference = 'Stop'
+    chcp 65001 > $null
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $api = 'https://api.github.com/repos/microsoft/WSL/releases/latest'
+    $headers = @{ 'User-Agent' = 'imp-installer'; 'Accept' = 'application/vnd.github+json' }
+    $rel = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30
+    $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'arm64' }
+    $asset = $rel.assets | Where-Object { $_.name -match ('\\.' + $arch + '\\.msi$') } | Select-Object -First 1
+    if (-not $asset) { throw "Nenhum MSI $arch na release $($rel.tag_name)" }
+    $ts = [int][double]::Parse((Get-Date -UFormat %s))
+    $msiPath = Join-Path $env:TEMP ('wsl_msi_' + $ts + '_' + $asset.name)
+    Write-Output ("VERSION=" + $rel.tag_name)
+    Write-Output ("URL=" + $asset.browser_download_url)
+    Write-Output ("MSI=" + $msiPath)
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msiPath -UseBasicParsing
+    $proc = Start-Process msiexec.exe -ArgumentList ('/i', ('"' + $msiPath + '"'), '/qn', '/norestart') -Wait -PassThru
+    Write-Output ("EXIT=" + $proc.ExitCode)
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+      throw ("msiexec falhou exit=" + $proc.ExitCode)
+    }
+  `;
+  try {
+    const r = await powershell(psScript, { timeout });
+    const out = (r && r.stdout) || '';
+    const version = (out.match(/VERSION=(\S+)/) || [])[1] || '?';
+    const msiPath = (out.match(/MSI=(.+?)(?:\r|\n|$)/) || [])[1] || '';
+    const exitCode = parseInt((out.match(/EXIT=(\d+)/) || [])[1] || '0', 10);
+    const rebootRequired = exitCode === 3010;
+    if (logger) {
+      logger.info('installWslModernViaMsi',
+        `MSI ${version} instalado (exit=${exitCode}, reboot=${rebootRequired}, path=${msiPath})`);
+    }
+    return { ok: true, version, exitCode, msiPath, rebootRequired };
+  } catch (e) {
+    const stdout = (e.stdout || '').trim();
+    const stderr = (e.stderr || '').trim();
+    const exitMatch = stdout.match(/EXIT=(\d+)/);
+    const exitCode = exitMatch ? parseInt(exitMatch[1], 10) : (e.code != null ? e.code : -1);
+    if (exitCode === 3010) {
+      // Falsa-falha — 3010 é sucesso-com-reboot.
+      const version = (stdout.match(/VERSION=(\S+)/) || [])[1] || '?';
+      const msiPath = (stdout.match(/MSI=(.+?)(?:\r|\n|$)/) || [])[1] || '';
+      if (logger) logger.info('installWslModernViaMsi', `MSI ${version} sucesso 3010 (reboot pendente)`);
+      return { ok: true, version, exitCode: 3010, msiPath, rebootRequired: true };
+    }
+    if (logger) logger.error('installWslModernViaMsi',
+      `falhou: exit=${exitCode} stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
+    return {
+      ok: false,
+      exitCode,
+      error: e.message || `MSI install exit=${exitCode}`,
+      stderr,
+      stdout,
+    };
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// forceRebootWindows — agenda reboot em N segundos com mensagem amigável.
+//
+// Bruno (noturna 2026-05-27): JOs autorizou reboot forçado durante missões.
+// shutdown /r /t <delay> /c "<reason>" /f /d p:4:1
+//   /r  = reinicia (não shutdown)
+//   /t  = delay em segundos
+//   /c  = comentário (até 512 chars)
+//   /f  = força fechar apps abertos
+//   /d p:4:1 = motivo "Application: Maintenance (Planned)"
+//
+// Retorna: { ok, delaySeconds, error? }
+async function forceRebootWindows(opts = {}) {
+  const { delaySeconds = 30, reason = 'Reinício agendado pelo Instalador IMP — salve seu trabalho', logger } = opts;
+  try {
+    await execP('shutdown.exe',
+      ['/r', '/t', String(delaySeconds), '/c', reason, '/f', '/d', 'p:4:1'],
+      { timeout: 10_000, label: 'shutdown /r' });
+    if (logger) logger.info('forceRebootWindows', `reboot agendado em ${delaySeconds}s — motivo: ${reason}`);
+    return { ok: true, delaySeconds };
+  } catch (e) {
+    if (logger) logger.error('forceRebootWindows', `falhou: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+// cancelReboot — cancela reboot pendente (shutdown /a).
+async function cancelReboot(opts = {}) {
+  const { logger } = opts;
+  try {
+    await execP('shutdown.exe', ['/a'], { timeout: 10_000, label: 'shutdown /a' });
+    if (logger) logger.info('cancelReboot', 'reboot cancelado');
+    return { ok: true };
+  } catch (e) {
+    // Exit 1116 = "Não foi possível anular o desligamento porque não havia desligamento em andamento"
+    // — não é erro pra nós.
+    if (logger) logger.info('cancelReboot', `shutdown /a retornou: ${e.message}`);
+    return { ok: true, noPending: true, info: e.message };
+  }
+}
+
 // Schedule the .exe to relaunch via HKCU\...\RunOnce after reboot.
 // RunOnce auto-clears its entry on first run, so this is naturally idempotent.
 //
@@ -505,4 +693,9 @@ module.exports = {
   isElevated,
   relaunchAsAdmin,
   wslExec,
+  // Bruno (noturna 2026-05-27) — fluxo WSL legacy→moderno
+  detectWslState,
+  installWslModernViaMsi,
+  forceRebootWindows,
+  cancelReboot,
 };

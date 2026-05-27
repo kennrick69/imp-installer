@@ -41,6 +41,12 @@ const installer = {
   cancelRelaunch: () => ipcRenderer.invoke('installer:cancelRelaunch'),
   quitApp: () => ipcRenderer.invoke('installer:quitApp'),
 
+  // WSL legacy→modern + reboot (Bruno v0.2.17, noturna 2026-05-27)
+  detectWslState: () => ipcRenderer.invoke('installer:detectWslState'),
+  scheduleRebootAndQuit: (args) => ipcRenderer.invoke('installer:scheduleRebootAndQuit', args || {}),
+  cancelReboot: () => ipcRenderer.invoke('installer:cancelReboot'),
+  executeManualAction: (kind, payload) => ipcRenderer.invoke('installer:executeManualAction', { kind, payload }),
+
   sudoReply: (id, password, cancelled = false) =>
     ipcRenderer.invoke('installer:sudoReply', { id, password, cancelled }),
 
@@ -56,6 +62,7 @@ const installer = {
   onScreen: on('installer:onScreen'),
   onToast: on('installer:onToast'),
   onSudoPrompt: on('installer:sudoPrompt'),
+  onWslUpgradeProgress: on('installer:onWslUpgradeProgress'),
 };
 
 contextBridge.exposeInMainWorld('api', {

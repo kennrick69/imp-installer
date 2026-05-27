@@ -87,7 +87,10 @@
       onToast:      (cb) => { /* noop */ },
       onState:      (cb) => { /* noop */ },
       onSudoPrompt: (cb) => { /* noop */ },
-      sudoReply:    async () => ({ ok: true })
+      sudoReply:    async () => ({ ok: true }),
+      // Camila noturna 2026-05-27 — handlers e eventos das telas novas
+      scheduleRebootAndQuit: noopAsync,
+      onWslUpgradeProgress:  (cb) => { /* noop */ }
     };
   }
 
@@ -687,6 +690,11 @@
       rawWrap.hidden = true;
     }
 
+    // ─── PLANO B no modal-error (Camila noturna 2026-05-27) ─────
+    // Se payload.fallback existe, renderiza bloco amber com comando
+    // copiável + steps opcionais + libera botão "Tentei manual, verifica".
+    renderErrorFallback(payload.fallback, stepId);
+
     // Botões: skip só se canSkip, retry só se canRetry
     $('#btn-error-skip').hidden  = !canSkip;
     $('#btn-error-retry').hidden = !canRetry;
@@ -706,6 +714,68 @@
     setConnection('err', num ? 'Travado no passo ' + num : 'Erro');
 
     openModal('modal-error');
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // Plano B dentro do modal de erro (Camila noturna 2026-05-27)
+  // fallback = { command, steps?: [string|{text}], terminalKind? }
+  // Quando presente, renderiza bloco amber e libera botão "Tentei manual, verifica".
+  // ───────────────────────────────────────────────────────────
+  function renderErrorFallback(fallback, stepId) {
+    const block = $('#error-fallback');
+    const verifyBtn = $('#btn-error-fallback-verify');
+    if (!block) return;
+
+    if (!fallback || !fallback.command) {
+      block.classList.add('hidden');
+      if (verifyBtn) verifyBtn.hidden = true;
+      return;
+    }
+
+    block.classList.remove('hidden');
+
+    const codeEl = $('#error-fallback-code');
+    if (codeEl) codeEl.textContent = fallback.command || '';
+
+    const copyBtn = $('#error-fallback-copy');
+    if (copyBtn) {
+      copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(fallback.command || '');
+          copyBtn.textContent = '✓ Copiado';
+          copyBtn.classList.add('copied');
+          setTimeout(() => {
+            copyBtn.textContent = 'Copiar';
+            copyBtn.classList.remove('copied');
+          }, 1800);
+        } catch (e) {
+          toast('Não consegui copiar: ' + (e?.message || ''), 'error');
+        }
+      };
+    }
+
+    // Steps opcionais
+    const stepsEl = $('#error-fallback-steps');
+    if (stepsEl) {
+      stepsEl.innerHTML = '';
+      const steps = Array.isArray(fallback.steps) ? fallback.steps : [];
+      if (steps.length) {
+        steps.forEach(s => {
+          const li = el('li');
+          li.textContent = typeof s === 'string' ? s : (s.text || '');
+          stepsEl.appendChild(li);
+        });
+        stepsEl.hidden = false;
+      } else {
+        stepsEl.hidden = true;
+      }
+    }
+
+    // Libera botão de verify e guarda stepId pro bind
+    if (verifyBtn) {
+      verifyBtn.hidden = false;
+      verifyBtn.dataset.stepId = stepId || '';
+    }
   }
 
   // ───────────────────────────────────────────────────────────
@@ -857,7 +927,13 @@
   // Telas em que a sidebar global dos 17 passos deve aparecer
   // Camila v0.2.11: sidebar virou persistente — visível em preflight, progress,
   // manual e error. Esconde só no welcome e no done.
-  const SIDEBAR_SCREENS = new Set(['preflight', 'progress', 'manual', 'error']);
+  // Camila noturna 2026-05-27: + 'reboot' e 'wsl-upgrade' pra sidebar continuar
+  // visível durante o gate de reboot e a migração WSL legado.
+  const SIDEBAR_SCREENS = new Set([
+    'preflight', 'progress', 'manual', 'error',
+    'reboot',        // tela de reboot forçado
+    'wsl-upgrade'    // tela de migração WSL legado→moderno
+  ]);
 
   // Status pill (topbar) — estado global
   function setStatusPill(state, text) {
@@ -1217,6 +1293,156 @@
   }
 
   // ───────────────────────────────────────────────────────────
+  // Tela REBOOT FORÇADO (Camila noturna 2026-05-27)
+  // Mostrada quando backend emite onScreen('reboot', payload).
+  // Payload opcional: { reason, resumeStep }
+  // ───────────────────────────────────────────────────────────
+  function showRebootScreen(payload = {}) {
+    if (payload && payload.resumeStep) {
+      const meta = STEP_BY_ID[payload.resumeStep];
+      const numTxt = meta ? String(meta.num).padStart(2, '0') : '03';
+      const el = $('#reboot-resume-step');
+      if (el) el.textContent = numTxt;
+    }
+    showScreen('reboot');
+    setStatusPill('working', 'Aguardando reboot do Windows…');
+  }
+
+  function bindReboot() {
+    const btnNow = $('#btn-reboot-now');
+    const btnLater = $('#btn-reboot-later');
+    const btnCopy = $('#reboot-fallback-copy');
+    if (!btnNow || !btnLater || !btnCopy) return;
+
+    btnNow.addEventListener('click', async () => {
+      btnNow.disabled = true;
+      btnNow.innerHTML = '<span class="imp-spinner"></span> Salvando progresso e agendando reboot…';
+      try {
+        const fn = (api && typeof api.scheduleRebootAndQuit === 'function')
+          ? api.scheduleRebootAndQuit.bind(api)
+          : null;
+        const r = fn ? await fn() : { ok: false, error: 'scheduleRebootAndQuit não disponível' };
+        if (r && r.ok) {
+          btnNow.innerHTML = '✓ Pronto. Windows reinicia em 10s…';
+          toast('Reboot agendado. Vou reabrir sozinho depois.', 'success', 8000);
+          // backend chamará app.quit() — não fazemos nada além disso
+        } else {
+          btnNow.disabled = false;
+          btnNow.innerHTML = '💾 Salvar progresso e reiniciar agora';
+          toast('Não consegui agendar o reboot: ' + ((r && r.error) || 'erro') +
+                '. Use o Plano B abaixo.', 'error', 9000);
+        }
+      } catch (e) {
+        btnNow.disabled = false;
+        btnNow.innerHTML = '💾 Salvar progresso e reiniciar agora';
+        toast('Erro: ' + (e?.message || ''), 'error');
+      }
+    });
+
+    btnLater.addEventListener('click', () => {
+      toast('Beleza. Quando reiniciar, clique no atalho da IMP Squad — eu retomo do passo 03.',
+            'info', 9000);
+      setTimeout(() => {
+        if (api.closeApp) api.closeApp();
+        else window.close();
+      }, 1500);
+    });
+
+    btnCopy.addEventListener('click', async () => {
+      const code = $('#reboot-fallback-code').textContent;
+      try {
+        await navigator.clipboard.writeText(code);
+        btnCopy.textContent = '✓ Copiado';
+        btnCopy.classList.add('copied');
+        setTimeout(() => { btnCopy.textContent = 'Copiar'; btnCopy.classList.remove('copied'); }, 1800);
+      } catch (e) {
+        toast('Não consegui copiar: ' + (e?.message || ''), 'error');
+      }
+    });
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // Tela MIGRAÇÃO WSL legado→moderno (Camila noturna 2026-05-27)
+  // ───────────────────────────────────────────────────────────
+  function showWslUpgradeScreen(_payload = {}) {
+    // Reseta visual ao entrar (caso reabra após falha)
+    const stage = $('#wsl-up-stage');
+    const pct = $('#wsl-up-pct');
+    const fill = $('#wsl-up-fill');
+    const detail = $('#wsl-up-detail');
+    const logBody = $('#wsl-up-log-body');
+    if (stage) stage.textContent = '⏳ Verificando link…';
+    if (pct) pct.textContent = '0%';
+    if (fill) fill.style.width = '0%';
+    if (detail) detail.textContent = '0 MB de 51 MB';
+    if (logBody) logBody.innerHTML = '';
+
+    showScreen('wsl-upgrade');
+    setStatusPill('working', 'Atualizando WSL…');
+  }
+
+  function updateWslUpgrade({ stage, pct, detail, logLine } = {}) {
+    if (stage) {
+      const s = $('#wsl-up-stage');
+      if (s) s.textContent = stage;
+    }
+    if (typeof pct === 'number') {
+      const pctEl = $('#wsl-up-pct');
+      const fillEl = $('#wsl-up-fill');
+      if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+      if (fillEl) fillEl.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    }
+    if (detail) {
+      const d = $('#wsl-up-detail');
+      if (d) d.textContent = detail;
+    }
+    if (logLine) {
+      const body = $('#wsl-up-log-body');
+      if (body) {
+        const line = el('div', {},
+          el('span', { className: 'lp-ts' }, formatClock(Date.now())),
+          logLine
+        );
+        body.appendChild(line);
+        while (body.children.length > 30) body.removeChild(body.firstChild);
+        body.scrollTop = body.scrollHeight;
+      }
+    }
+    // Quando chega 100%, transita pro progress depois de 2s (graceful)
+    if (typeof pct === 'number' && pct >= 100) {
+      setTimeout(() => {
+        if (ui.currentScreen === 'wsl-upgrade') showScreen('progress');
+      }, 2000);
+    }
+  }
+
+  function bindWslUpgrade() {
+    const openLink = $('#btn-wsl-up-open-link');
+    const manualDone = $('#btn-wsl-up-manual-done');
+    if (openLink) {
+      openLink.addEventListener('click', () => {
+        if (api.openBrowser) api.openBrowser('https://aka.ms/wsl2kernel');
+        else window.open('https://aka.ms/wsl2kernel', '_blank');
+      });
+    }
+    if (manualDone) {
+      manualDone.addEventListener('click', async () => {
+        try {
+          const r = api.markManualDone ? await api.markManualDone('step_03_wsl_install') : null;
+          if (r && r.status === 'done') {
+            toast('Verificado! Seguindo pra próxima etapa.', 'success');
+            showScreen('progress');
+          } else {
+            toast('Ainda não detectei o WSL moderno. Reinicia o Windows e tenta de novo.', 'warn', 8000);
+          }
+        } catch (e) {
+          toast('Erro: ' + (e?.message || ''), 'error');
+        }
+      });
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────
   // Boas-vindas — bindings
   // ───────────────────────────────────────────────────────────
   function bindWelcome() {
@@ -1375,6 +1601,41 @@
       closeModal('modal-error');
       openLogsModal();
     });
+
+    // Camila noturna 2026-05-27 — "Tentei manual, verifica":
+    // após JOs rodar o comando do plano B, valida via markManualDone.
+    const verifyBtn = $('#btn-error-fallback-verify');
+    if (verifyBtn) {
+      verifyBtn.addEventListener('click', async () => {
+        const stepId = verifyBtn.dataset.stepId;
+        if (!stepId) {
+          toast('Sem stepId pra verificar.', 'warn');
+          return;
+        }
+        verifyBtn.disabled = true;
+        const origLabel = verifyBtn.textContent;
+        verifyBtn.innerHTML = '<span class="imp-spinner"></span> Verificando…';
+        try {
+          const fn = (api && typeof api.markManualDone === 'function')
+            ? api.markManualDone.bind(api)
+            : null;
+          const r = fn ? await fn(stepId) : { status: 'unknown' };
+          if (r && r.status === 'done') {
+            toast('✓ Detectei! Seguindo pro próximo passo.', 'success');
+            closeModal('modal-error');
+            setStepState(stepId, 'done');
+          } else {
+            toast('Ainda não detectei. ' + ((r && r.error) || 'Confirma que rodou e tenta de novo.'), 'warn', 7000);
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = origLabel;
+          }
+        } catch (e) {
+          toast('Erro: ' + (e?.message || ''), 'error');
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = origLabel;
+        }
+      });
+    }
   }
 
   // ───────────────────────────────────────────────────────────
@@ -1548,11 +1809,30 @@
     // Eventos opcionais que o main.js pode disparar
     // Eduardo v0.2.15: main envia {screen:'preflight'} mas wizard tratava como string.
     // showScreen({screen:'preflight'}) virava showScreen({}) → quebra silente.
+    // Camila noturna 2026-05-27: 'reboot' e 'wsl-upgrade' precisam de setup
+    // próprio (status pill, reset visual) — roteamos antes do showScreen genérico.
     api.onScreen && api.onScreen((payload) => {
-      const name = (payload && typeof payload === 'object') ? payload.screen : payload;
-      if (name) showScreen(name);
+      const isObj = payload && typeof payload === 'object';
+      const name = isObj ? payload.screen : payload;
+      if (!name) return;
+      const data = isObj ? payload : {};
+      if (name === 'reboot') {
+        showRebootScreen(data);
+        return;
+      }
+      if (name === 'wsl-upgrade') {
+        showWslUpgradeScreen(data);
+        return;
+      }
+      showScreen(name);
     });
     api.onToast  && api.onToast(({ message, kind }) => toast(message, kind));
+
+    // Camila noturna 2026-05-27 — progresso da migração WSL legado→moderno
+    // payload = { stage, pct, detail, logLine }
+    api.onWslUpgradeProgress && api.onWslUpgradeProgress((payload) => {
+      updateWslUpgrade(payload || {});
+    });
 
     // Fix Eduardo 2.3 — modal de sudo (passos 05, 10 precisam)
     api.onSudoPrompt && api.onSudoPrompt(({ id, prompt }) => {
@@ -1615,6 +1895,8 @@
     bindManual();
     bindError();
     bindElevateModal();
+    bindReboot();         // Camila noturna 2026-05-27 — tela #screen-reboot
+    bindWslUpgrade();     // Camila noturna 2026-05-27 — tela #screen-wsl-upgrade
     bindDone();
     bindTopbar();
     bindBackendEvents();
