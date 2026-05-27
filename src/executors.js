@@ -1,8 +1,105 @@
 'use strict';
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated, wslExec } = require('./shell');
 const preflight = require('./preflight');
 const { enrichError } = require('./error-catalog');
+
+// ───────────────────────────────────────────────────────────────────────
+// wslIsFunctional — verifica se o WSL realmente FUNCIONA neste host.
+//
+// Bruno v0.2.16 (live-test JOs em v0.2.15):
+// Steps 01/02/03 validavam "ok" baseados em sinais fracos (feature habilitada,
+// distro listada). MAS o WSL podia estar em LIMBO: features habilitadas e
+// `wsl --install` rodou, porém o REBOOT do Windows nunca aconteceu — sem
+// reboot, o kernel WSL não ativa e QUALQUER comando wsl mostra apenas a tela
+// de help (incluindo `wsl --status`, `wsl --list -v`, `wsl -d <distro>`, etc).
+//
+// Estratégia: chamar `wsl --status`. Saída esperada quando funcional:
+//   "Default Distribution: Ubuntu"
+//   "Default Version: 2"
+// (ou em pt-BR: "Distribuição padrão", "Versão padrão", "Versão do kernel").
+//
+// Quando QUEBRADO (reboot pendente / WSL incompleto), o wsl.exe ignora o
+// argumento e cospe a tela de help genérica:
+//   "Copyright (c) Microsoft Corporation."
+//   "Usage: wsl.exe [Argument]"
+//   "  --install ..."
+//   "  --list ..."
+//   "  --status ..."
+//
+// Detectamos "help" por 3 heurísticas (qualquer uma positiva → quebrado):
+//   1) padrão "Usage:" ou "Uso:" + copyright Microsoft
+//   2) lista de flags conhecidas juntas (--no-launch + --web-download + --list)
+//   3) menção simultânea de --install + --list + --status (assinatura do help)
+//
+// Retorno: { ok: boolean, reason: string, raw?: string }
+async function wslIsFunctional() {
+  let r;
+  try {
+    r = await wslExec(['--status'], { timeout: 10_000 });
+  } catch (e) {
+    return { ok: false, reason: `wslExec falhou: ${e.message}` };
+  }
+  if (r.exit_code !== 0) {
+    return { ok: false, reason: `wsl --status exit=${r.exit_code}`, raw: r.stdout || r.stderr || '' };
+  }
+  const raw = r.stdout || '';
+  const out = raw.toLowerCase();
+  const isHelp =
+    /usage:|uso:|copyright.*microsoft.*windows subsystem.*linux/i.test(raw)
+    || /--no-launch[\s\S]*--web-download[\s\S]*--list/i.test(raw)
+    || (out.includes('--install') && out.includes('--list') && out.includes('--status'));
+  if (isHelp) {
+    return { ok: false, reason: 'wsl mostra help — reboot pendente ou WSL incompleto', raw };
+  }
+  // Saída válida deve mencionar default/version/kernel/distribuição
+  if (/default|kernel|version|distribu/i.test(raw)) {
+    return { ok: true, raw };
+  }
+  return { ok: false, reason: 'saída de wsl --status não reconhecida', raw };
+}
+
+// writeWslDiagLog — coleta output bruto de `wsl --status/--list -v/--version` +
+// resultado do wslIsFunctional num arquivo único. JOs pega esse log e manda
+// pro Bruno quando algo falha — diagnóstico em 5min em vez de 2h adivinhando.
+async function writeWslDiagLog(ctx) {
+  try {
+    const ts = Date.now();
+    const dir = path.join(os.homedir(), '.imp-installer', 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `wsl-diag-${ts}.log`);
+    const lines = [];
+    const push = (label, val) => {
+      lines.push(`=== ${label} ===`);
+      lines.push(typeof val === 'string' ? val : JSON.stringify(val, null, 2));
+      lines.push('');
+    };
+    push('timestamp', new Date(ts).toISOString());
+    try {
+      const fn = await wslIsFunctional();
+      push('wslIsFunctional()', fn);
+    } catch (e) { push('wslIsFunctional() ERROR', e.message); }
+    for (const args of [['--status'], ['--list', '--verbose'], ['--version']]) {
+      try {
+        const r = await wslExec(args, { timeout: 10_000 });
+        push(`wsl.exe ${args.join(' ')}`, `exit_code=${r.exit_code}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+      } catch (e) {
+        push(`wsl.exe ${args.join(' ')} ERROR`, e.message);
+      }
+    }
+    if (ctx && ctx.logger) ctx.logger.info('wslDiag', `log gravado em ${file}`);
+    return file;
+  } catch (e) {
+    if (ctx && ctx.logger) ctx.logger.warn('wslDiag', `falhou: ${e.message}`);
+    return null;
+  }
+}
+
+// Nota: wslIsFunctional/writeWslDiagLog também são re-exportados no
+// `module.exports = { ... }` no fim do arquivo (que sobrescreve `exports`).
 
 // ───────────────────────────────────────────────────────────────────────
 // Wrapper: roda PowerShell e enriquece o erro com stdout+code+stderr.
@@ -416,6 +513,34 @@ const step01EnableFeatures = {
         await wslExec(['--set-default', chosenDistro], { timeout: 30_000, logger: ctx.logger, label: 'set-default' });
       } catch (_) {}
 
+      // Bruno v0.2.16: tenta `wsl --update` como CURA antes de marcar reboot.
+      // Atualiza o kernel WSL — em alguns hosts isso ativa o WSL sem reboot,
+      // economizando 1 reinício pro JOs. Se já está atualizado, é no-op rápido.
+      ctx.logger.info('step_01', 'tentando wsl --update pra ativar kernel sem reboot...');
+      try {
+        const upd = await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger, label: 'wsl --update' });
+        ctx.logger.info('step_01', `wsl --update exit=${upd.exit_code}`);
+      } catch (e) {
+        ctx.logger.warn('step_01', `wsl --update falhou (segue): ${e.message}`);
+      }
+
+      // Verifica se ficou funcional sem reboot (best case).
+      const fn = await wslIsFunctional();
+      if (fn.ok) {
+        ctx.logger.info('step_01', 'WSL ficou funcional sem reboot — perfeito');
+        // Grava log diagnóstico em caso de sucesso também (telemetria)
+        await writeWslDiagLog(ctx);
+        return;
+      }
+
+      // WSL ainda não funcional → reboot OBRIGATÓRIO. Grava diagnóstico
+      // pra JOs poder mandar o log se mesmo após reboot algo persistir.
+      ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
+      ctx.save && ctx.save();
+      const diagFile = await writeWslDiagLog(ctx);
+      ctx.logger.warn('step_01',
+        `reboot OBRIGATÓRIO — ${fn.reason}${diagFile ? ` (diag: ${diagFile})` : ''}`);
+
       // Mesmo que wsl --install não tenha sinalizado reboot, é mais SEGURO
       // forçar reboot pra primeira instalação WSL — features de virtualização
       // só ativam de verdade após restart. Custo: 1 reboot extra. Benefício:
@@ -433,6 +558,21 @@ const step01EnableFeatures = {
   async validate(ctx) {
     // Se reboot pendente, segura aqui — runner libera quando rebootDone.
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    // Bruno v0.2.16: TESTE REAL — feature habilitada + distro listada NÃO
+    // basta. Tem que checar se `wsl --status` retorna saída válida (i.e.,
+    // não a tela de help). Se WSL não funcional, marca rebootRequired e
+    // valida=false força UI a mostrar mensagem de reboot.
+    const fn = await wslIsFunctional();
+    if (!fn.ok) {
+      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
+      if (!ctx.state.rebootDone) {
+        ctx.state.rebootRequired = true;
+        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
+        ctx.save && ctx.save();
+      }
+      await writeWslDiagLog(ctx);
+      return false;
+    }
     return _ubuntuInstalled();
   },
 };
@@ -511,7 +651,23 @@ const step02SetWslDefaultV2 = {
       ctx.logger.warn('step_02', `set-default-version 2 falhou: exit=${r.exit_code} stderr=${(r.stderr || '').slice(0, 200)}`);
     }
   },
-  async validate(ctx) { return this.detect(ctx); },
+  async validate(ctx) {
+    // Bruno v0.2.16: respeita reboot pendente.
+    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    // TESTE REAL — wsl --status precisa retornar saída válida (não help).
+    const fn = await wslIsFunctional();
+    if (!fn.ok) {
+      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
+      if (!ctx.state.rebootDone) {
+        ctx.state.rebootRequired = true;
+        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
+        ctx.save && ctx.save();
+      }
+      await writeWslDiagLog(ctx);
+      return false;
+    }
+    return this.detect(ctx);
+  },
 };
 
 // -------- step 03 — install WSL + Ubuntu (NO-OP no fluxo moderno) --------
@@ -559,6 +715,18 @@ const step03WslInstall = {
   },
   async validate(ctx) {
     if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
+    // Bruno v0.2.16: TESTE REAL — wsl --status precisa ser válido.
+    const fn = await wslIsFunctional();
+    if (!fn.ok) {
+      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
+      if (!ctx.state.rebootDone) {
+        ctx.state.rebootRequired = true;
+        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
+        ctx.save && ctx.save();
+      }
+      await writeWslDiagLog(ctx);
+      return false;
+    }
     return _ubuntuInstalled();
   },
 };
@@ -1333,4 +1501,7 @@ module.exports = {
   step14TmuxSession,
   step15DownloadInterface,
   step16ValidateEndToEnd,
+  // Bruno v0.2.16 — helpers diagnósticos (usados por validate dos 01/02/03)
+  wslIsFunctional,
+  writeWslDiagLog,
 };

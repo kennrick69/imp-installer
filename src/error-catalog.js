@@ -224,6 +224,29 @@ const ENTRIES = [
     canSkip: false,
   },
 
+  // ─── WSL não funcional (Bruno v0.2.16 — live-test #3 causa raiz real) ──
+  // Sintoma: features WSL habilitadas + distro listada, MAS qualquer comando
+  // `wsl` mostra apenas a tela de help. Causa raiz: reboot do Windows nunca
+  // aconteceu, então o kernel WSL não ativou. wsl --update sem efeito sem
+  // reboot do host. Único caminho: REINICIAR.
+  //
+  // IMPORTANTE: precisa vir ANTES da entrada genérica "/reboot pendente/" mais
+  // abaixo — senão a mensagem genérica intercepta (porque a string de erro
+  // contém "reboot pendente"). Ordem do array = ordem de prioridade.
+  {
+    stepId: '*',
+    match: /WSL (ainda )?n[ãa]o (est[áa] )?funcional|wsl mostra help|WSL incompleto|reboot pendente.*WSL/i,
+    headline: 'O WSL precisa de um reinício do Windows',
+    what: 'As features do WSL foram habilitadas, mas o Windows precisa REINICIAR pra ativar o kernel do WSL. Sem reboot, qualquer comando `wsl` mostra a tela de ajuda em vez de funcionar.',
+    suggestions: [
+      'Salve qualquer trabalho aberto e reinicie o Windows agora.',
+      'Quando voltar, o instalador reabre sozinho e continua de onde parou.',
+      'Se já reiniciou e ainda dá esse erro: abra um cmd como administrador e rode `wsl --update`, depois tente de novo aqui.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+
   // ─── reboot ────────────────────────────────────────────────────────────
   {
     stepId: '*',

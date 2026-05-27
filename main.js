@@ -535,50 +535,84 @@ safeHandle('installer:openTerminal', async (_e, { cmd } = {}) => {
 //
 // Live-test v0.2.13: openInteractiveTerminal abriu janelas que sumiram antes
 // do JOs ler — ele viu a tela piscar sem entender o que era. Causa raiz:
-// /c (close) em vez de /k (keep). Agora forçamos /k e wt.exe sem auto-close.
+// /c (close) em vez de /k (keep).
 //
-// Estratégia:
-//   1. Tenta wt.exe (Windows Terminal — visual moderno, sempre stays-open).
-//   2. Fallback cmd.exe /k (KEEP OPEN após comando; CRÍTICO pro JOs ler).
+// Live-test v0.2.15: wt.exe + cmd /k via spawn-com-array de args
+// (`spawn('cmd.exe', ['/c','start','""','cmd.exe','/k','wsl.exe','-d',distro])`)
+// abriu janela MAS mostrava help do wsl.exe — Node re-quota a cmdline (Windows
+// argv→cmdline) e o `start` interpretava os tokens ambíguos, fazendo wsl receber
+// args inválidos.
 //
-// Com cmd: monta `wsl -d <distro> -- bash -lc "<cmd>; exec bash"`.
-//   - "exec bash" no fim mantém shell interativo vivo após cmd terminar,
-//     pra JOs ver output, ler erros, etc. Sem isso, wsl fechava na hora.
-// Sem cmd: `wsl -d <distro>` direto (já cai em shell interativo).
+// Estratégia v0.2.16: SÓ PowerShell Start-Process com UMA string única dentro
+// de cmd /k. PowerShell faz quoting determinístico, janela visível garantida,
+// encoding pt-BR OK. Log diagnóstico SEMPRE escrito em ~/.imp-installer/logs/.
+//
+// Com cmd: `wsl -d "<distro>" -- bash -lc "<cmd>; exec bash"` (exec bash mantém shell)
+// Sem cmd: `wsl -d "<distro>"`  (já cai em shell interativo).
 // ───────────────────────────────────────────────────────────────────────
 safeHandle('installer:executeManualAction', async (_e, args = {}) => {
   const { kind, payload = {} } = args || {};
   if (!kind) return { ok: false, error: 'kind obrigatório' };
   switch (kind) {
     case 'terminal': {
-      const distro = payload.distro || 'Ubuntu';
+      // v0.2.16 — refactor radical: SÓ PowerShell Start-Process.
+      // Motivo: v0.2.15 com `spawn('cmd.exe', ['/c','start','""','cmd.exe','/k',...])`
+      // mostrava help do wsl. Causa provável: o `start` do cmd interpreta a lista
+      // de args de forma ambígua (cada token vira arg DELE até encontrar o exe-alvo)
+      // e Node ainda re-quota a cmdline na conversão argv→cmdline (Windows API).
+      // Resultado: `wsl.exe -d Ubuntu-22.04` chegava como `wsl --help` equivalent
+      // (ou wsl recebia args inválidos e cuspia help).
+      //
+      // Nova estratégia (Opção C do brief): UMA string única dentro de `cmd /k`,
+      // disparada via `Start-Process` do PowerShell — quoting determinístico,
+      // janela visível garantida, encoding pt-BR OK.
+      const distro = String(payload.distro || 'Ubuntu').trim();
+      if (!distro) return { ok: false, error: 'distro vazio' };
+
       const cmd = payload.cmd; // opcional — comando inicial dentro do shell
 
-      // Args base do wsl. Se há cmd, embrulha em bash -lc com `exec bash` no
-      // fim pra shell ficar vivo após o comando — leitura do JOs.
-      // Sem cmd, wsl -d entra em shell interativo direto.
-      const wslArgs = ['-d', distro];
-      if (cmd) {
-        wslArgs.push('--', 'bash', '-lc', `${cmd}; exec bash`);
-      }
+      // Setup log diagnóstico — JOs vai ler isso quando der ruim de novo.
+      const actionLog = path.join(STATE_DIR, 'logs', `action-${Date.now()}.log`);
+      try { fs.mkdirSync(path.dirname(actionLog), { recursive: true }); } catch (_) {}
+      const logA = (msg) => {
+        try { fs.appendFileSync(actionLog, `[${new Date().toISOString()}] ${msg}\n`); } catch (_) {}
+      };
 
-      // PRIORIDADE 1: Windows Terminal (wt.exe). Mais bonito, sempre aberto.
-      try {
-        const wtArgs = ['-w', '0', 'new-tab', '--title', `IMP — ${distro}`, '--', 'wsl.exe', ...wslArgs];
-        const r1 = await trySpawnDetached('wt.exe', wtArgs);
-        if (r1.ok) return { ok: true, via: 'wt' };
-      } catch (_) { /* wt.exe não existe ou falhou — cai pro fallback */ }
+      logA(`kind=terminal distro=${JSON.stringify(distro)} cmd=${JSON.stringify(cmd)}`);
 
-      // FALLBACK: cmd.exe /k (mantém janela viva após comando terminar).
-      // Estrutura: `start "" cmd /k wsl.exe -d <distro> [...]`
-      // /k = Keep open. CRÍTICO pra JOs ler/digitar sem janela sumir.
+      // Monta UMA STRING DE SHELL — exatamente o que `cmd /k` vai executar.
+      // Com cmd: wsl -d "<distro>" -- bash -lc "<cmd>; exec bash"  (exec bash mantém shell vivo)
+      // Sem cmd: wsl -d "<distro>"  (já entra em shell interativo)
+      const innerCmd = cmd
+        ? `wsl.exe -d "${distro}" -- bash -lc "${String(cmd).replace(/"/g, '\\"')}; exec bash"`
+        : `wsl.exe -d "${distro}"`;
+      logA(`innerCmd: ${innerCmd}`);
+
+      // PowerShell Start-Process — escapa aspas simples DOBRANDO ('').
+      const psScript = `Start-Process -FilePath 'cmd.exe' -ArgumentList '/k','${innerCmd.replace(/'/g, "''")}'`;
+      logA(`psScript: ${psScript}`);
+      logA(`manual reproduce: powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`);
+      logA(`equivalente cmd: cmd /k ${innerCmd}`);
+
       try {
-        const cmdArgs = ['/k', 'wsl.exe', ...wslArgs];
-        const r2 = await trySpawnDetached('cmd.exe', cmdArgs, { useStart: true });
-        if (r2.ok) return { ok: true, via: 'cmd' };
-        return { ok: false, error: r2.error || 'cmd.exe não abriu janela' };
+        const ps = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', psScript],
+          { detached: true, stdio: 'ignore', windowsHide: true }
+        );
+        let spawnErr = null;
+        ps.on('error', (err) => { spawnErr = err; logA(`ps spawn error: ${err.message}`); });
+        ps.unref();
+        // Espera 800ms pra confirmar que sobreviveu (mesma heurística que tínhamos).
+        await new Promise((r) => setTimeout(r, 800));
+        if (spawnErr) {
+          return { ok: false, error: spawnErr.message, logFile: actionLog };
+        }
+        logA('ps spawned, considering OK');
+        return { ok: true, via: 'powershell+cmd', logFile: actionLog };
       } catch (e) {
-        return { ok: false, error: e.message };
+        logA(`ps spawn falhou (catch): ${e.message}`);
+        return { ok: false, error: e.message, logFile: actionLog };
       }
     }
     case 'browser': {
