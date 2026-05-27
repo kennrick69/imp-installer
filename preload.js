@@ -47,6 +47,10 @@ const installer = {
   cancelReboot: () => ipcRenderer.invoke('installer:cancelReboot'),
   executeManualAction: (kind, payload) => ipcRenderer.invoke('installer:executeManualAction', { kind, payload }),
 
+  // FASE 2 autossuficiente — runtime MSYS2 embarcado (v0.3.0)
+  applyAvExclusion: (path) => ipcRenderer.invoke('installer:applyAvExclusion', { path }),
+  getRuntimeInfo: () => ipcRenderer.invoke('installer:getRuntimeInfo'),
+
   sudoReply: (id, password, cancelled = false) =>
     ipcRenderer.invoke('installer:sudoReply', { id, password, cancelled }),
 
@@ -63,6 +67,11 @@ const installer = {
   onToast: on('installer:onToast'),
   onSudoPrompt: on('installer:sudoPrompt'),
   onWslUpgradeProgress: on('installer:onWslUpgradeProgress'),
+
+  // FASE 2 (v0.3.0)
+  onCopyRuntimeProgress: on('installer:onCopyRuntimeProgress'),
+  onNeedsAvExclusion: on('installer:onNeedsAvExclusion'),
+  onAppLockerBlocked: on('installer:onAppLockerBlocked'),
 };
 
 contextBridge.exposeInMainWorld('api', {

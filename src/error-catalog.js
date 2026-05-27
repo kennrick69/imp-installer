@@ -7,6 +7,85 @@
 // Texto baseado em RISCOS-INSTALACAO.md (Patrícia).
 
 const ENTRIES = [
+  // ─── FASE 2 — runtime MSYS2 embarcado (Bruno 2026-05-27) ──────────────
+
+  {
+    stepId: '*',
+    match: /RUNTIME_ARCHIVE_MISSING|runtime\.7z não foi gerado/i,
+    headline: 'Arquivo do runtime ausente no instalador',
+    what: 'O instalador foi construído sem o runtime.7z embarcado. Sem ele, não há como copiar o ambiente.',
+    suggestions: [
+      'Se você está rodando uma build dev: rode `scripts/build-runtime.ps1` numa máquina Windows pra gerar `resources/runtime.7z`.',
+      'Se baixou de um release: baixe novamente, o arquivo veio incompleto.',
+    ],
+    canRetry: false,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /RUNTIME_DISK_FULL|disco encheu|precisa de \d+ GB livres/i,
+    headline: 'Disco cheio — preciso de 2 GB livres',
+    what: 'O drive de destino (geralmente C:) não tem espaço suficiente pra copiar o runtime.',
+    suggestions: [
+      'Libere ao menos 2 GB no drive C: (execute "Limpeza de Disco" do Windows).',
+      'Apague arquivos grandes em Downloads/Vídeos/Documents.',
+      'Tente de novo — o instalador faz um pré-check antes de copiar.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /AV_QUARANTINE|antivírus pode ter removido|binários|tmux\.exe ausente|bash\.exe ausente/i,
+    headline: 'Antivírus removeu arquivos do runtime',
+    what: 'Seu antivírus achou que `tmux.exe`/`bash.exe`/`nc.exe` são suspeitos e removeu silenciosamente. São ferramentas de terminal antigas, inofensivas.',
+    suggestions: [
+      'Adicione a pasta do runtime como exceção no Defender (o instalador oferece um botão pra fazer isso com 1 clique — precisa admin).',
+      'Se for Avast/Kaspersky/Trend: abra o painel do antivírus, vá em Exclusões, adicione `%LOCALAPPDATA%\\IMP-Squad-Runtime\\`.',
+      'Restaure os arquivos quarentenados manualmente OU clique "Tentar de novo" depois da exclusão.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /APPLOCKER_BLOCKED|AppLocker corporativo bloqueia/i,
+    headline: 'AppLocker corporativo bloqueia execução',
+    what: 'Seu PC tem AppLocker (política corporativa) que impede executar programas em pastas pessoais. O runtime não vai rodar até o TI liberar.',
+    suggestions: [
+      'Peça ao TI corporativo pra adicionar uma exceção AppLocker — o instalador gerou o XML de regra pronto em `~/.imp-installer/applocker-rule.xml`.',
+      'Alternativa: rodar o instalador como admin pra extrair em `%PROGRAMDATA%` (algumas políticas liberam essa pasta).',
+      'Sem liberação do TI, este PC não vai rodar a squad.',
+    ],
+    canRetry: false,
+    canSkip: false,
+  },
+  {
+    stepId: '*',
+    match: /RUNTIME_BASH_MISSING|RUNTIME_7Z_TOOL_MISSING/i,
+    headline: 'Ferramentas internas do runtime ausentes',
+    what: 'O runtime extraído está incompleto (faltam binários esperados). Pode ser extração corrompida ou AV agindo no meio.',
+    suggestions: [
+      'Verifique se o antivírus removeu arquivos (vide opção acima).',
+      'Apague `%LOCALAPPDATA%\\IMP-Squad-Runtime\\` e tente de novo do zero.',
+      'Se persistir, baixe o instalador novamente.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+  {
+    stepId: 'step_x4_launch_tmux',
+    match: /tmux launch falhou|not a terminal|open terminal failed/i,
+    headline: 'tmux não conseguiu subir a sessão',
+    what: 'O tmux precisa de um terminal PTY pra rodar. No Windows isso depende do ConPTY do MSYS2.',
+    suggestions: [
+      'Tente de novo — primeira chamada às vezes falha por timing.',
+      'Se persistir, abra o `imp-squad.bat` manualmente (em %LOCALAPPDATA%\\IMP-Squad-Runtime\\current\\scripts\\) e rode `tmux new-session -s imp`.',
+    ],
+    canRetry: true,
+    canSkip: false,
+  },
+
   // ─── steps 01/02/03 — admin gate (Bruno live-test #3) ─────────────────
   // Cobertura caso a flag NEEDS_ADMIN escape do interceptor em main.js
   // (defesa em profundidade). Caminho normal: main.js trata e emite

@@ -28,22 +28,32 @@ function emptyState() {
     updatedAt: new Date().toISOString(),
     rebootRequired: false,
     rebootDone: false,
-    ubuntuUser: null,
-    distro: 'Ubuntu-22.04',
-    githubAuthMethod: null,
     decisions: {
-      nodeInstallVia: 'nvm',          // Bruno won the debate
-      claudeCliVia: 'native',         // curl install.sh
+      // Decisões herdadas (campos antigos preservados por compat de state.json
+      // pré-FASE 2 — code novo ignora).
+      nodeInstallVia: 'nvm',
+      claudeCliVia: 'native',
       escritorio3dStrategy: 'release-asset-on-demand',
     },
-    // Bruno (noturna 2026-05-27) — fluxo WSL legacy→moderno explícito
-    wslState: null,                   // 'absent' | 'legacy' | 'modern' | 'functional' | 'broken'
-    featuresEnabled: null,            // { wsl: bool, vmp: bool, checkedAt: ts }
+    // FASE 2 — runtime MSYS2 embarcado (Bruno 2026-05-27)
+    runtimeInstalled: false,
+    runtimePath: null,                // string com %LOCALAPPDATA%\IMP-Squad-Runtime\<ver>
+    runtimeVersion: null,             // string versão do app
+    avDetected: null,                 // { defender, real_time_active, third_party_name, exclusion_added }
+    appLockerDetected: null,          // { restrictive_policy: bool }
+    githubAuthMode: null,             // 'device' | 'token' | 'seed-only' | 'pending'
+    // Campos LEGADOS (pré-FASE 2) preservados pra migração de state.json antigo.
+    // O code novo NÃO usa, mas a migração precisa não perder.
+    ubuntuUser: null,
+    distro: null,
+    githubAuthMethod: null,
+    wslState: null,
+    featuresEnabled: null,
     wslMigrationAttempted: false,
     wslMsiVersion: null,
     rebootRequiredReason: null,
-    rebootCount: 0,                   // cap em 3 pra evitar loop infinito
-    distroState: null,                // 'none' | 'installed' | 'user_created'
+    rebootCount: 0,
+    distroState: null,
     steps: {}, // stepId -> 'pending' | 'running' | 'done' | 'error' | 'skipped' | 'blocked_user_action'
     stepDetails: {}, // stepId -> { startedAt, finishedAt, lastError, attempts }
     lastStepCompleted: null,

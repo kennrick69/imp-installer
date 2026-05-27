@@ -41,7 +41,7 @@
     <div id="global-progress" class="hidden" aria-label="Progresso geral da instalação">
       <div class="gp-label">
         <span id="gp-text">Verificando ambiente…</span>
-        <span id="gp-count" class="gp-count">0/7</span>
+        <span id="gp-count" class="gp-count">0/5</span>
       </div>
       <div class="gp-track">
         <div class="gp-fill" id="gp-fill" style="width:0%"></div>
@@ -56,11 +56,11 @@
     ========================================================== -->
     <div id="main-area">
 
-    <!-- Sidebar global dos 17 passos -->
+    <!-- Sidebar global dos 5 passos (FASE 2 — Camila 2026-05-27) -->
     <aside id="step-sidebar" class="hidden" aria-label="Etapas da instalação">
       <header class="sidebar-head">
         <h3 id="progress-title">Etapas</h3>
-        <span class="step-counter"><span id="step-done-count">0</span>/<span id="step-total-count">17</span></span>
+        <span class="step-counter"><span id="step-done-count">0</span>/<span id="step-total-count">5</span></span>
       </header>
       <div class="overall-progress" aria-label="Progresso total">
         <div class="overall-bar"><div class="overall-fill" id="overall-fill" style="width:0%"></div></div>
@@ -410,6 +410,46 @@
       </section>
 
       <!-- ─────────────────────────────────────────────────────
+           TELA — COPIANDO RUNTIME (FASE 2 — Camila 2026-05-27)
+           Aparece no Step 1 (step_x1_copy_runtime). Mostra cópia
+           do MSYS2 portable (~680MB) pra %LOCALAPPDATA%. Backend
+           emite installer:onCopyRuntimeProgress {pct, bytesDone,
+           totalBytes, eta}. Se pct não anda em 60s, aviso AV
+           aparece sugerindo antivírus escaneando.
+      ────────────────────────────────────────────────────── -->
+      <section class="screen" id="screen-copying-runtime" aria-labelledby="copy-runtime-title">
+        <div class="screen-inner copy-runtime-wrap">
+          <header class="screen-head">
+            <h2 id="copy-runtime-title">📦 Preparando seu ambiente...</h2>
+            <p class="screen-sub">Estou copiando o ambiente Linux pra dentro do seu PC.
+              Isso leva ~1 minuto e só acontece uma vez.</p>
+          </header>
+
+          <div class="cr-progress-card">
+            <div class="cr-bar"><div class="cr-fill" id="cr-fill" style="width:0%"></div></div>
+            <div class="cr-stats">
+              <span id="cr-pct">0%</span>
+              <span class="cr-sep">·</span>
+              <span id="cr-bytes">0 MB de 680 MB</span>
+              <span class="cr-sep">·</span>
+              <span id="cr-eta">calculando...</span>
+            </div>
+          </div>
+
+          <div class="cr-info">
+            <p>📁 Destino: <code id="cr-dest">%LOCALAPPDATA%\IMP-Squad-Runtime\</code></p>
+            <p>✨ Funciona offline depois de instalado</p>
+            <p>🧹 Pode desinstalar limpo (Apps & Features)</p>
+          </div>
+
+          <div class="cr-warn hidden" id="cr-av-warn">
+            ⚠ Se a barra parou: pode ser o antivírus escaneando.
+            Aguarde uns minutos — vai retomar sozinho.
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────
            TELA 4 — PASSO MANUAL
       ────────────────────────────────────────────────────── -->
       <section class="screen" id="screen-manual" aria-labelledby="manual-title">
@@ -750,6 +790,35 @@
           <button class="btn-primary btn-large" id="btn-elevate-relaunch">
             🛡 Reabrir como administrador
           </button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- =========================================================
+         MODAL — AV EXCLUSION (FASE 2 — Camila 2026-05-27)
+         Aparece quando backend detecta Defender ativo. Pede pra
+         liberar %LOCALAPPDATA%\IMP-Squad-Runtime como exclusão
+         pra evitar scan lento. UAC vai aparecer ao confirmar.
+    ========================================================== -->
+    <div class="modal-overlay hidden" id="modal-av-exclusion" role="dialog" aria-modal="true" aria-labelledby="av-exclusion-title">
+      <div class="modal modal-av">
+        <header>
+          <h2 id="av-exclusion-title">🛡 Pedir ao Windows Defender pra liberar nossa pasta</h2>
+        </header>
+        <div class="body">
+          <p>Detectei que o <strong>Windows Defender</strong> está ativo. Pra evitar que ele
+            bloqueie ou demore demais escaneando nossos arquivos, posso adicionar a pasta
+            do IMP Squad como <strong>exceção</strong>.</p>
+          <p class="hint">Você vai ver um pedido de admin (UAC) — aceite pra continuar.</p>
+          <div class="av-card">
+            <strong>Pasta a liberar:</strong><br>
+            <code id="av-exclusion-path">%LOCALAPPDATA%\IMP-Squad-Runtime</code>
+          </div>
+          <p class="hint">É seguro: só liberamos NOSSA pasta, não o Windows todo.</p>
+        </div>
+        <footer>
+          <button class="btn-ghost" id="btn-av-skip">Pular (vai ser mais lento)</button>
+          <button class="btn-primary" id="btn-av-apply">🛡 Liberar pasta agora</button>
         </footer>
       </div>
     </div>

@@ -9,18 +9,14 @@ const { ALL_STEPS } = require('./executors');
 // Lock file prevents two installer processes from racing on state.json.
 const LOCK_NAME = '.installer.lock';
 
-// CRITICAL_STEPS: skipStep recusa esses (sem force:true). Pular qualquer um quebra
-// downstream — ex.: pular step_05 (apt) garante que step_06 (node via nvm via apt deps)
-// falhe; pular step_03 (wsl_install) deixa o sistema sem distro Linux.
+// CRITICAL_STEPS: skipStep recusa esses (sem force:true).
+// FASE 2 (Bruno 2026-05-27): novos step IDs do runtime embarcado MSYS2.
+// step_x3_github_auth é OPCIONAL (squad-seed já vem embarcado) → pulável.
 const CRITICAL_STEPS = new Set([
-  'step_01_enable_features', // v0.2.9: agora faz wsl --install (era só features)
-  'step_03_wsl_install',     // mantido crítico pra fluxo legacy fallback
-  'step_05_apt_base',
-  'step_06_node_nvm',
-  'step_08_claude_cli',
-  'step_10_gh_auth',
-  'step_11_clone_squad',
-  'step_14_tmux_session',
+  'step_x1_copy_runtime',
+  'step_x2_setup_env',
+  'step_x4_launch_tmux',
+  'step_x5_desktop_shortcut',
 ]);
 
 function acquireLock(dir) {
@@ -188,16 +184,12 @@ async function runStep(stepId, events) {
 
   await pauseGate(_ctx);
 
-  // Reboot gate: step 01 (refactor v0.2.9 — unified wsl --install) ou step 03
-  // (fallback legacy) podem setar rebootRequired=true. Steps subsequentes não
-  // podem rodar até rebootDone também ser true. main.js flipa rebootDone no
-  // próximo launch via RunOnce. Os 3 primeiros steps (01/02/03) são liberados
-  // pra que a UI possa re-detectar e marcar como done após reboot.
+  // Reboot gate: FASE 2 (runtime MSYS2) NÃO dispara reboot por design — mas
+  // mantemos o gate funcional pra retro-compat com state.json antigo (se
+  // alguém migrou de v0.2.x com rebootRequired pendente, libera só o preflight
+  // pra re-detectar e o user pode resetar).
   const REBOOT_GATE_EXEMPT = new Set([
     'step_00_preflight',
-    'step_01_enable_features',
-    'step_02_set_wsl_default_v2',
-    'step_03_wsl_install',
   ]);
   if (_ctx.state.rebootRequired && !_ctx.state.rebootDone && !REBOOT_GATE_EXEMPT.has(step.id)) {
     const msg = 'Reboot pendente — reinicie o Windows antes de continuar.';
@@ -311,11 +303,10 @@ async function runAll(events) {
     const r = await runStep(step.id, _ctx.events);
     results.push(r);
     if (r.status === 'error') break;
-    // v0.2.9: step_01 (refactor unificado) ou step_03 (fallback legacy) podem
-    // setar rebootRequired. Pausa execução; user precisa reiniciar Windows.
-    if ((step.id === 'step_01_enable_features' || step.id === 'step_03_wsl_install')
-        && _ctx.state.rebootRequired && !_ctx.state.rebootDone) {
-      _ctx.logger.info('runner', `pausando após ${step.id} — aguardando reboot do usuário`);
+    // FASE 2: nenhum step novo dispara rebootRequired. Mantemos check genérico
+    // (defesa em profundidade): se algum step setar a flag, pausa o runAll.
+    if (_ctx.state.rebootRequired && !_ctx.state.rebootDone) {
+      _ctx.logger.info('runner', `pausando após ${step.id} — rebootRequired flag setada`);
       break;
     }
   }

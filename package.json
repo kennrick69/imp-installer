@@ -1,7 +1,7 @@
 {
   "name": "imp-installer",
   "productName": "IMP Squad \u2014 Instalador",
-  "version": "0.2.18",
+  "version": "0.3.0",
   "description": "Instalador guiado da IMP Dev Squad (Windows zerado \u2192 squad rodando com 7 Claudes + interface).",
   "private": true,
   "main": "main.js",
@@ -41,6 +41,16 @@
       "!**/node_modules/*/{test,tests,__tests__,docs,example,examples}/**",
       "!**/*.{md,markdown}",
       "!docs/**"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/",
+        "to": "runtime/",
+        "filter": [
+          "runtime.7z",
+          "runtime.7z.sha256"
+        ]
+      }
     ],
     "win": {
       "target": [

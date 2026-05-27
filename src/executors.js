@@ -1,325 +1,166 @@
 'use strict';
 
+// ───────────────────────────────────────────────────────────────────────
+// FASE 2 — Runtime MSYS2 embarcado (Bruno, 2026-05-27)
+//
+// REESCRITA: os 17 steps WSL antigos foram REMOVIDOS. 5 novos steps:
+//   step_X1 — copyRuntime    (copia ~680 MB de runtime.7z pra LOCALAPPDATA)
+//   step_X2 — setupEnv       (setup.sh, AV exclusion, valida runtime)
+//   step_X3 — githubAuth     (gh auth login --device-flow, opcional)
+//   step_X4 — launchTmux     (sessão tmux imp + 7 painéis claude)
+//   step_X5 — desktopShortcut (atalho .lnk pra reabrir squad)
+//
+// Premissas (vide docs/fase-autossuficiente/{DECISAO-FASE1,MARCOS-EMBARCAR,
+// BRUNO-TESTE-MSYS2,PATRICIA-CENARIOS-NOVOS}.md):
+//   - Zero WSL, zero virtualização, zero reboot
+//   - PATH isolado via wrapper imp-squad.bat (HKCU\Environment NÃO é tocado)
+//   - claude.exe NATIVO Windows + CLAUDE_CODE_GIT_BASH_PATH apontando pro bash
+//     do MSYS2 (issue #9883: claude in MSYS2 shell quebra)
+//   - Runtime versionado em %LOCALAPPDATA%\IMP-Squad-Runtime\<version>\
+//   - Junction `current` aponta pra versão ativa
+//
+// step00Preflight é PRESERVADO (genérico, vale pra qualquer fluxo).
+// ───────────────────────────────────────────────────────────────────────
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { powershell, wsl, sudoInWsl, openInteractiveTerminal, withRetry, scheduleRunOnceAfterReboot, shSingleQuote, isElevated, wslExec, detectWslState, installWslModernViaMsi, forceRebootWindows, cancelReboot } = require('./shell');
+const { spawn } = require('child_process');
+const { powershell, isElevated } = require('./shell');
 const preflight = require('./preflight');
-const { enrichError } = require('./error-catalog');
 
 // ───────────────────────────────────────────────────────────────────────
-// wslIsFunctional — verifica se o WSL realmente FUNCIONA neste host.
-//
-// Bruno v0.2.16 (live-test JOs em v0.2.15):
-// Steps 01/02/03 validavam "ok" baseados em sinais fracos (feature habilitada,
-// distro listada). MAS o WSL podia estar em LIMBO: features habilitadas e
-// `wsl --install` rodou, porém o REBOOT do Windows nunca aconteceu — sem
-// reboot, o kernel WSL não ativa e QUALQUER comando wsl mostra apenas a tela
-// de help (incluindo `wsl --status`, `wsl --list -v`, `wsl -d <distro>`, etc).
-//
-// Estratégia: chamar `wsl --status`. Saída esperada quando funcional:
-//   "Default Distribution: Ubuntu"
-//   "Default Version: 2"
-// (ou em pt-BR: "Distribuição padrão", "Versão padrão", "Versão do kernel").
-//
-// Quando QUEBRADO (reboot pendente / WSL incompleto), o wsl.exe ignora o
-// argumento e cospe a tela de help genérica:
-//   "Copyright (c) Microsoft Corporation."
-//   "Usage: wsl.exe [Argument]"
-//   "  --install ..."
-//   "  --list ..."
-//   "  --status ..."
-//
-// Detectamos "help" por 3 heurísticas (qualquer uma positiva → quebrado):
-//   1) padrão "Usage:" ou "Uso:" + copyright Microsoft
-//   2) lista de flags conhecidas juntas (--no-launch + --web-download + --list)
-//   3) menção simultânea de --install + --list + --status (assinatura do help)
-//
-// Retorno: { ok: boolean, reason: string, raw?: string }
-async function wslIsFunctional() {
-  let r;
-  try {
-    r = await wslExec(['--status'], { timeout: 10_000 });
-  } catch (e) {
-    return { ok: false, reason: `wslExec falhou: ${e.message}` };
-  }
-  if (r.exit_code !== 0) {
-    return { ok: false, reason: `wsl --status exit=${r.exit_code}`, raw: r.stdout || r.stderr || '' };
-  }
-  const raw = r.stdout || '';
-  const out = raw.toLowerCase();
-  const isHelp =
-    /usage:|uso:|copyright.*microsoft.*windows subsystem.*linux/i.test(raw)
-    || /--no-launch[\s\S]*--web-download[\s\S]*--list/i.test(raw)
-    || (out.includes('--install') && out.includes('--list') && out.includes('--status'));
-  if (isHelp) {
-    return { ok: false, reason: 'wsl mostra help — reboot pendente ou WSL incompleto', raw };
-  }
-  // Saída válida deve mencionar default/version/kernel/distribuição
-  if (/default|kernel|version|distribu/i.test(raw)) {
-    return { ok: true, raw };
-  }
-  return { ok: false, reason: 'saída de wsl --status não reconhecida', raw };
+// Constantes globais do runtime
+// ───────────────────────────────────────────────────────────────────────
+
+// Tamanho mínimo livre no drive destino — 2 GB (1 GB runtime + folga cache).
+const MIN_FREE_GB = 2;
+
+// Arquivos esperados após extração — usados pra validate de step_X1.
+// Compatível com 2 layouts: msys64/usr/bin/... (achatado) ou msys2/usr/bin/...
+// O builder pode escolher; aqui aceitamos ambos.
+const RUNTIME_CRITICAL_BINS = [
+  ['msys64', 'usr', 'bin', 'bash.exe'],
+  ['msys64', 'usr', 'bin', 'tmux.exe'],
+  ['msys64', 'usr', 'bin', 'git.exe'],
+];
+
+// Caminho do node embarcado — também aceita dois layouts (node/ raiz ou
+// dentro de mingw64/ucrt64).
+const RUNTIME_NODE_CANDIDATES = [
+  ['node', 'node.exe'],
+  ['msys64', 'ucrt64', 'bin', 'node.exe'],
+  ['msys64', 'mingw64', 'bin', 'node.exe'],
+];
+
+// Caminho do claude.exe nativo embarcado.
+const RUNTIME_CLAUDE_CANDIDATES = [
+  ['claude-cli', 'claude.exe'],
+  ['claude-cli', 'bin', 'claude.exe'],
+];
+
+// Personas que ganham 1 painel cada na tmux session.
+const TMUX_PERSONAS = ['lider', 'arquiteto', 'criativo', 'debugger', 'qa', 'revisor'];
+
+// ───────────────────────────────────────────────────────────────────────
+// Helpers de paths — todos resolvem caminhos absolutos sem efeito colateral.
+// ───────────────────────────────────────────────────────────────────────
+
+function getLocalAppData() {
+  return process.env.LOCALAPPDATA
+    || path.join(os.homedir(), 'AppData', 'Local');
 }
 
-// writeWslDiagLog — coleta output bruto de `wsl --status/--list -v/--version` +
-// resultado do wslIsFunctional num arquivo único. JOs pega esse log e manda
-// pro Bruno quando algo falha — diagnóstico em 5min em vez de 2h adivinhando.
-async function writeWslDiagLog(ctx) {
-  try {
-    const ts = Date.now();
-    const dir = path.join(os.homedir(), '.imp-installer', 'logs');
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `wsl-diag-${ts}.log`);
-    const lines = [];
-    const push = (label, val) => {
-      lines.push(`=== ${label} ===`);
-      lines.push(typeof val === 'string' ? val : JSON.stringify(val, null, 2));
-      lines.push('');
-    };
-    push('timestamp', new Date(ts).toISOString());
+function getRuntimeRoot() {
+  return path.join(getLocalAppData(), 'IMP-Squad-Runtime');
+}
+
+function getRuntimeVersionDir(version) {
+  return path.join(getRuntimeRoot(), version);
+}
+
+function getRuntimeCurrentDir() {
+  // Junction (mklink /J) apontando pra versão ativa. Os steps que precisam
+  // do runtime SEM saber versão usam `current`.
+  return path.join(getRuntimeRoot(), 'current');
+}
+
+// Resolve um candidato de path dentro do runtime — testa cada layout e
+// devolve o primeiro existente, ou null.
+function resolveRuntimeBin(runtimeDir, candidates) {
+  for (const parts of candidates) {
+    const p = path.join(runtimeDir, ...parts);
     try {
-      const fn = await wslIsFunctional();
-      push('wslIsFunctional()', fn);
-    } catch (e) { push('wslIsFunctional() ERROR', e.message); }
-    for (const args of [['--status'], ['--list', '--verbose'], ['--version']]) {
-      try {
-        const r = await wslExec(args, { timeout: 10_000 });
-        push(`wsl.exe ${args.join(' ')}`, `exit_code=${r.exit_code}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
-      } catch (e) {
-        push(`wsl.exe ${args.join(' ')} ERROR`, e.message);
-      }
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Localiza o arquivo runtime.7z (ou .zip) empacotado com extraResources do
+// electron-builder. Em runtime portable: process.resourcesPath.
+// Aceita .7z (preferido — sólido, AV escaneia 1x) ou .zip (fallback se 7za
+// não está disponível no Windows host).
+function findRuntimeArchive() {
+  const baseCandidates = [];
+  if (process.resourcesPath) baseCandidates.push(process.resourcesPath);
+  baseCandidates.push(path.join(__dirname, '..', 'resources'));
+  baseCandidates.push(path.join(__dirname, '..'));
+
+  const fileCandidates = ['runtime.7z', 'runtime.zip', 'runtime.tar.zst'];
+
+  for (const base of baseCandidates) {
+    for (const file of fileCandidates) {
+      const p = path.join(base, file);
+      try { if (fs.existsSync(p)) return p; } catch (_) {}
+      const p2 = path.join(base, 'runtime', file);
+      try { if (fs.existsSync(p2)) return p2; } catch (_) {}
     }
-    if (ctx && ctx.logger) ctx.logger.info('wslDiag', `log gravado em ${file}`);
-    return file;
-  } catch (e) {
-    if (ctx && ctx.logger) ctx.logger.warn('wslDiag', `falhou: ${e.message}`);
-    return null;
+  }
+  return null;
+}
+
+// Versão "ativa" do runtime — atrelada à versão do app. Se não conseguir
+// resolver, usa "1.0.0" como fallback (Marcos §6 — coexistência versionada).
+function getRuntimeVersion() {
+  try {
+    const pkg = require(path.join(__dirname, '..', 'package.json'));
+    return pkg.version || '1.0.0';
+  } catch (_) {
+    return '1.0.0';
   }
 }
 
-// Nota: wslIsFunctional/writeWslDiagLog também são re-exportados no
-// `module.exports = { ... }` no fim do arquivo (que sobrescreve `exports`).
-
 // ───────────────────────────────────────────────────────────────────────
-// Wrapper: roda PowerShell e enriquece o erro com stdout+code+stderr.
-//
-// DISM e wsl.exe escrevem MUITOS erros em STDOUT, não stderr. Em particular,
-// erro 740 (ELEVATION_REQUIRED) sai com stderr vazio — o log do JOs no live
-// test mostrou exatamente isso: `{"stderr":""}` sem nenhuma pista do motivo.
-// Esta função SEMPRE inclui stdout + exit code na mensagem do erro, pra
-// debugar sem ficar adivinhando.
-//
-// Bruno v0.2.9 (live-test #2 fix CAUSA 1 — encoding):
-// Windows pt-BR retorna stdout do dism/wsl em codepage 850/1252 (legacy DOS).
-// Node lê como UTF-8 → mojibake ("Manuten��o"). Prependamos `chcp 65001 > $null`
-// pra forçar a sessão PS pra UTF-8 ANTES de invocar a ferramenta. Inofensivo
-// pra comandos sem acentos.
-//
-// Bruno v0.2.9 (CAUSA 2 — exit 3010): DISM/wsl --install retornam 3010 quando
-// têm SUCESSO mas precisam reboot pra ativar. Tratamos como sucesso e flag
-// rebootRequired=true em vez de erro. Os steps que chamam powershellVerbose
-// devem checar `r.rebootRequired` no resultado.
-//
-// Exit codes conhecidos (relevantes p/ steps 01/02/03):
-//   0     sucesso, sem reboot
-//   740   ERROR_ELEVATION_REQUIRED — falta admin (manifest deve resolver em v0.2.7)
-//   50    DISM: feature já em estado desejado / não suportado
-//   3010  DISM/wsl --install: sucesso mas precisa reboot (tratado como OK)
-//   -1    wsl.exe: distro não instalada / erro genérico
+// Helper: powershellVerbose — wrap p/ chamadas PS que precisam de output rico.
+// Diferente do `powershell` cru: pré-chc 65001 (UTF-8) + enriquece erro com
+// stdout/stderr/exit code. Reaproveitado dos steps WSL antigos.
 // ───────────────────────────────────────────────────────────────────────
 async function powershellVerbose(script, opts = {}) {
-  // CAUSA 1 fix: força UTF-8 na sessão PS. `chcp 65001 > $null` muda code page
-  // do console pra UTF-8 antes do comando real, eliminando mojibake pt-BR na
-  // saída do dism/wsl. `$ErrorActionPreference = 'Continue'` garante que
-  // mudar chcp não derrube o script se algo der ruim no chcp (raríssimo).
   const wrapped = `chcp 65001 > $null; ${script}`;
   try {
     const r = await powershell(wrapped, opts);
-    // CAUSA 2 fix: alguns comandos (raro mas possível) retornam 3010 SEM throw
-    // — flag pra caller saber.
-    if (r && r.code === 3010) {
-      r.rebootRequired = true;
-    }
     return r;
   } catch (e) {
     const code = e.code != null ? e.code : '(unknown)';
     const stdout = (e.stdout || '').trim();
     const stderr = (e.stderr || '').trim();
-
-    // CAUSA 2 fix: exit 3010 NÃO é erro — é "sucesso, precisa reboot".
-    // Sintetiza um resultado de sucesso e devolve em vez de throw.
-    if (code === 3010) {
-      return {
-        stdout, stderr, code: 3010, rebootRequired: true,
-      };
-    }
-
     const parts = [
       `exit_code=${code}`,
       stdout ? `stdout=${stdout.slice(0, 1500)}` : 'stdout=(empty)',
       stderr ? `stderr=${stderr.slice(0, 1500)}` : 'stderr=(empty)',
     ];
-    // Hint específico pra erro 740 — orienta o user/dev sem cavar log.
-    if (code === 740 || /elevation|0x[0-9a-f]*2e4|ELEVATION_REQUIRED/i.test(stdout + stderr)) {
-      parts.push('hint=ELEVATION_REQUIRED (code 740) — manifest deveria forçar elevação no boot');
-    }
     const enriched = new Error(`${e.message} | ${parts.join(' | ')}`);
     enriched.code = code;
     enriched.stdout = stdout;
     enriched.stderr = stderr;
-    enriched.originalMessage = e.message;
     throw enriched;
   }
 }
 
-// Helper: detecta se `wsl --install` moderno está disponível neste Windows.
-// Win10 build 19041+ (Win10 21H2) e Win11 têm.
-//
-// Bruno v0.2.11 (live-test JOs em v0.2.10): a versão anterior dependia 100% de
-// regex `/--install/i` sobre `wsl --help`. FALHOU em Win10 19045 pt-BR porque:
-//   1) wsl --help em pt-BR não cita o flag literal "--install" em toda linha;
-//   2) UTF-16 LE + chcp 65001 ainda assim deixa stdout com chars NUL ou texto
-//      traduzido que o regex inglês não casa.
-// Resultado: falso-negativo → fallback dism legacy → mojibake + exit 1.
-//
-// Estratégia v0.2.11: testa via MÚLTIPLOS sinais, retorna na primeira evidência
-// positiva. Loga o motivo da decisão pra debug.
-//
-// Retorna: { supported: boolean, reason: string, evidence: object }
-async function wslInstallSupported(logger) {
-  const evidence = {};
-
-  // Sinal 1 — `wsl --version`: SÓ existe em wsl moderno (>=0.64, 19041+).
-  // Se retorna 0 e stdout menciona "WSL"/"kernel"/"distribu", é moderno.
-  // Bruno v0.2.12: wslExec direto (decode UTF-16 LE hard-coded) — antes
-  // powershell wrapper deixava mojibake mesmo com chcp 65001.
-  try {
-    const r = await wslExec(['--version'], { timeout: 10_000, logger });
-    evidence.version = { code: r.exit_code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
-    if (r.exit_code === 0 && /WSL|kernel|distribu|vers[aã]o/i.test(r.stdout || '')) {
-      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --version OK, stdout=${(r.stdout || '').slice(0, 120).replace(/\s+/g, ' ')})`);
-      return { supported: true, reason: 'wsl --version retornou ok', evidence };
-    }
-  } catch (e) {
-    evidence.version = { error: e.message };
-  }
-
-  // Sinal 2 — `wsl --help` com regex MAIS GENEROSA (pt-BR + en-US):
-  // procura "--install" OU "instalar" OU "Install" como palavra/subcomando.
-  try {
-    const r = await wslExec(['--help'], { timeout: 10_000, logger });
-    evidence.help = { code: r.exit_code, stdoutLen: (r.stdout || '').length, sample: (r.stdout || '').slice(0, 200) };
-    if (r.exit_code === 0 && /--install\b|\binstall\b|\binstalar\b|\binstale\b/i.test(r.stdout || '')) {
-      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: wsl --help menciona install/instalar)`);
-      return { supported: true, reason: 'wsl --help menciona install', evidence };
-    }
-  } catch (e) {
-    evidence.help = { error: e.message };
-  }
-
-  // Sinal 3 — fallback BUILD do Windows. >=19041 = wsl --install moderno.
-  // Win10 build 19045 (22H2 do JOs) > 19041 → MODERNO. Esse é o sinal mais
-  // confiável quando os 2 primeiros falham por encoding bizarro.
-  try {
-    const r = await powershell(`[Environment]::OSVersion.Version.Build`, { timeout: 5_000 });
-    const buildStr = (r.stdout || '').trim();
-    const build = parseInt(buildStr, 10);
-    evidence.build = { raw: buildStr, parsed: build, code: r.code };
-    if (Number.isFinite(build) && build >= 19041) {
-      if (logger) logger.info('wslInstallSupported', `decisão: MODERNO (sinal: build ${build} >= 19041)`);
-      return { supported: true, reason: `build ${build} >= 19041`, evidence };
-    }
-    if (Number.isFinite(build) && build < 19041) {
-      if (logger) logger.info('wslInstallSupported', `decisão: LEGACY (build ${build} < 19041)`);
-      return { supported: false, reason: `build ${build} < 19041`, evidence };
-    }
-  } catch (e) {
-    evidence.build = { error: e.message, code: e.code };
-  }
-
-  if (logger) logger.warn('wslInstallSupported', `decisão: LEGACY (nenhum sinal confirmou suporte) evidence=${JSON.stringify(evidence).slice(0, 400)}`);
-  return { supported: false, reason: 'nenhum sinal positivo', evidence };
-}
-
-// Helper: lista distros instaladas. Usa wslExec direto (decode UTF-16 LE
-// hard-coded) em vez de PS wrapper que sofria mojibake mesmo com chcp 65001.
-// Mantém shape { stdout, stderr, code } pra não quebrar callers.
-async function wslListVerbose() {
-  const r = await wslExec(['-l', '-v'], { timeout: 15_000 });
-  return { stdout: r.stdout, stderr: r.stderr, code: r.exit_code };
-}
-
 // ───────────────────────────────────────────────────────────────────────
-// discoverUbuntuDistroName — lista distros DISPONÍVEIS via `wsl --list --online`
-// e escolhe o melhor candidato Ubuntu.
-//
-// Bruno v0.2.12 (live-test JOs em v0.2.11):
-// Em algumas instalações Win10 (especialmente pt-BR), o nome canônico
-// `Ubuntu-22.04` NÃO está disponível no catálogo online — wsl --install -d
-// retorna "Nome de distribuição inválido". Precisamos descobrir dinamicamente
-// quais nomes Ubuntu o `wsl.exe` deste host reconhece.
-//
-// Output típico de `wsl --list --online`:
-//   NAME            FRIENDLY NAME
-//   Ubuntu          Ubuntu
-//   Ubuntu-24.04    Ubuntu 24.04 LTS
-//   Ubuntu-22.04    Ubuntu 22.04 LTS
-//   ...
-//
-// Prioridade: 22.04 > 24.04 > 20.04 > Ubuntu (sem versão) > primeiro Ubuntu*.
-//
-// Retorna: string com NAME (ex: 'Ubuntu-22.04') ou null se não conseguiu listar
-// ou nenhum Ubuntu foi encontrado.
-async function discoverUbuntuDistroName(logger) {
-  const r = await wslExec(['--list', '--online'], { timeout: 15_000 });
-  if (r.exit_code !== 0) {
-    if (logger) logger.warn('discoverUbuntuDistroName',
-      `wsl --list --online falhou: exit=${r.exit_code} stderr=${(r.stderr || '').slice(0, 200)}`);
-    return null;
-  }
-  const lines = (r.stdout || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  // Primeiro token de cada linha = NAME. Pega só linhas que começam com "Ubuntu".
-  const names = lines
-    .map(l => l.split(/\s+/)[0])
-    .filter(n => /^Ubuntu/i.test(n) && n !== 'NAME');
-  if (!names.length) {
-    if (logger) logger.warn('discoverUbuntuDistroName',
-      `nenhum Ubuntu no catálogo. stdout=${(r.stdout || '').slice(0, 400)}`);
-    return null;
-  }
-  const priority = ['Ubuntu-22.04', 'Ubuntu-24.04', 'Ubuntu-20.04', 'Ubuntu'];
-  for (const want of priority) {
-    const found = names.find(n => n.toLowerCase() === want.toLowerCase());
-    if (found) {
-      if (logger) logger.info('discoverUbuntuDistroName',
-        `escolhido por prioridade: ${found} (disponíveis: ${names.join(', ')})`);
-      return found;
-    }
-  }
-  if (logger) logger.info('discoverUbuntuDistroName',
-    `fallback primeiro Ubuntu*: ${names[0]} (disponíveis: ${names.join(', ')})`);
-  return names[0];
-}
-
-// Each executor exports: { id, title, description, category, detect, execute, validate, manualInstructions? }
-//   detect():    Promise<boolean>  — true if step is already done (skip).
-//   execute():   Promise<void>     — perform work. May throw to mark error.
-//   validate():  Promise<boolean>  — confirm completion. False -> mark error.
-//   category:    'AUTO' | 'MANUAL' | 'HYBRID'
-//
-// `ctx` is passed at runtime and contains: { state, save, logger, events, requestSudoPassword, ... }
-
-const FOLDER_MARKER = '.imp-installer-managed';
-
-// ───────────────────────────────────────────────────────────────────────
-// Admin gate (Bruno — live-test #3, v0.2.4 -> v0.2.5)
-//
-// Steps 01/02/03 manipulam o Windows (dism enable-feature, wsl --install,
-// wsl --set-default-version) e EXIGEM token de admin. Se o EXE não estiver
-// elevado, throw error com flag NEEDS_ADMIN — main.js intercepta e emite
-// `installer:onNeedsAdmin` em vez do onError genérico, pra UI mostrar o
-// modal-elevate (botão "Reabrir como administrador") em vez do modal-error.
+// Admin gate. Steps X1/X2 podem precisar (AV exclusion via Add-MpPreference,
+// junction em LOCALAPPDATA opera sem admin mas exclusion sim).
 // ───────────────────────────────────────────────────────────────────────
 async function requireAdminOrThrow() {
   const elevated = await isElevated();
@@ -331,20 +172,587 @@ async function requireAdminOrThrow() {
   }
 }
 
-function makeMarker(bashPathExpr) {
-  return `mkdir -p ${bashPathExpr} && touch ${bashPathExpr}/${FOLDER_MARKER}`;
+// ───────────────────────────────────────────────────────────────────────
+// Helper: checkFreeSpace(drivePath, minGb) → { ok, freeGb }
+// Patrícia N8: SEMPRE checa o drive da PASTA-DESTINO, nunca fixo em C:.
+// ───────────────────────────────────────────────────────────────────────
+async function checkFreeSpace(targetPath, minGb = MIN_FREE_GB) {
+  const drive = path.parse(targetPath).root.replace(/\\$/, ''); // "C:"
+  const letter = drive.replace(':', '');
+  const script = `[math]::Round((Get-PSDrive ${letter}).Free / 1GB, 2)`;
+  try {
+    const r = await powershell(script, { timeout: 15_000 });
+    const free = parseFloat((r.stdout || '').trim());
+    if (!Number.isFinite(free)) {
+      return { ok: false, freeGb: NaN, drive, error: 'Get-PSDrive não retornou valor numérico' };
+    }
+    return { ok: free >= minGb, freeGb: free, drive, minGb };
+  } catch (e) {
+    return { ok: false, freeGb: NaN, drive, error: e.message };
+  }
 }
 
-// -------- step 00 — preflight ---------------------------------------------
+// ───────────────────────────────────────────────────────────────────────
+// Helper: copyRuntimeWithProgress(srcArchive, destDir, onProgress)
+//
+// Estratégia (Patrícia N6): UM .7z sólido + extrai em TEMP + MOVE pra destino
+// final. Isso faz o AV escanear UMA vez (no .7z baixado e arquivo TEMP), em
+// vez de cada um dos 50K binários extraídos.
+//
+// onProgress recebe { pct, bytesDone, totalBytes, phase }.
+//   phase: 'preflight' | 'extracting' | 'moving' | 'done'
+//
+// Suporta .7z (via 7za.exe se disponível, fallback Expand-Archive p/ .zip)
+// e .zip (Expand-Archive direto).
+// ───────────────────────────────────────────────────────────────────────
+async function copyRuntimeWithProgress(srcArchive, destDir, onProgress) {
+  const fire = (payload) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress(payload); } catch (_) {}
+    }
+  };
+
+  // Preflight: tamanho do arquivo origem (pra estimar progresso).
+  let totalBytes = 0;
+  try { totalBytes = fs.statSync(srcArchive).size; } catch (_) {}
+
+  fire({ pct: 0, bytesDone: 0, totalBytes, phase: 'preflight' });
+
+  // Cria destDir se não existe (parent dir do version-dir já deve existir).
+  fs.mkdirSync(destDir, { recursive: true });
+
+  // Decide extrator pelo extension.
+  const ext = path.extname(srcArchive).toLowerCase();
+  const isZip = ext === '.zip';
+  const is7z = ext === '.7z';
+  const isTarZst = srcArchive.endsWith('.tar.zst');
+
+  // Pasta TEMP intermediária — extração rápida, depois move atomicamente.
+  // Mesma partição que destino (move sem cópia) sempre que possível.
+  const tempBase = path.join(path.dirname(destDir), `.extracting-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(tempBase, { recursive: true });
+
+  // Marca atômica (Patrícia N27): se essa pasta existe na próxima abertura,
+  // sabemos que a extração foi interrompida.
+  const flagFile = path.join(destDir, '.extracting');
+  try { fs.writeFileSync(flagFile, String(Date.now())); } catch (_) {}
+
+  let extractScript;
+  if (isZip) {
+    // Expand-Archive nativo. Suporta progresso via Write-Progress, mas sem
+    // captura prática aqui. Emitimos progresso mock baseado em tempo.
+    extractScript = `
+      $ErrorActionPreference = 'Stop'
+      Expand-Archive -LiteralPath '${srcArchive.replace(/'/g, "''")}' -DestinationPath '${tempBase.replace(/'/g, "''")}' -Force
+      'OK'
+    `;
+  } else if (is7z) {
+    // Tenta 7za.exe embarcado (extraResources/tools/7za.exe), depois 7z.exe do PATH.
+    extractScript = `
+      $ErrorActionPreference = 'Stop'
+      $cands = @(
+        (Join-Path $PSScriptRoot '7za.exe'),
+        (Join-Path '${(process.resourcesPath || '').replace(/'/g, "''")}' 'tools/7za.exe'),
+        '7za.exe', '7z.exe'
+      )
+      $exe = $null
+      foreach ($c in $cands) {
+        if ($c -and (Test-Path $c)) { $exe = $c; break }
+        $cmd = Get-Command $c -ErrorAction SilentlyContinue
+        if ($cmd) { $exe = $cmd.Source; break }
+      }
+      if (-not $exe) { throw 'RUNTIME_7Z_TOOL_MISSING: nem 7za nem 7z encontrados' }
+      & $exe x -y -bsp1 -o'${tempBase.replace(/'/g, "''")}' '${srcArchive.replace(/'/g, "''")}'
+      if ($LASTEXITCODE -ne 0) { throw "7za exit $LASTEXITCODE" }
+      'OK'
+    `;
+  } else if (isTarZst) {
+    // Última opção — requer tar.exe (Win10 17063+) + zstd extension. Não cobrimos
+    // amplamente; assumimos zip ou 7z. Falha clara se chegar aqui sem suporte.
+    extractScript = `
+      $ErrorActionPreference = 'Stop'
+      throw 'RUNTIME_ARCHIVE_FORMAT_UNSUPPORTED: tar.zst não suportado nesta versão. Use .7z ou .zip.'
+    `;
+  } else {
+    throw new Error(`RUNTIME_ARCHIVE_FORMAT_UNSUPPORTED: extensão desconhecida ${ext}`);
+  }
+
+  fire({ pct: 5, bytesDone: 0, totalBytes, phase: 'extracting' });
+
+  // Roda extração — não temos hook real de progresso da PS, mas emitimos
+  // marcadores temporais pra UI não parecer travada.
+  let extractTimer = null;
+  let fakePct = 5;
+  if (typeof onProgress === 'function') {
+    extractTimer = setInterval(() => {
+      fakePct = Math.min(80, fakePct + 2);
+      fire({ pct: fakePct, bytesDone: Math.floor(totalBytes * fakePct / 100), totalBytes, phase: 'extracting' });
+    }, 2000);
+  }
+
+  try {
+    await powershellVerbose(extractScript, { timeout: 1800_000 }); // 30min cap
+  } catch (e) {
+    if (extractTimer) clearInterval(extractTimer);
+    // Limpa pasta de extração parcial
+    try { fs.rmSync(tempBase, { recursive: true, force: true }); } catch (_) {}
+    // Mensagem amigável p/ disco cheio durante extração
+    if (/ENOSPC|no space|disk full/i.test(e.message || '')) {
+      const err = new Error(`RUNTIME_DISK_FULL: disco encheu durante extração. ${e.message}`);
+      err.code = 'RUNTIME_DISK_FULL';
+      throw err;
+    }
+    // AV pode ter agido — re-lança erro com hint
+    if (/access.*denied|cannot find|virus/i.test(e.message || '')) {
+      const err = new Error(`AV_QUARANTINE: antivírus pode ter removido binários durante extração. ${e.message}`);
+      err.code = 'AV_QUARANTINE';
+      throw err;
+    }
+    throw e;
+  }
+  if (extractTimer) clearInterval(extractTimer);
+
+  fire({ pct: 85, bytesDone: totalBytes, totalBytes, phase: 'moving' });
+
+  // Move conteúdo do tempBase pra destDir. Se tempBase contém UMA pasta
+  // (típico: msys64/ ou runtime/), move o conteúdo dela; senão move tudo.
+  const tempEntries = fs.readdirSync(tempBase);
+  let srcDir = tempBase;
+  if (tempEntries.length === 1) {
+    const single = path.join(tempBase, tempEntries[0]);
+    if (fs.statSync(single).isDirectory()) {
+      // Heurística: se essa pasta única é "runtime", desce mais um nível.
+      if (/^runtime$/i.test(tempEntries[0])) {
+        srcDir = single;
+      }
+    }
+  }
+
+  // Move atomicamente cada entry de srcDir pra destDir.
+  for (const entry of fs.readdirSync(srcDir)) {
+    const from = path.join(srcDir, entry);
+    const to = path.join(destDir, entry);
+    try {
+      fs.renameSync(from, to);
+    } catch (e) {
+      // Cross-device? Fallback: cópia recursiva.
+      if (e.code === 'EXDEV' || e.code === 'EPERM') {
+        try { fs.cpSync(from, to, { recursive: true, force: true }); }
+        catch (e2) { throw e2; }
+        try { fs.rmSync(from, { recursive: true, force: true }); } catch (_) {}
+      } else if (e.code === 'EEXIST') {
+        // Destino já existe (re-run idempotente) — sobrescreve.
+        fs.rmSync(to, { recursive: true, force: true });
+        fs.renameSync(from, to);
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  // Cleanup do tempBase
+  try { fs.rmSync(tempBase, { recursive: true, force: true }); } catch (_) {}
+  try { fs.unlinkSync(flagFile); } catch (_) {}
+
+  fire({ pct: 100, bytesDone: totalBytes, totalBytes, phase: 'done' });
+  return { ok: true, destDir };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: createJunction(linkPath, targetPath)
+// Cria junction NTFS (não requer admin nem dev-mode) apontando linkPath →
+// targetPath. Idempotente: remove link antigo se existir.
+// ───────────────────────────────────────────────────────────────────────
+async function createJunction(linkPath, targetPath) {
+  // Remove existing junction/dir if present
+  try {
+    const st = fs.lstatSync(linkPath);
+    if (st.isDirectory() || st.isSymbolicLink()) {
+      // Em Windows, rmSync funciona pra junction também.
+      fs.rmSync(linkPath, { recursive: true, force: true });
+    }
+  } catch (_) {}
+
+  // mklink /J via cmd.exe (PowerShell New-Item -ItemType Junction também
+  // funciona, mas mklink /J é mais antigo e confiável).
+  const script = `cmd.exe /c mklink /J "${linkPath.replace(/"/g, '""')}" "${targetPath.replace(/"/g, '""')}"`;
+  await powershellVerbose(script, { timeout: 15_000 });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: detectAv() — descobre status do Defender e antivírus de terceiros.
+// Retorna: { defender: bool, real_time_active: bool, third_party_name: string|null,
+//           exclusion_added: bool }
+// Patrícia N2, N20, E3.
+// ───────────────────────────────────────────────────────────────────────
+async function detectAv() {
+  const result = {
+    defender: false,
+    real_time_active: false,
+    third_party_name: null,
+    exclusion_added: false,
+  };
+
+  // 1) Defender via Get-MpComputerStatus
+  try {
+    const r = await powershell(`
+      try {
+        $s = Get-MpComputerStatus -ErrorAction Stop
+        '' + $s.AntivirusEnabled + '|' + $s.RealTimeProtectionEnabled
+      } catch { 'unavail|unavail' }
+    `, { timeout: 15_000 });
+    const parts = (r.stdout || '').trim().split('|');
+    if (parts.length === 2 && parts[0] !== 'unavail') {
+      result.defender = /true/i.test(parts[0]);
+      result.real_time_active = /true/i.test(parts[1]);
+    }
+  } catch (_) {}
+
+  // 2) Antivírus de terceiros via SecurityCenter2
+  try {
+    const r = await powershell(`
+      try {
+        $av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop
+        $names = @($av | Where-Object { $_.displayName -notmatch 'Defender|Windows Defender' } | ForEach-Object { $_.displayName })
+        if ($names.Count -gt 0) { $names -join ',' } else { '' }
+      } catch { '' }
+    `, { timeout: 15_000 });
+    const names = (r.stdout || '').trim();
+    if (names) result.third_party_name = names.split(',')[0];
+  } catch (_) {}
+
+  return result;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: detectAppLocker() — descobre se há regras AppLocker restritivas
+// que possam bloquear binários em LOCALAPPDATA.
+// Retorna: { policy_present: bool, blocks_localappdata: bool, raw_xml: string|null }
+// Patrícia N1.
+// ───────────────────────────────────────────────────────────────────────
+async function detectAppLocker() {
+  const result = { policy_present: false, blocks_localappdata: false, raw_xml: null };
+  try {
+    const r = await powershell(`
+      try {
+        $p = Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop
+        if ($p) { $p } else { '' }
+      } catch { '' }
+    `, { timeout: 20_000 });
+    const xml = (r.stdout || '').trim();
+    if (xml && /<AppLockerPolicy/i.test(xml)) {
+      result.policy_present = true;
+      result.raw_xml = xml.slice(0, 4000); // cap pra log
+      // Heurística simples: regra Deny com path LOCALAPPDATA, ou Allow MUITO
+      // restritiva (sem entries que cubram nossa pasta).
+      if (/<FilePathRule[^>]*Action="Deny"[^>]*Path="[^"]*LOCALAPPDATA/i.test(xml)
+          || /<FilePathRule[^>]*Action="Deny"[^>]*Path="[^"]*%LOCALAPPDATA%/i.test(xml)
+          || /<FilePathRule[^>]*Action="Deny"[^>]*Path="\*\\AppData\\Local/i.test(xml)) {
+        result.blocks_localappdata = true;
+      }
+    }
+  } catch (_) {}
+  return result;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: addDefenderExclusion(folderPath) — Add-MpPreference -ExclusionPath
+// REQUER admin. Patrícia N2 + N20.
+// Retorna { ok: bool, error?: string }.
+// ───────────────────────────────────────────────────────────────────────
+async function addDefenderExclusion(folderPath) {
+  if (!(await isElevated())) {
+    return { ok: false, error: 'NEEDS_ADMIN: Add-MpPreference exige administrador' };
+  }
+  try {
+    const script = `
+      try {
+        Add-MpPreference -ExclusionPath '${folderPath.replace(/'/g, "''")}' -ErrorAction Stop
+        Add-MpPreference -ExclusionProcess 'bash.exe','tmux.exe','node.exe','git.exe' -ErrorAction SilentlyContinue
+        'OK'
+      } catch { "ERR: $($_.Exception.Message)" }
+    `;
+    const r = await powershell(script, { timeout: 30_000 });
+    if (/^OK\s*$/m.test(r.stdout || '')) {
+      return { ok: true };
+    }
+    return { ok: false, error: (r.stdout || '').trim() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: launchTmuxSquadSession(runtimeHome) — cria/recria sessão tmux `imp`
+// com 7 painéis (1 main + 6 personas). Usa bash do MSYS2 embarcado, claude.exe
+// nativo Windows com CLAUDE_CODE_GIT_BASH_PATH apontando pro bash MSYS2.
+//
+// Reuso do step_14 antigo (lider/arquiteto/criativo/debugger/qa/revisor) mas
+// agora roda dentro do bash embarcado em vez de WSL.
+// ───────────────────────────────────────────────────────────────────────
+async function launchTmuxSquadSession(runtimeHome, opts = {}) {
+  const bash = resolveRuntimeBin(runtimeHome, [['msys64', 'usr', 'bin', 'bash.exe']]);
+  if (!bash) {
+    throw new Error('RUNTIME_BASH_MISSING: bash.exe do MSYS2 não encontrado em ' + runtimeHome);
+  }
+
+  // Pastas das personas. Esperado: runtime/squad-seed/imp-squad/<persona>
+  const squadRoot = path.join(runtimeHome, 'squad-seed', 'imp-squad');
+  const orchRoot = path.join(runtimeHome, 'squad-seed', 'imp-orchestrator');
+
+  // bash espera paths POSIX. Conversão simples: drive letter → /<letter>/...
+  const winToPosix = (p) => {
+    const m = p.match(/^([A-Za-z]):[\\/](.*)$/);
+    if (!m) return p.replace(/\\/g, '/');
+    return `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+  };
+
+  const squadRootPosix = winToPosix(squadRoot);
+  const orchRootPosix = winToPosix(orchRoot);
+
+  // Script — mata sessão `imp` antiga e recria.
+  const personasList = TMUX_PERSONAS.join(' ');
+  const script = `
+    set -e
+    SESSION="imp"
+    SQUAD_ROOT="${squadRootPosix}"
+    ORCH_ROOT="${orchRootPosix}"
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      tmux kill-session -t "$SESSION"
+    fi
+    tmux new-session -d -s "$SESSION" -n agents -c "$SQUAD_ROOT/lider"
+    for dir in ${TMUX_PERSONAS.slice(1).join(' ')}; do
+      tmux split-window -t "$SESSION" -c "$SQUAD_ROOT/$dir"
+      tmux select-layout -t "$SESSION" tiled
+    done
+    tmux split-window -t "$SESSION" -c "$ORCH_ROOT"
+    tmux select-layout -t "$SESSION" tiled
+    tmux set -t "$SESSION" -g pane-border-status top
+    PANES=( $(tmux list-panes -t "$SESSION" -F '#{pane_id}') )
+    LABELS=(${TMUX_PERSONAS.join(' ')} main)
+    for i in "\${!PANES[@]}"; do
+      tmux select-pane -t "\${PANES[$i]}" -T "\${LABELS[$i]}"
+    done
+    for pid in "\${PANES[@]}"; do
+      tmux send-keys -t "$pid" 'claude' C-m
+    done
+  `;
+
+  // Env isolado — IMP_RUNTIME_HOME + CLAUDE_CODE_GIT_BASH_PATH + PATH prepend
+  const claudeExe = resolveRuntimeBin(runtimeHome, RUNTIME_CLAUDE_CANDIDATES);
+  const nodeExe = resolveRuntimeBin(runtimeHome, RUNTIME_NODE_CANDIDATES);
+  const env = {
+    ...process.env,
+    IMP_RUNTIME_HOME: runtimeHome,
+    HOME: path.join(runtimeHome, 'home', os.userInfo().username || 'user'),
+    MSYSTEM: 'MSYS',
+    CLAUDE_CODE_GIT_BASH_PATH: bash,
+    PATH: [
+      path.join(runtimeHome, 'msys64', 'usr', 'bin'),
+      claudeExe ? path.dirname(claudeExe) : '',
+      nodeExe ? path.dirname(nodeExe) : '',
+      process.env.PATH || '',
+    ].filter(Boolean).join(';'),
+  };
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bash, ['-lc', script], {
+      env,
+      windowsHide: true,
+      timeout: opts.timeout || 60_000,
+    });
+    let stdout = '', stderr = '';
+    proc.stdout && proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr && proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        const err = new Error(`tmux launch falhou (exit ${code}): ${stderr.slice(0, 500)}`);
+        err.code = code;
+        err.stdout = stdout;
+        err.stderr = stderr;
+        return reject(err);
+      }
+      resolve({ ok: true, stdout, stderr });
+    });
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: createDesktopShortcut(targetPath, name) — cria .lnk no Desktop.
+// Usa WScript.Shell via PowerShell. Patrícia N13 (fallback se COM falhar).
+// ───────────────────────────────────────────────────────────────────────
+async function createDesktopShortcut(targetPath, name) {
+  const safeName = String(name || 'IMP Squad').replace(/[\\/:*?"<>|]/g, '_');
+  const ps = `
+    $ErrorActionPreference = 'Stop'
+    $Desktop = [Environment]::GetFolderPath("Desktop")
+    $LnkPath = Join-Path $Desktop '${safeName.replace(/'/g, "''")}.lnk'
+    try {
+      $WshShell = New-Object -ComObject WScript.Shell
+      $Shortcut = $WshShell.CreateShortcut($LnkPath)
+      $Shortcut.TargetPath       = '${targetPath.replace(/'/g, "''")}'
+      $Shortcut.WorkingDirectory = '${path.dirname(targetPath).replace(/'/g, "''")}'
+      $Shortcut.IconLocation     = '${targetPath.replace(/'/g, "''")},0'
+      $Shortcut.Description      = 'IMP Squad — sessão tmux com 7 Claudes'
+      $Shortcut.Save()
+      'OK:' + $LnkPath
+    } catch {
+      # Fallback (Patrícia N13): cria .cmd manual no Desktop
+      $CmdPath = Join-Path $Desktop '${safeName.replace(/'/g, "''")}.cmd'
+      Set-Content -Path $CmdPath -Value ('@echo off' + "\`r\`n" + 'start "" "${targetPath.replace(/\\/g, '\\\\').replace(/'/g, "''")}"')
+      'FALLBACK:' + $CmdPath
+    }
+  `;
+  const r = await powershellVerbose(ps, { timeout: 30_000 });
+  return { ok: true, raw: (r.stdout || '').trim() };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: writeImpSquadBat — gera o wrapper `imp-squad.bat` isolando PATH.
+// Marcos §5: única var "global" tocada é IMP_RUNTIME_HOME via HKCU.
+// ───────────────────────────────────────────────────────────────────────
+function writeImpSquadBat(runtimeHome) {
+  const batPath = path.join(runtimeHome, 'scripts', 'imp-squad.bat');
+  fs.mkdirSync(path.dirname(batPath), { recursive: true });
+  const bashRel = path.join('msys64', 'usr', 'bin', 'bash.exe');
+  const content = [
+    '@echo off',
+    `set IMP_RUNTIME_HOME=${runtimeHome}`,
+    `set PATH=%IMP_RUNTIME_HOME%\\msys64\\usr\\bin;%IMP_RUNTIME_HOME%\\node;%IMP_RUNTIME_HOME%\\claude-cli;%PATH%`,
+    'set MSYSTEM=MSYS',
+    'set HOME=%IMP_RUNTIME_HOME%\\home\\%USERNAME%',
+    `set CLAUDE_CODE_GIT_BASH_PATH=%IMP_RUNTIME_HOME%\\${bashRel}`,
+    `"%IMP_RUNTIME_HOME%\\${bashRel}" --login -i %*`,
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(batPath, content, 'utf8');
+  return batPath;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: writeSetupSh — gera setup.sh idempotente que cria HOME, .bashrc,
+// configura locale UTF-8 (Patrícia N11), valida tmux/git/node/claude.
+// ───────────────────────────────────────────────────────────────────────
+function writeSetupSh(runtimeHome) {
+  const setupPath = path.join(runtimeHome, 'scripts', 'setup.sh');
+  fs.mkdirSync(path.dirname(setupPath), { recursive: true });
+  const content = `#!/usr/bin/env bash
+# setup.sh — preparado pelo instalador IMP Squad (idempotente)
+set -e
+RUNTIME="\${IMP_RUNTIME_HOME:-/c/Users/\${USERNAME:-user}/AppData/Local/IMP-Squad-Runtime/current}"
+USER_NAME="\${USERNAME:-user}"
+HOME_DIR="$RUNTIME/home/$USER_NAME"
+mkdir -p "$HOME_DIR"
+mkdir -p "$RUNTIME/msys64/tmp" 2>/dev/null || true
+
+# .bashrc minimal (idempotente)
+if [ ! -f "$HOME_DIR/.bashrc" ]; then
+  cat > "$HOME_DIR/.bashrc" <<'BASHRC'
+# IMP Squad runtime bashrc
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export LC_TIME=C
+export PATH="$IMP_RUNTIME_HOME/msys64/usr/bin:$IMP_RUNTIME_HOME/node:$IMP_RUNTIME_HOME/claude-cli:$PATH"
+alias ll='ls -la'
+BASHRC
+fi
+
+# Smoke test
+echo "[setup] bash: $(bash --version | head -1)"
+command -v tmux >/dev/null && echo "[setup] tmux: $(tmux -V)" || echo "[setup] WARN: tmux ausente"
+command -v git >/dev/null  && echo "[setup] git:  $(git --version)" || echo "[setup] WARN: git ausente"
+
+# Marca setup completo
+touch "$RUNTIME/.setup-done"
+echo "[setup] OK"
+`;
+  fs.writeFileSync(setupPath, content, 'utf8');
+  return setupPath;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: runSetupSh(runtimeHome) — invoca setup.sh dentro do bash embarcado.
+// ───────────────────────────────────────────────────────────────────────
+async function runSetupSh(runtimeHome) {
+  const bash = resolveRuntimeBin(runtimeHome, [['msys64', 'usr', 'bin', 'bash.exe']]);
+  if (!bash) throw new Error('RUNTIME_BASH_MISSING: bash não encontrado em ' + runtimeHome);
+  const setupPath = path.join(runtimeHome, 'scripts', 'setup.sh');
+  const winToPosix = (p) => {
+    const m = p.match(/^([A-Za-z]):[\\/](.*)$/);
+    if (!m) return p.replace(/\\/g, '/');
+    return `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+  };
+  return new Promise((resolve, reject) => {
+    const env = {
+      ...process.env,
+      IMP_RUNTIME_HOME: runtimeHome,
+      MSYSTEM: 'MSYS',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+    };
+    const proc = spawn(bash, ['-lc', winToPosix(setupPath)], {
+      env, windowsHide: true, timeout: 60_000,
+    });
+    let stdout = '', stderr = '';
+    proc.stdout && proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr && proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        const err = new Error(`setup.sh falhou (exit ${code}): ${stderr.slice(0, 500)}`);
+        err.code = code;
+        err.stdout = stdout;
+        err.stderr = stderr;
+        return reject(err);
+      }
+      resolve({ ok: true, stdout, stderr });
+    });
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Helper: ghAuthStatus(runtimeHome) — checa se gh já está logado.
+// Usa o gh embarcado em runtime/gh ou no msys64 binPath.
+// ───────────────────────────────────────────────────────────────────────
+async function ghAuthStatus(runtimeHome) {
+  const bash = resolveRuntimeBin(runtimeHome, [['msys64', 'usr', 'bin', 'bash.exe']]);
+  if (!bash) return { logged_in: false, reason: 'bash missing' };
+  return new Promise((resolve) => {
+    const env = {
+      ...process.env,
+      IMP_RUNTIME_HOME: runtimeHome,
+      MSYSTEM: 'MSYS',
+      HOME: path.join(runtimeHome, 'home', os.userInfo().username || 'user'),
+      PATH: [
+        path.join(runtimeHome, 'msys64', 'usr', 'bin'),
+        process.env.PATH || '',
+      ].filter(Boolean).join(';'),
+    };
+    const proc = spawn(bash, ['-lc', 'gh auth status 2>&1 || true'], {
+      env, windowsHide: true, timeout: 15_000,
+    });
+    let out = '';
+    proc.stdout && proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr && proc.stderr.on('data', (d) => { out += d.toString(); });
+    proc.on('error', () => resolve({ logged_in: false, reason: 'spawn error' }));
+    proc.on('close', () => {
+      resolve({ logged_in: /Logged in to github\.com/i.test(out), raw: out.slice(0, 300) });
+    });
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// STEPS — 5 novos. step_00 preflight é PRESERVADO (genérico).
+// ───────────────────────────────────────────────────────────────────────
+
+// -------- step 00 — preflight (PRESERVADO) --------------------------------
 const step00Preflight = {
   id: 'step_00_preflight',
   title: 'Pré-flight (Windows / admin / disco / internet)',
-  description: 'Confere Windows version, admin, disco, internet e virtualização antes de começar.',
+  description: 'Confere Windows version, admin, disco, internet antes de copiar runtime.',
   category: 'AUTO',
-  async detect(ctx) {
-    // Always re-run preflight on each session; cheap and catches drift (disk filled, AV came online).
-    return false;
-  },
+  async detect(ctx) { return false; },
   async execute(ctx) {
     const r = await preflight.runAll({ logger: ctx.logger });
     ctx._preflight = r;
@@ -358,1373 +766,374 @@ const step00Preflight = {
   },
 };
 
-// ───────────────────────────────────────────────────────────────────────
-// Bruno v0.2.9 — REFATORAÇÃO steps 01/02/03 (live-test #2)
-//
-// CAUSA RAIZ (live-test JOs em v0.2.8): dism.exe /enable-feature falhava em
-// ~29.4% com exit 1, stderr vazio, stdout em mojibake pt-BR ("Manuten��o").
-// Diagnóstico cirúrgico identificou 3 fatores:
-//   1) Encoding pt-BR (cp850/1252) lido como UTF-8 → mojibake
-//   2) Exit 3010 (sucesso-com-reboot) tratado como erro
-//   3) Abordagem dism+wsl --set-default+wsl --install (3 passos) é a forma
-//      ANTIGA. Microsoft recomenda `wsl --install` desde Win10 19041 (2021),
-//      que faz tudo numa tacada e gerencia reboot.
-//
-// ESTRATÉGIA CONSERVADORA: preservamos os 3 IDs (step_01/02/03) pra não quebrar
-// state.json existente nem a UI da Camila (wizard.js mapeia por ID). Mas:
-//   - step_01 agora faz TUDO (wsl --install ou fallback dism)
-//   - step_02 e step_03 viram NO-OPs (detect=true após step_01)
-//
-// Compatibilidade total com state.json antigo (steps já 'done' continuam done).
-// ───────────────────────────────────────────────────────────────────────
-
-// Compartilhado: marca reboot + agenda RunOnce. Idempotente.
-async function _markRebootAndScheduleRunOnce(ctx, stepId, reason) {
-  ctx.state.rebootRequired = true;
-  ctx.state.rebootDone = false;
-  if (reason) {
-    ctx.state.rebootRequiredReason = reason;
-    ctx.state.rebootBlockingReason = reason; // legacy alias usado pela UI v0.2.16
-  }
-  // Bruno (noturna 2026-05-27): contador pra detectar loop infinito de reboot.
-  ctx.state.rebootCount = (ctx.state.rebootCount || 0) + 1;
-  ctx.save();
-  // Eduardo lastmile v0.2.17: emite onScreen('reboot') pra UI MOSTRAR a tela
-  // dedicada da Camila com botão "Salvar e reiniciar". Antes caía no modal
-  // de erro genérico — JOs perdia a tela bonita.
-  if (ctx.events && typeof ctx.events.onScreen === 'function') {
-    try { ctx.events.onScreen({ screen: 'reboot', stepId, reason: reason || ctx.state.rebootBlockingReason }); }
-    catch (_) {}
-  }
-  if (ctx.state.rebootCount > 3) {
-    ctx.logger.error(stepId, `WSL_TOO_MANY_REBOOTS — ${ctx.state.rebootCount} reboots e ainda não funcional`);
-    const err = new Error(`Reinícios excessivos (${ctx.state.rebootCount}). Algo no Windows está impedindo o WSL — peça ajuda manual.`);
-    err.code = 'WSL_TOO_MANY_REBOOTS';
-    throw err;
-  }
-  if (ctx.exePath) {
-    try {
-      await scheduleRunOnceAfterReboot(ctx.exePath);
-      ctx.logger.info(stepId, 'RunOnce agendado — instalador re-abre após reboot');
-    } catch (e) {
-      ctx.logger.warn(stepId, `RunOnce schedule falhou: ${e.message}`);
-    }
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────
-// ensureFeatures — garante Microsoft-Windows-Subsystem-Linux + VirtualMachinePlatform
-// habilitadas no Windows.
-//
-// Bruno (noturna 2026-05-27): MSI moderno do WSL exige essas duas features
-// habilitadas. Em Win10 19045 com inbox legacy a feature WSL já está ON
-// (foi assim que o inbox apareceu), mas VirtualMachinePlatform pode não estar.
-//
-// Idempotente: dism /enable-feature em feature já enabled retorna rápido (exit 0).
-// dism pode retornar 3010 (sucesso + reboot pendente). Tratamos como sucesso e
-// sinalizamos pro caller via state.featuresEnabled.
-//
-// Atualiza ctx.state.featuresEnabled = { wsl, vmp, checkedAt }.
-// Retorna: true se AMBAS estão Enabled (não Pending); false se alguma precisa reboot.
-async function ensureFeatures(ctx) {
-  ctx.logger.info('ensureFeatures', 'dism /enable-feature Microsoft-Windows-Subsystem-Linux');
-  try {
-    await powershellVerbose(
-      `dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`,
-      { timeout: 600_000 }
-    );
-  } catch (e) {
-    // exit 3010 já é tratado como sucesso por powershellVerbose; outro exit = erro real.
-    ctx.logger.warn('ensureFeatures', `dism Microsoft-Windows-Subsystem-Linux: ${e.message}`);
-  }
-
-  ctx.logger.info('ensureFeatures', 'dism /enable-feature VirtualMachinePlatform');
-  try {
-    await powershellVerbose(
-      `dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`,
-      { timeout: 600_000 }
-    );
-  } catch (e) {
-    ctx.logger.warn('ensureFeatures', `dism VirtualMachinePlatform: ${e.message}`);
-  }
-
-  // Checa estado REAL via Get-WindowsOptionalFeature (não basta dism retornar 0).
-  let wslEnabled = false;
-  let vmpEnabled = false;
-  try {
-    const r1 = await powershellVerbose(
-      `Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux | Select-Object -ExpandProperty State`,
-      { timeout: 30_000 }
-    );
-    wslEnabled = /^Enabled\s*$/m.test(r1.stdout || '');
-  } catch (e) {
-    ctx.logger.warn('ensureFeatures', `check WSL feature: ${e.message}`);
-  }
-  try {
-    const r2 = await powershellVerbose(
-      `Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform | Select-Object -ExpandProperty State`,
-      { timeout: 30_000 }
-    );
-    vmpEnabled = /^Enabled\s*$/m.test(r2.stdout || '');
-  } catch (e) {
-    ctx.logger.warn('ensureFeatures', `check VMP feature: ${e.message}`);
-  }
-
-  ctx.state.featuresEnabled = { wsl: wslEnabled, vmp: vmpEnabled, checkedAt: Date.now() };
-  ctx.save && ctx.save();
-  ctx.logger.info('ensureFeatures', `wsl=${wslEnabled} vmp=${vmpEnabled}`);
-  return wslEnabled && vmpEnabled;
-}
-
-// ───────────────────────────────────────────────────────────────────────
-// wslIsFunctionalLite — checagem rápida pós-install. Usa detectWslState
-// + wsl --status pra decidir se WSL responde válido.
-async function wslIsFunctionalLite() {
-  const st = await detectWslState();
-  if (st.state !== 'modern') return { ok: false, state: st.state, reason: `wsl state=${st.state}` };
-  return await wslIsFunctional();
-}
-
-// Compartilhado: detecta QUALQUER distro Ubuntu instalada (qualquer um dos 3
-// steps considera "feito" se isso é true, porque step_01 unificado já cuidou).
-//
-// Bruno v0.2.12: antes hardcodava `Ubuntu-22.04` — falhava quando o host só
-// tinha `Ubuntu` ou `Ubuntu-24.04`. Agora aceita qualquer NAME que comece com
-// "Ubuntu" (Ubuntu, Ubuntu-22.04, Ubuntu-24.04, etc.). Como a lista vem do
-// wslExec (UTF-16 LE decodado), regex casa limpa.
-async function _ubuntuInstalled() {
-  const r = await wslListVerbose();
-  return /\bUbuntu(?:-\d+\.\d+)?\b/i.test(r.stdout || '');
-}
-
-// -------- step 01 — Install WSL2 + Ubuntu (unified, modern) ---------------
-const step01EnableFeatures = {
-  id: 'step_01_enable_features', // ID preservado pra compat com state.json/UI
-  title: 'Instalar WSL2 + Ubuntu (features + kernel + distro)',
-  description: 'wsl --install -d Ubuntu-22.04 (moderno: faz features, kernel e distro de uma vez). Fallback dism se Windows for antigo.',
-  category: 'HYBRID', // pode disparar reboot
-  // Bruno v0.2.13: shape NOVO (action/steps/expected/note). action.kind=none —
-  // step roda sozinho; só mostra instruções pro caso de reboot pendente.
-  manualInstructions: {
-    action: { label: 'Aguardando instalação do WSL…', kind: 'none', payload: {} },
-    steps: [
-      { num: 1, text: 'O instalador vai baixar e instalar o WSL2 + Ubuntu (pode demorar 2–5 min)' },
-      { num: 2, text: 'Ao final, o Windows pode pedir um REBOOT' },
-      { num: 3, text: 'Salve seu trabalho aberto (Word, navegador, etc.)' },
-      { num: 4, text: 'Quando o PC reiniciar, este instalador abre sozinho e retoma de onde parou' },
-    ],
-    expected: 'Mensagem "wsl --install OK" e/ou pedido de reboot do Windows.',
-    note: 'Não feche o instalador. Se o reboot for solicitado, reinicie o Windows.',
-  },
-  async detect(ctx) {
-    // Bruno (noturna 2026-05-27): SUCESSO = WSL é MODERN + funcional + Ubuntu
-    // já presente. Se for legacy/absent, força execute() pra migrar via MSI.
-    const st = await detectWslState({ logger: ctx && ctx.logger });
-    if (st.state === 'modern') {
-      const fn = await wslIsFunctional();
-      if (fn.ok && await _ubuntuInstalled()) return true;
-    }
-    return false;
-  },
-  async execute(ctx) {
-    await requireAdminOrThrow();
-
-    // Bruno (noturna 2026-05-27): NOVO fluxo cascata
-    //   1) detectWslState — sabe se é absent/legacy/modern
-    //   2) ensureFeatures — habilita WSL + VMP (com reboot se necessário)
-    //   3) Se legacy/absent → installWslModernViaMsi
-    //   4) Se modern → wsl --update (cura)
-    //   5) Valida funcional; se não, reboot
-    //   6) Instala Ubuntu se ainda não
-    const state0 = await detectWslState({ logger: ctx.logger });
-    ctx.logger.info('step_01', `WSL state detectado: ${state0.state} (exe=${state0.exePath || '(nenhum)'})`);
-    ctx.state.wslState = state0.state;
-    ctx.save && ctx.save();
-
-    // 2) Habilita features Windows (idempotente)
-    const featuresOk = await ensureFeatures(ctx);
-    if (!featuresOk) {
-      ctx.logger.warn('step_01', 'features WSL/VMP recém-habilitadas — reboot OBRIGATÓRIO');
-      await _markRebootAndScheduleRunOnce(
-        ctx, 'step_01',
-        'Features WSL habilitadas — reinicie o Windows pra ativar'
-      );
-      return;
-    }
-
-    // 3) Se legacy ou absent → instala WSL moderno via MSI
-    if (state0.state === 'legacy' || state0.state === 'absent') {
-      ctx.logger.info('step_01', `wslState=${state0.state} → instalando WSL moderno via MSI...`);
-      ctx.state.wslMigrationAttempted = true;
-      ctx.save && ctx.save();
-      // Eduardo lastmile v0.2.17: navega pra tela #screen-wsl-upgrade da Camila
-      if (ctx.events && typeof ctx.events.onScreen === 'function') {
-        try { ctx.events.onScreen({ screen: 'wsl-upgrade', stage: 'init' }); } catch (_) {}
-      }
-      // Repassa onProgress pro shell helper emitir updates da barra real
-      const onProgress = (p) => {
-        if (ctx.events && typeof ctx.events.onWslUpgradeProgress === 'function') {
-          try { ctx.events.onWslUpgradeProgress(p); } catch (_) {}
-        }
-      };
-      const msi = await installWslModernViaMsi({ logger: ctx.logger, onProgress });
-      if (!msi.ok) {
-        const err = new Error(`Não consegui instalar o WSL moderno via MSI. ${msi.error || ''}`);
-        err.code = 'WSL_MSI_INSTALL_FAILED';
-        throw err;
-      }
-      ctx.state.wslMsiVersion = msi.version;
-      ctx.save && ctx.save();
-      ctx.logger.info('step_01', `MSI ${msi.version} instalado (exit=${msi.exitCode})`);
-
-      // MSI moderno SEMPRE precisa reboot pra ativar kernel novo em Win10 legacy.
-      // Tenta validar primeiro; se falhar, força reboot.
-      const fn0 = await wslIsFunctional();
-      if (!fn0.ok || msi.rebootRequired) {
-        await _markRebootAndScheduleRunOnce(
-          ctx, 'step_01',
-          'WSL moderno instalado — reinicie o Windows pra ativar o kernel'
-        );
-        return;
-      }
-      ctx.state.wslState = 'modern';
-      ctx.save && ctx.save();
-    }
-
-    // 4) wsl --update como CURA antes de marcar reboot (best case: sem reboot)
-    if (ctx.state.wslState === 'modern' || state0.state === 'modern') {
-      ctx.logger.info('step_01', 'tentando wsl --update pra ativar kernel sem reboot...');
-      try {
-        const upd = await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger, label: 'wsl --update' });
-        ctx.logger.info('step_01', `wsl --update exit=${upd.exit_code}`);
-      } catch (e) {
-        ctx.logger.warn('step_01', `wsl --update falhou (segue): ${e.message}`);
-      }
-    }
-
-    // 5) Valida funcional. Se não, reboot.
-    const fn1 = await wslIsFunctional();
-    if (!fn1.ok) {
-      ctx.logger.warn('step_01', `WSL não funcional após install/update: ${fn1.reason}`);
-      await writeWslDiagLog(ctx);
-      await _markRebootAndScheduleRunOnce(
-        ctx, 'step_01',
-        `WSL ainda não responde corretamente: ${fn1.reason}`
-      );
-      return;
-    }
-    ctx.state.wslState = 'functional';
-    ctx.save && ctx.save();
-    ctx.logger.info('step_01', 'WSL moderno + funcional');
-
-    // 6) Aviso amigável se outra distro for default.
-    try {
-      const r = await wslListVerbose();
-      if (r.stdout && /\*\s+(Debian|Kali|openSUSE|SLES|Oracle|Pengwin|Alpine)/i.test(r.stdout)) {
-        ctx.logger.warn('step_01', 'Outra distro detectada como default (não-Ubuntu). Vamos instalar Ubuntu e setar como default.');
-      }
-    } catch (_) {}
-
-    // Decision: agora moderno, pode usar `wsl --install -d`. Mantém lógica antiga
-    // pra instalar Ubuntu (idempotente).
-    const decision = { supported: true, reason: 'WSL moderno + funcional após migração' };
-    ctx.logger.info('step_01', `wsl --install decision: USAR_MODERNO (motivo: ${decision.reason})`);
-
-    if (decision.supported) {
-      // Bruno v0.2.12: descoberta DINÂMICA do nome de distro Ubuntu.
-      // Em v0.2.11 hardcodávamos `Ubuntu-22.04`, mas alguns hosts retornavam
-      // "Nome de distribuição inválido". Agora consultamos o catálogo online.
-      let distro = await discoverUbuntuDistroName(ctx.logger);
-      if (!distro) {
-        ctx.logger.warn('step_01',
-          'wsl --list --online falhou ou não retornou Ubuntu — tentando wsl --install sem -d (Ubuntu default do host).');
-        distro = null; // sinaliza pra rodar sem -d
-      } else {
-        ctx.logger.info('step_01', `distro Ubuntu detectada: ${distro}`);
-      }
-
-      // Persiste o nome ESCOLHIDO em ctx.state ANTES de instalar — assim, se
-      // der reboot e voltar, os steps 04+ já sabem qual distro usar.
-      const chosenDistro = distro || 'Ubuntu';
-      ctx.state.distro = chosenDistro;
-      ctx.state.ubuntuDistroName = chosenDistro;
-      ctx.save && ctx.save();
-
-      const installArgs = distro
-        ? ['--install', '-d', distro, '--no-launch']
-        : ['--install', '--no-launch'];
-
-      ctx.logger.info('step_01', `rodando: wsl ${installArgs.join(' ')}`);
-      // Bruno v0.2.12: usa wslExec direto (UTF-16 LE decode hard-coded) em vez
-      // de powershellVerbose que sofria mojibake mesmo com chcp 65001.
-      const r = await withRetry(
-        () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install' }),
-        { label: 'wsl --install', attempts: 2, backoff: [10, 30], logger: ctx.logger,
-          // wslExec NUNCA throw — sempre resolve com {exit_code,...}. Sinaliza
-          // retry só quando exit_code != 0 E não é "já instalado".
-          shouldRetry: () => true,
-        }
-      );
-
-      // Bruno v0.2.12: parser ROBUSTO do output. Aceita sucesso em vários casos:
-      //   - exit_code 0 ou 3010 (canônicos)
-      //   - stdout indica "já instalado" / "already installed"
-      //   - stdout indica reboot needed → marca rebootRequired
-      const fullOut = ((r.stdout || '') + ' ' + (r.stderr || ''));
-      ctx.logger.info('step_01',
-        `wsl --install resultado: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 300).replace(/\s+/g, ' ')}`);
-
-      const stdoutLower = fullOut.toLowerCase();
-      const alreadyInstalled = /already installed|j[áa] (est[áa]|foi) instalad|already exists|j[áa] existe/i.test(fullOut);
-      const wantsReboot = r.exit_code === 3010
-        || /restart|reinici|reboot/i.test(stdoutLower);
-
-      // Só falha se: exit != 0/3010 E não há indicador de "já feito".
-      if (r.exit_code !== 0 && r.exit_code !== 3010 && !alreadyInstalled) {
-        throw new Error(`wsl --install falhou: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 500)} stderr=${(r.stderr || '').slice(0, 300)}`);
-      }
-
-      if (alreadyInstalled) {
-        ctx.logger.info('step_01', 'wsl --install OK — distro já estava instalada (idempotente)');
-      } else if (wantsReboot) {
-        ctx.logger.info('step_01', 'wsl --install OK — reboot pendente');
-      } else {
-        ctx.logger.info('step_01', 'wsl --install OK — sem reboot necessário');
-      }
-
-      // Força a distro escolhida como default (idempotente). Usa wslExec.
-      try {
-        await wslExec(['--set-default', chosenDistro], { timeout: 30_000, logger: ctx.logger, label: 'set-default' });
-      } catch (_) {}
-
-      // Bruno v0.2.16: tenta `wsl --update` como CURA antes de marcar reboot.
-      // Atualiza o kernel WSL — em alguns hosts isso ativa o WSL sem reboot,
-      // economizando 1 reinício pro JOs. Se já está atualizado, é no-op rápido.
-      ctx.logger.info('step_01', 'tentando wsl --update pra ativar kernel sem reboot...');
-      try {
-        const upd = await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger, label: 'wsl --update' });
-        ctx.logger.info('step_01', `wsl --update exit=${upd.exit_code}`);
-      } catch (e) {
-        ctx.logger.warn('step_01', `wsl --update falhou (segue): ${e.message}`);
-      }
-
-      // Verifica se ficou funcional sem reboot (best case).
-      const fn = await wslIsFunctional();
-      if (fn.ok) {
-        ctx.logger.info('step_01', 'WSL ficou funcional sem reboot — perfeito');
-        // Grava log diagnóstico em caso de sucesso também (telemetria)
-        await writeWslDiagLog(ctx);
-        return;
-      }
-
-      // WSL ainda não funcional → reboot OBRIGATÓRIO. Grava diagnóstico
-      // pra JOs poder mandar o log se mesmo após reboot algo persistir.
-      const diagFile = await writeWslDiagLog(ctx);
-      ctx.logger.warn('step_01',
-        `reboot OBRIGATÓRIO — ${fn.reason}${diagFile ? ` (diag: ${diagFile})` : ''}`);
-
-      await _markRebootAndScheduleRunOnce(
-        ctx, 'step_01',
-        `WSL ainda não funcional: ${fn.reason}`
-      );
-      return;
-    }
-
-    // Caminho não-moderno é IMPOSSÍVEL aqui (já migramos via MSI acima),
-    // mas mantemos fallback defensivo caso algo bizarro aconteça.
-    ctx.logger.error('step_01', `decision.supported=false após migração — fluxo inesperado`);
-    throw new Error('Fluxo inesperado: WSL não ficou moderno após migração MSI');
-  },
-  async validate(ctx) {
-    // Se reboot pendente, segura aqui — runner libera quando rebootDone.
-    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Bruno (noturna 2026-05-27): TESTE REAL — detectWslState precisa ser
-    // 'modern' E `wsl --status` precisa responder válido (não help).
-    const st = await detectWslState({ logger: ctx.logger });
-    if (st.state !== 'modern') {
-      ctx.logger.warn(this.id, `WSL state=${st.state} — ainda precisa migração`);
-      if (!ctx.state.rebootDone) {
-        ctx.state.rebootRequired = true;
-        ctx.state.rebootRequiredReason = `WSL state=${st.state}`;
-        ctx.state.rebootBlockingReason = `WSL state=${st.state}`;
-        ctx.save && ctx.save();
-      }
-      await writeWslDiagLog(ctx);
-      return false;
-    }
-    const fn = await wslIsFunctional();
-    if (!fn.ok) {
-      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
-      if (!ctx.state.rebootDone) {
-        ctx.state.rebootRequired = true;
-        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
-        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
-        ctx.save && ctx.save();
-      }
-      await writeWslDiagLog(ctx);
-      return false;
-    }
-    ctx.state.wslState = 'functional';
-    ctx.save && ctx.save();
-    return _ubuntuInstalled();
-  },
-};
-
-// Fallback legacy (dism). Só usado quando wsl --install indisponível.
-async function _executeLegacyDismFlow(ctx) {
-  ctx.logger.info('step_01', 'fallback: dism /enable-feature Microsoft-Windows-Subsystem-Linux');
-  await powershellVerbose(
-    `dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart`,
-    { timeout: 600_000 }
-  );
-  ctx.logger.info('step_01', 'fallback: dism /enable-feature VirtualMachinePlatform');
-  await powershellVerbose(
-    `dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart`,
-    { timeout: 600_000 }
-  );
-  ctx.logger.info('step_01', 'fallback: wsl --set-default-version 2');
-  // wslExec direto (UTF-16 LE decodado) — antes powershellVerbose dava mojibake.
-  await wslExec(['--set-default-version', '2'], { timeout: 30_000, logger: ctx.logger, label: 'set-default-v2' })
-    .then(r => {
-      if (r.exit_code !== 0) {
-        ctx.logger.warn('step_01',
-          `wsl --set-default-version 2 falhou: exit=${r.exit_code} (pode precisar reboot antes)`);
-      }
-    });
-
-  // Bruno v0.2.12: descoberta dinâmica também no fallback legacy.
-  let distro = await discoverUbuntuDistroName(ctx.logger);
-  const chosen = distro || 'Ubuntu';
-  ctx.state.distro = chosen;
-  ctx.state.ubuntuDistroName = chosen;
-  ctx.save && ctx.save();
-
-  const installArgs = distro
-    ? ['--install', '-d', distro, '--no-launch']
-    : ['--install', '--no-launch'];
-
-  ctx.logger.info('step_01', `fallback: wsl ${installArgs.join(' ')}`);
-  await withRetry(
-    () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install (legacy)' }),
-    { label: 'wsl --install (legacy)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
-  );
-  try {
-    await wslExec(['--set-default', chosen], { timeout: 30_000, logger: ctx.logger, label: 'set-default-legacy' });
-  } catch (_) {}
-}
-
-// -------- step 02 — wsl default v2 (NO-OP no fluxo moderno) ---------------
-// Mantido pra compat com state.json + wizard.js. `wsl --install` já configura
-// default version 2. Detect retorna true se Ubuntu-22.04 está instalado (step_01
-// fez), então este step pula com `skipped` sem executar nada.
-const step02SetWslDefaultV2 = {
-  id: 'step_02_set_wsl_default_v2',
-  title: 'WSL funcional (validação)',
-  description: 'Já configurado pelo passo 1. NO-OP: valida que wsl --status responde válido.',
+// -------- step_X1 — copyRuntime -------------------------------------------
+const stepX1CopyRuntime = {
+  id: 'step_x1_copy_runtime',
+  title: 'Preparar runtime (copiar ~680 MB pra AppData)',
+  description: 'Extrai runtime.7z embarcado pra %LOCALAPPDATA%\\IMP-Squad-Runtime\\<version>\\ e cria junction `current`.',
   category: 'AUTO',
   async detect(ctx) {
-    // Se reboot pendente, considera detectado (libera o caminho).
-    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    // Bruno (noturna 2026-05-27): TESTE REAL — wslIsFunctional cobre tudo.
-    const fn = await wslIsFunctional();
-    return fn.ok;
+    const version = getRuntimeVersion();
+    const versionDir = getRuntimeVersionDir(version);
+    // Sucesso = bash + tmux + (node OU claude) presentes em versionDir
+    const bash = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'bash.exe']]);
+    const tmux = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'tmux.exe']]);
+    if (!bash || !tmux) return false;
+    // Marca state se detectou
+    ctx.state.runtimeInstalled = true;
+    ctx.state.runtimePath = versionDir;
+    ctx.state.runtimeVersion = version;
+    ctx.save && ctx.save();
+    return true;
   },
   async execute(ctx) {
-    // Bruno (noturna 2026-05-27): NO-OP — step_01 unificado já faz tudo.
-    // Se chegou aqui sem detect=true, é porque WSL não está funcional.
-    // Re-roda wsl --update como cura best-effort e re-valida.
-    ctx.logger.info('step_02', 'NO-OP — step_01 cuida da instalação. Tentando wsl --update como cura...');
+    const version = getRuntimeVersion();
+    const versionDir = getRuntimeVersionDir(version);
+    const runtimeRoot = getRuntimeRoot();
+
+    // 1) Localiza arquivo embarcado
+    const archive = findRuntimeArchive();
+    if (!archive) {
+      const err = new Error('RUNTIME_ARCHIVE_MISSING: runtime.7z não foi gerado. Rode scripts/build-runtime.ps1 primeiro.');
+      err.code = 'RUNTIME_ARCHIVE_MISSING';
+      throw err;
+    }
+    ctx.logger.info(this.id, `runtime archive localizado: ${archive}`);
+
+    // 2) Pré-check espaço (Patrícia N3 + N8 — checa drive da PASTA DESTINO)
+    fs.mkdirSync(runtimeRoot, { recursive: true });
+    const space = await checkFreeSpace(runtimeRoot, MIN_FREE_GB);
+    if (!space.ok) {
+      const err = new Error(
+        `RUNTIME_DISK_FULL: precisa de ${MIN_FREE_GB} GB livres em ${space.drive} (tem ${space.freeGb || '?'} GB)`
+      );
+      err.code = 'RUNTIME_DISK_FULL';
+      throw err;
+    }
+    ctx.logger.info(this.id, `espaço OK em ${space.drive}: ${space.freeGb} GB livres`);
+
+    // 3) Cria pasta da versão (não destrói se já existe — sobrescreve files)
+    fs.mkdirSync(versionDir, { recursive: true });
+
+    // 4) Extrai com progresso real → emite events
+    const onProgress = (p) => {
+      if (ctx.events && typeof ctx.events.onCopyRuntimeProgress === 'function') {
+        try { ctx.events.onCopyRuntimeProgress(p); } catch (_) {}
+      }
+      if (p.phase === 'extracting' || p.phase === 'moving') {
+        ctx.logger.info(this.id, `[${p.phase}] ${p.pct}%`);
+      }
+    };
+
+    await copyRuntimeWithProgress(archive, versionDir, onProgress);
+
+    // 5) Cria junction `current` → versionDir (Marcos §6)
     try {
-      await wslExec(['--update'], { timeout: 120_000, logger: ctx.logger });
-    } catch (_) {}
+      await createJunction(getRuntimeCurrentDir(), versionDir);
+      ctx.logger.info(this.id, `junction current → ${version}`);
+    } catch (e) {
+      ctx.logger.warn(this.id, `junction falhou (não-fatal): ${e.message}`);
+    }
+
+    // 6) Grava state
+    ctx.state.runtimeInstalled = true;
+    ctx.state.runtimePath = versionDir;
+    ctx.state.runtimeVersion = version;
+    ctx.save && ctx.save();
   },
   async validate(ctx) {
-    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    const fn = await wslIsFunctional();
-    if (!fn.ok) {
-      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
-      if (!ctx.state.rebootDone) {
-        ctx.state.rebootRequired = true;
-        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
-        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
-        ctx.save && ctx.save();
-      }
-      await writeWslDiagLog(ctx);
+    const version = getRuntimeVersion();
+    const versionDir = getRuntimeVersionDir(version);
+    const bash = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'bash.exe']]);
+    const tmux = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'tmux.exe']]);
+    if (!bash) {
+      ctx.logger.warn(this.id, `bash ausente após extração — AV pode ter quarentenado`);
       return false;
     }
+    if (!tmux) {
+      ctx.logger.warn(this.id, `tmux ausente após extração — AV pode ter quarentenado`);
+      return false;
+    }
+    // node E claude são checados em step_x2 (mais granular)
     return true;
   },
 };
 
-// -------- step 03 — install WSL + Ubuntu (NO-OP no fluxo moderno) --------
-// Mantido pra compat. `wsl --install` do step_01 já baixou e instalou.
-// Detect retorna true → step é pulado como `skipped`.
-const step03WslInstall = {
-  id: 'step_03_wsl_install',
-  title: 'WSL2 + Ubuntu instalados',
-  description: 'Instala Ubuntu se ainda não. Gate: wsl --status precisa estar funcional.',
+// -------- step_X2 — setupEnv ----------------------------------------------
+const stepX2SetupEnv = {
+  id: 'step_x2_setup_env',
+  title: 'Configurar ambiente (HOME, AV exclusion, smoke runtime)',
+  description: 'Roda setup.sh, detecta AV/AppLocker, oferece exclusion, valida tmux/git/node/claude.',
   category: 'HYBRID',
-  // Bruno v0.2.13: shape enriquecido. Mostra apenas se reboot pendente.
-  manualInstructions: {
-    action: { label: 'Reiniciar Windows', kind: 'none', payload: {} },
-    steps: [
-      { num: 1, text: 'Se o Windows pediu reboot no passo anterior, salve seu trabalho aberto' },
-      { num: 2, text: 'Reinicie o Windows agora (Iniciar → Reiniciar)' },
-      { num: 3, text: 'Quando o PC voltar, este instalador abre sozinho e retoma de onde parou' },
-    ],
-    expected: 'Após o reboot, instalador volta automaticamente neste passo marcado como OK.',
-    note: 'Não tem botão automático pra reiniciar — você reinicia o Windows manualmente quando estiver pronto.',
-  },
   async detect(ctx) {
-    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    return _ubuntuInstalled();
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    const setupDone = path.join(versionDir, '.setup-done');
+    try {
+      return fs.existsSync(setupDone);
+    } catch (_) { return false; }
   },
   async execute(ctx) {
-    await requireAdminOrThrow();
-    // Bruno (noturna 2026-05-27): GATE OBRIGATÓRIO — wslIsFunctional precisa
-    // passar ANTES de tentar `wsl --install -d`. Sem isso, o comando dá
-    // mojibake/help inválido.
-    const fn = await wslIsFunctional();
-    if (!fn.ok) {
-      ctx.logger.warn('step_03', `gate: WSL não funcional (${fn.reason}) — marcando reboot`);
-      await _markRebootAndScheduleRunOnce(
-        ctx, 'step_03',
-        `WSL não funcional: ${fn.reason}`
-      );
-      return;
-    }
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
 
-    // Bruno v0.2.12: descoberta dinâmica + wslExec.
-    let distro = await discoverUbuntuDistroName(ctx.logger);
-    const chosen = distro || 'Ubuntu';
-    ctx.state.distro = chosen;
-    ctx.state.ubuntuDistroName = chosen;
-    ctx.state.distroState = 'none';
+    // 1) Detecta AV
+    ctx.logger.info(this.id, 'detectando antivírus...');
+    const av = await detectAv();
+    ctx.state.avDetected = av;
     ctx.save && ctx.save();
-    const installArgs = distro
-      ? ['--install', '-d', distro, '--no-launch']
-      : ['--install', '--no-launch'];
-    ctx.logger.info('step_03', `wsl ${installArgs.join(' ')}`);
-    const r = await withRetry(
-      () => wslExec(installArgs, { timeout: 600_000, logger: ctx.logger, label: 'wsl --install (step_03)' }),
-      { label: 'wsl --install (step_03)', attempts: 2, backoff: [10, 30], logger: ctx.logger, shouldRetry: () => true }
+    ctx.logger.info(this.id,
+      `AV: defender=${av.defender} realtime=${av.real_time_active} 3rd-party=${av.third_party_name || 'nenhum'}`
     );
 
-    const fullOut = ((r.stdout || '') + ' ' + (r.stderr || ''));
-    const alreadyInstalled = /already installed|j[áa] (est[áa]|foi) instalad|already exists|j[áa] existe/i.test(fullOut);
-    const wantsReboot = r.exit_code === 3010 || /restart|reinici|reboot/i.test(fullOut.toLowerCase());
-
-    if (r.exit_code !== 0 && r.exit_code !== 3010 && !alreadyInstalled) {
-      throw new Error(`wsl --install (step_03) falhou: exit=${r.exit_code} stdout=${(r.stdout || '').slice(0, 500)}`);
+    // 2) Se Defender ativo + real-time, emite event pra UI mostrar modal opcional
+    if (av.defender && av.real_time_active && !av.exclusion_added) {
+      if (ctx.events && typeof ctx.events.onNeedsAvExclusion === 'function') {
+        try {
+          ctx.events.onNeedsAvExclusion({
+            folder: versionDir,
+            defender: true,
+            third_party_name: av.third_party_name,
+          });
+        } catch (_) {}
+      }
+      // NÃO bloqueia — exclusion é opcional. UI pode chamar installer:applyAvExclusion depois.
     }
 
-    if (alreadyInstalled || await _ubuntuInstalled()) {
-      ctx.state.distroState = 'installed';
-      ctx.save && ctx.save();
+    // 3) Detecta AppLocker (Patrícia N1)
+    ctx.logger.info(this.id, 'detectando AppLocker...');
+    const al = await detectAppLocker();
+    ctx.state.appLockerDetected = { restrictive_policy: al.blocks_localappdata };
+    ctx.save && ctx.save();
+    if (al.blocks_localappdata) {
+      ctx.logger.warn(this.id, 'AppLocker detectado bloqueando LOCALAPPDATA — emitindo event');
+      if (ctx.events && typeof ctx.events.onAppLockerBlocked === 'function') {
+        try {
+          ctx.events.onAppLockerBlocked({
+            folder: versionDir,
+            raw_xml_excerpt: al.raw_xml ? al.raw_xml.slice(0, 800) : null,
+          });
+        } catch (_) {}
+      }
+      const err = new Error(`APPLOCKER_BLOCKED: AppLocker corporativo bloqueia execução em ${versionDir}. Veja sugestões no painel.`);
+      err.code = 'APPLOCKER_BLOCKED';
+      throw err;
     }
+
+    // 4) Gera scripts wrapper (imp-squad.bat) + setup.sh
+    writeImpSquadBat(versionDir);
+    writeSetupSh(versionDir);
+
+    // 5) Roda setup.sh
+    ctx.logger.info(this.id, 'rodando setup.sh...');
+    await runSetupSh(versionDir);
+
+    // 6) Smoke runtime — bash, tmux, node, claude
+    const bash = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'bash.exe']]);
+    const tmux = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'tmux.exe']]);
+    const nodeBin = resolveRuntimeBin(versionDir, RUNTIME_NODE_CANDIDATES);
+    const claudeBin = resolveRuntimeBin(versionDir, RUNTIME_CLAUDE_CANDIDATES);
+
+    if (!bash) {
+      const err = new Error('AV_QUARANTINE: bash.exe ausente após setup. Antivírus pode ter removido.');
+      err.code = 'AV_QUARANTINE';
+      throw err;
+    }
+    if (!tmux) {
+      const err = new Error('AV_QUARANTINE: tmux.exe ausente após setup. Antivírus pode ter removido.');
+      err.code = 'AV_QUARANTINE';
+      throw err;
+    }
+    if (!nodeBin) ctx.logger.warn(this.id, 'node.exe não encontrado no runtime — algumas funcionalidades podem quebrar');
+    if (!claudeBin) ctx.logger.warn(this.id, 'claude.exe não encontrado no runtime — login Claude vai precisar instalação separada');
+
+    ctx.logger.info(this.id, `runtime OK: bash=${path.basename(bash)} tmux=${path.basename(tmux)}`);
+  },
+  async validate(ctx) {
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    const setupDone = path.join(versionDir, '.setup-done');
+    const bash = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'bash.exe']]);
+    const tmux = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'tmux.exe']]);
+    return fs.existsSync(setupDone) && !!bash && !!tmux;
+  },
+};
+
+// -------- step_X3 — githubAuth (opcional, pulável) ------------------------
+const stepX3GithubAuth = {
+  id: 'step_x3_github_auth',
+  title: 'Autenticar GitHub (opcional — pula se seed atualizado)',
+  description: 'gh auth login --device-flow ou usa squad-seed pré-clonado.',
+  category: 'MANUAL',
+  manualInstructions: () => ({
+    action: { label: 'Login GitHub (device-flow)', kind: 'none', payload: {} },
+    steps: [
+      { num: 1, text: 'O instalador já trouxe a squad pré-clonada — você PODE pular este passo' },
+      { num: 2, text: 'Se quiser sincronizar com GitHub, abre um terminal e roda `gh auth login --web`' },
+      { num: 3, text: 'Vai mostrar um código de 8 dígitos — copia, abre github.com/login/device e cola' },
+      { num: 4, text: 'Volta aqui e clica "Verificar agora"' },
+    ],
+    note: 'Pode pular se você não vai puxar updates do squad por enquanto.',
+    fallback: {
+      title: 'Pular este passo',
+      command: '(seed já tem squad pré-clonado)',
+      steps: ['1. Clique "Pular" — squad funciona offline com o seed embarcado'],
+    },
+  }),
+  async detect(ctx) {
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    // 1) Seed presente?
+    const squadDir = path.join(versionDir, 'squad-seed', 'imp-squad');
+    const seedPresent = fs.existsSync(squadDir) && fs.existsSync(path.join(squadDir, '_shared'));
+    if (!seedPresent) return false;
+
+    // 2) Seed recente (< 7 dias)? Checa mtime do _shared/REGRAS_GERAIS.md
     try {
-      await wslExec(['--set-default', chosen], { timeout: 30_000, logger: ctx.logger });
+      const regras = path.join(squadDir, '_shared', 'REGRAS_GERAIS.md');
+      if (fs.existsSync(regras)) {
+        const ageMs = Date.now() - fs.statSync(regras).mtimeMs;
+        const ageDays = ageMs / (1000 * 60 * 60 * 24);
+        if (ageDays < 7) {
+          ctx.state.githubAuthMode = 'seed-only';
+          ctx.save && ctx.save();
+          return true;
+        }
+      }
     } catch (_) {}
 
-    if (wantsReboot) {
-      await _markRebootAndScheduleRunOnce(
-        ctx, 'step_03',
-        'wsl --install solicitou reboot do Windows'
-      );
-    }
-  },
-  async validate(ctx) {
-    if (ctx.state.rebootRequired && !ctx.state.rebootDone) return true;
-    const fn = await wslIsFunctional();
-    if (!fn.ok) {
-      ctx.logger.warn(this.id, `WSL ainda não funcional: ${fn.reason}`);
-      if (!ctx.state.rebootDone) {
-        ctx.state.rebootRequired = true;
-        ctx.state.rebootRequiredReason = `WSL não funcional: ${fn.reason}`;
-        ctx.state.rebootBlockingReason = `WSL não funcional ainda: ${fn.reason}`;
-        ctx.save && ctx.save();
-      }
-      await writeWslDiagLog(ctx);
-      return false;
-    }
-    return _ubuntuInstalled();
-  },
-};
-
-// -------- step 04 — Ubuntu first boot (manual) ----------------------------
-const step04UbuntuFirstBoot = {
-  id: 'step_04_ubuntu_first_boot',
-  title: 'Primeira boot do Ubuntu (criar usuário UNIX)',
-  description: 'Usuário precisa abrir Ubuntu uma vez para criar username/senha. Não automatizável.',
-  category: 'MANUAL',
-  // Bruno v0.2.14: shape enriquecido com `fallback` (plano B se botão não funcionar).
-  // CRÍTICO: execute() é NO-OP — quem abre o terminal é executeManualAction (botão UI).
-  // Live-test v0.2.13 mostrou: Start-Process ubuntu2204.exe abria janela que fechava
-  // sozinha SEM JOs ver botão de controle. Agora UI dispara, terminal usa cmd /k
-  // (mantém aberto), JOs digita user/senha sem pressão, fecha, clica "Verificar".
-  manualInstructions: (ctx) => {
-    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
-    return {
-      action: {
-        label: '🐧 Abrir Ubuntu',
-        kind: 'terminal',
-        payload: { distro },
-      },
-      fallback: {
-        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
-        command: `wsl -d ${distro}`,
-        steps: [
-          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
-          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
-          '3. Volte aqui pra continuar nos passos acima',
-        ],
-      },
-      steps: [
-        { num: 1, text: 'Clique no botão verde 🐧 "Abrir Ubuntu" aqui em cima' },
-        { num: 2, text: 'Vai abrir uma JANELA PRETA. Espere uns segundos (pode aparecer "Installing...")' },
-        { num: 3, text: 'Vai aparecer "Enter new UNIX username:" — DIGITE um nome simples (ex: jose), tudo MINÚSCULO, sem espaço, e aperte Enter' },
-        { num: 4, text: 'Vai pedir senha: "New password:" — DIGITE uma senha. ⚠️ ATENÇÃO: a senha NÃO APARECE na tela enquanto você digita (sem bolinhas, sem nada). Isso é NORMAL no Linux, NÃO é erro! Aperte Enter' },
-        { num: 5, text: 'Vai pedir DE NOVO: "Retype new password:" — digite a MESMA senha e Enter' },
-        { num: 6, text: '✍️ ANOTE seu usuário e senha num papel AGORA — vai precisar várias vezes!' },
-        { num: 7, text: 'Quando aparecer texto verde tipo "jose@DESKTOP:~$", DEU CERTO! Pode fechar a janela preta e voltar aqui' },
-        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
-      ],
-      commands: [
-        { label: 'Comando pra conferir o usuário criado', code: 'whoami' },
-      ],
-      expected: 'Prompt verde "usuario@PC:~$" no terminal.',
-      note: 'ANOTE o usuário e a senha — vai usar várias vezes nos próximos passos (apt, sudo, etc.).',
-    };
-  },
-  async detect(ctx) {
-    try {
-      // Idempotente: true se default user já existe e é non-root.
-      // wsl whoami sem distro usa o default — que é o Ubuntu (step 01 setou).
-      // Não força recriar; se o user já foi criado antes, considera done.
-      const { stdout } = await wsl(`whoami`, { distro: ctx.state.distro });
-      const u = (stdout || '').trim();
-      if (!u || u === 'root') return false;
-      ctx.state.ubuntuUser = u;
+    // 3) gh auth status já OK?
+    const gh = await ghAuthStatus(versionDir);
+    if (gh.logged_in) {
+      ctx.state.githubAuthMode = 'device';
       ctx.save && ctx.save();
       return true;
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Manual step — abertura é via UI (botão clica → installer:executeManualAction).
-    // Apenas log; runner emite onStepUpdate(running) e a UI mostra manualInstructions.
-    // Live-test v0.2.13: ANTES esta função abria Start-Process ubuntu2204.exe e a
-    // janela fechava sozinha. Agora NO-OP. Quem abre é o handler executeManualAction
-    // do main.js usando cmd /k (mantém janela viva).
-    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
-    return;
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 05 — apt base packages -------------------------------------
-const step05AptBase = {
-  id: 'step_05_apt_base',
-  title: 'Pacotes apt base (tmux, git, curl, build-essential, jq)',
-  description: 'apt update + instalação dos pacotes mínimos.',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `command -v tmux >/dev/null && command -v git >/dev/null && command -v curl >/dev/null && command -v cc >/dev/null && command -v jq >/dev/null && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Pré-check dpkg lock (Eduardo §2.4 / Patrícia §2.4). Se outra instalação travou,
-    // apt-get install vai falhar feio — melhor avisar antes com instrução clara.
-    try {
-      const { stdout: lockOut } = await wsl(
-        `(sudo -n lsof /var/lib/dpkg/lock-frontend 2>/dev/null || lsof /var/lib/dpkg/lock-frontend 2>/dev/null) | tail -n +2`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 15_000 }
-      ).catch(() => ({ stdout: '' }));
-      if (lockOut && lockOut.trim()) {
-        throw new Error(
-          'instalação anterior do Ubuntu ficou pendente (dpkg lock detectado). ' +
-          'Abra o Ubuntu pelo menu Iniciar, rode `sudo dpkg --configure -a` e depois `sudo apt-get -f install`, então tente de novo aqui.'
-        );
-      }
-    } catch (e) {
-      // Se a mensagem é nossa (lock detectado), propaga; senão segue.
-      if (e && /dpkg lock/.test(e.message)) throw e;
     }
-
-    // Bruno onda 3: log granular ANTES de cada operação demorada, pra UI ter
-    // sinal de "tá vivo" durante o apt (que pode demorar 2-5min).
-    ctx.logger.info('step_05', 'baixando lista de pacotes (apt-get update)...');
-    const cmd = `DEBIAN_FRONTEND=noninteractive apt-get update -y && (echo "[imp] update ok, instalando pacotes..." >&2) && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl ca-certificates build-essential jq wget`;
-    ctx.logger.info('step_05', 'pacotes a instalar: tmux git curl ca-certificates build-essential jq wget');
-    await withRetry(
-      () => sudoInWsl(cmd, {
-        distro: ctx.state.distro,
-        user: ctx.state.ubuntuUser,
-        passwordPromise: ctx.requestSudoPassword,
-        logger: ctx.logger,
-        timeout: 600_000,
-      }),
-      { label: 'apt install base', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
-    );
-    ctx.logger.info('step_05', 'apt install concluído');
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 06 — Node 20 LTS via nvm -----------------------------------
-const step06NodeViaNvm = {
-  id: 'step_06_node_nvm',
-  title: 'Node 20 LTS via nvm v0.40.4',
-  description: 'Instala nvm em ~/.nvm e Node LTS (sem sudo, sem /usr/bin).',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" && node -v 2>/dev/null | grep -qE '^v(2[0-9]|[3-9][0-9])\\.' && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
+    return false;
   },
   async execute(ctx) {
-    const script = `
-      set -e
-      export NVM_DIR="$HOME/.nvm"
-      if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-        curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
-      fi
-      . "$NVM_DIR/nvm.sh"
-      nvm install --lts
-      nvm alias default 'lts/*'
-      node -v
-    `;
-    await withRetry(
-      () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 600_000, logger: ctx.logger }),
-      { label: 'nvm + node lts', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
-    );
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 07 — npm prefix (kept for npm-global fallback) -------------
-const step07NpmPrefix = {
-  id: 'step_07_npm_prefix',
-  title: 'Configurar prefix npm global em ~/.npm-global (fallback)',
-  description: 'Garante npm install -g sem sudo, mesmo que algo bypassse nvm.',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `grep -q '.npm-global/bin' "$HOME/.bashrc" && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    const script = `
-      mkdir -p "$HOME/.npm-global"
-      npm config set prefix "$HOME/.npm-global" 2>/dev/null || true
-      grep -q '.npm-global/bin' "$HOME/.bashrc" || echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
-    `;
-    await wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser });
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 08 — Claude Code CLI (native installer) --------------------
-const step08ClaudeCli = {
-  id: 'step_08_claude_cli',
-  title: 'Claude Code CLI (native installer)',
-  description: 'curl -fsSL https://claude.ai/install.sh | bash — adiciona ~/.local/bin ao PATH.',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(`command -v claude >/dev/null && claude --version 2>/dev/null && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser });
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    const script = `
-      set -e
-      curl -fsSL https://claude.ai/install.sh | bash
-      case ":$PATH:" in
-        *":$HOME/.local/bin:"*) ;;
-        *) grep -q '.local/bin' "$HOME/.bashrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc" ;;
-      esac
-    `;
-    try {
-      await withRetry(
-        () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 600_000, logger: ctx.logger }),
-        { label: 'claude native install', attempts: 2, backoff: [5, 20], logger: ctx.logger }
-      );
-    } catch (e) {
-      // Fallback: npm global (passo 7 já preparou prefix).
-      ctx.logger.warn('claude', `native installer falhou, tentando npm fallback: ${e.message}`);
-      await wsl(
-        `export PATH="$HOME/.npm-global/bin:$PATH" && npm install -g @anthropic-ai/claude-code`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 600_000 }
-      );
-    }
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 09 — Claude login (MANUAL — terminal interativo) ----------
-const step09ClaudeLogin = {
-  id: 'step_09_claude_login',
-  title: 'Login Claude Code (browser OAuth)',
-  description: 'Abre terminal Windows com `claude` — usuário loga no browser e fecha.',
-  category: 'MANUAL',
-  // Bruno v0.2.14: shape enriquecido com `fallback`. NO-OP execute (UI dispara).
-  manualInstructions: (ctx) => {
-    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
-    return {
-      action: {
-        label: '🔐 Abrir terminal pra login Claude',
-        kind: 'terminal',
-        payload: { distro, cmd: 'claude' },
-      },
-      fallback: {
-        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
-        command: `wsl -d ${distro} -- bash -lc 'claude'`,
-        steps: [
-          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
-          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
-          '3. Volte aqui pra continuar nos passos acima',
-        ],
-      },
-      steps: [
-        { num: 1, text: 'Clique no botão azul 🔐 "Abrir terminal pra login Claude" aqui em cima' },
-        { num: 2, text: 'Vai abrir uma JANELA PRETA com o Claude pedindo login' },
-        { num: 3, text: 'Ele mostra um LINK na tela — COPIE o link (selecione com o mouse, Ctrl+C)' },
-        { num: 4, text: 'Cole o link no navegador (Chrome/Edge) e LOGUE com sua conta Claude (Max ou Pro)' },
-        { num: 5, text: 'O navegador mostra um CÓDIGO — copie esse código' },
-        { num: 6, text: 'Volte na janela preta, COLE o código (botão direito do mouse cola) e aperte Enter' },
-        { num: 7, text: 'Quando aparecer "Login successful", DEU CERTO! Pode fechar a janela preta' },
-        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
-      ],
-      commands: [
-        { label: 'Comando pra conferir login', code: 'claude --print "responda: pong"' },
-      ],
-      expected: '"Login successful" no terminal e `claude --print "pong"` retorna pong.',
-      note: 'Use uma conta Claude com plano ativo (Max/Pro/Team) — free não funciona pra Claude Code.',
-    };
-  },
-  async detect(ctx) {
-    try {
-      // claude --print is non-interactive; if not logged in it returns non-zero.
-      const { stdout } = await wsl(
-        `claude --print "responda apenas: pong" 2>/dev/null | tail -c 200`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 60_000 }
-      ).catch(e => ({ stdout: '', code: e.code || 1 }));
-      return /pong/i.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Manual step — abertura é via UI (botão → installer:executeManualAction).
-    // Live-test v0.2.13: ANTES openInteractiveTerminal abria janela que sumia
-    // antes do JOs ler. Agora NO-OP, handler do main.js usa cmd /k.
-    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
-    return;
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 10 — GitHub auth via gh device flow ------------------------
-const step10GhAuth = {
-  id: 'step_10_gh_auth',
-  title: 'GitHub auth (gh CLI — Device Flow)',
-  description: 'Instala gh CLI + gh auth login --web. Configura credential helper.',
-  category: 'MANUAL',
-  // Bruno v0.2.14: shape enriquecido com `fallback`. NO-OP execute (UI dispara).
-  manualInstructions: (ctx) => {
-    const distro = (ctx && ctx.state && ctx.state.distro) || 'Ubuntu';
-    return {
-      action: {
-        label: '🔑 Iniciar login GitHub (Device Flow)',
-        kind: 'terminal',
-        payload: {
-          distro,
-          cmd: 'gh auth login --hostname github.com --git-protocol https --web',
-        },
-      },
-      fallback: {
-        title: 'A janela fechou sozinha ou o botão não funcionou? Faça manual:',
-        command: `wsl -d ${distro} -- bash -lc 'gh auth login --web --git-protocol https'`,
-        steps: [
-          '1. Aperte a tecla Windows, digite "cmd", abra o Prompt de Comando',
-          '2. Cole o comando acima (botão direito do mouse cola) e aperte Enter',
-          '3. Volte aqui pra continuar nos passos acima',
-        ],
-      },
-      steps: [
-        { num: 1, text: 'Clique no botão amarelo 🔑 "Iniciar login GitHub" aqui em cima' },
-        { num: 2, text: 'Vai abrir uma JANELA PRETA com o gh pedindo login' },
-        { num: 3, text: 'Ele mostra um CÓDIGO de 8 caracteres tipo "ABCD-1234" — COPIE esse código' },
-        { num: 4, text: 'Clique no botão "Abrir github.com/login/device" aqui embaixo (vai abrir no navegador)' },
-        { num: 5, text: 'Cole o código e LOGUE com sua conta GitHub (autorize o app)' },
-        { num: 6, text: 'Volte na janela preta — espere aparecer "Authentication complete"' },
-        { num: 7, text: 'DEU CERTO! Pode fechar a janela preta' },
-        { num: 8, text: 'Clique "🔍 Verificar agora" aqui embaixo' },
-      ],
-      commands: [
-        { label: 'URL do Device Flow GitHub', code: 'https://github.com/login/device' },
-        { label: 'Comando pra conferir login', code: 'gh auth status' },
-      ],
-      expected: '"Authentication complete" no terminal e `gh auth status` mostra "Logged in to github.com".',
-      note: 'Use uma conta GitHub que tenha acesso ao repo kennrick69/imp-squad (squad privado).',
-    };
-  },
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(`gh auth status 2>&1 | grep -q "Logged in to github.com" && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser });
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Garante gh instalado ANTES de o user clicar o botão manual (auto-step).
-    // Login interativo é via UI (botão → installer:executeManualAction).
-    // Live-test v0.2.13: ANTES openInteractiveTerminal disparava aqui e a janela
-    // sumia. Agora só instala gh (silencioso, sem janela visível) e marca pra UI.
-    const ghCheck = await wsl(`command -v gh >/dev/null && echo OK || echo MISSING`,
-      { distro: ctx.state.distro, user: ctx.state.ubuntuUser }).catch(() => ({ stdout: 'MISSING' }));
-    if (!/OK/.test(ghCheck.stdout || '')) {
-      ctx.logger.info(this.id, 'gh CLI ausente — instalando antes do login manual');
-      const installGh = `
-        set -e
-        (type -p wget >/dev/null || sudo apt-get install -y wget) \\
-          && sudo mkdir -p -m 755 /etc/apt/keyrings \\
-          && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \\
-          && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \\
-          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\
-          && sudo apt-get update -y \\
-          && sudo apt-get install -y gh
-      `;
-      await withRetry(
-        () => sudoInWsl(installGh, {
-          distro: ctx.state.distro,
-          user: ctx.state.ubuntuUser,
-          passwordPromise: ctx.requestSudoPassword,
-          logger: ctx.logger,
-          timeout: 600_000,
-        }),
-        { label: 'install gh', attempts: 2, backoff: [5, 20], logger: ctx.logger }
-      );
-    }
-    ctx.logger.info(this.id, 'Aguardando você clicar no botão na tela');
-    return;
+    // Manual step — UI dispara terminal. Aqui só log + marca modo.
+    ctx.logger.info(this.id, 'aguardando user clicar no botão (gh auth login --web ou Pular)');
+    ctx.state.githubAuthMode = ctx.state.githubAuthMode || 'pending';
+    ctx.save && ctx.save();
   },
   async validate(ctx) {
-    const ok = await this.detect(ctx);
-    if (ok) {
-      ctx.state.githubAuthMethod = 'device-flow';
-      ctx.save && ctx.save();
-    }
-    return ok;
-  },
-};
-
-// -------- step 11 — clone imp-squad ---------------------------------------
-const step11CloneSquad = {
-  id: 'step_11_clone_squad',
-  title: 'Clonar imp-squad em /mnt/c/Projetos/_squad',
-  description: 'Repo privado kennrick69/imp-squad; pasta local mantém nome _squad.',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `[ -d /mnt/c/Projetos/_squad/.git ] && [ -f /mnt/c/Projetos/_squad/_shared/REGRAS_GERAIS.md ] && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Try git clone; on 404 (repo not provisioned), fall back to seeded tarball if available.
-    const cloneScript = `
-      set -e
-      mkdir -p /mnt/c/Projetos
-      cd /mnt/c/Projetos
-      if [ -d _squad/.git ]; then
-        git -C _squad pull --ff-only || true
-      elif [ -d _squad ]; then
-        echo "[_squad] existe sem .git — abortando pra não perder dados" >&2
-        exit 2
-      else
-        if git clone https://github.com/kennrick69/imp-squad.git _squad; then
-          touch _squad/${FOLDER_MARKER}
-        else
-          # Fallback: seed tarball at /mnt/c/Projetos/imp-installer/seeds/_squad.tar.gz
-          SEED=/mnt/c/Projetos/imp-installer/seeds/_squad.tar.gz
-          if [ -f "$SEED" ]; then
-            mkdir -p _squad && tar -xzf "$SEED" -C _squad && touch _squad/${FOLDER_MARKER}
-          else
-            exit 3
-          fi
-        fi
-      fi
-    `;
-    // Bruno onda 3: log granular pre-clone.
-    ctx.logger.info('step_11', 'clonando kennrick69/imp-squad em /mnt/c/Projetos/_squad...');
-    try {
-      await withRetry(
-        () => wsl(cloneScript, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 300_000, logger: ctx.logger }),
-        { label: 'clone imp-squad', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
-      );
-      ctx.logger.info('step_11', 'clone _squad OK');
-    } catch (e) {
-      // Enriquece o erro do clone usando o catalog (4.6 do Eduardo + 7.1 da Patrícia).
-      // Os padrões mais comuns: exit 128 (auth), exit 3 (sem fallback), 403, "could not read from remote".
-      const raw = `${e.message || ''}\n${e.stderr || ''}`;
-      const enriched = enrichError('step_11_clone_squad', raw);
-      const friendly = new Error(`${enriched.headline} — ${enriched.what}`);
-      friendly.stderr = e.stderr;
-      friendly.enriched = enriched;
-      throw friendly;
-    }
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 12 — clone imp-orchestrator + npm install ------------------
-const step12CloneOrchestrator = {
-  id: 'step_12_clone_orchestrator',
-  title: 'Clonar imp-orchestrator + npm install',
-  description: 'Clona orquestrador e instala dependências (sem devDependencies).',
-  category: 'AUTO',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `[ -d /mnt/c/Projetos/imp-orchestrator/.git ] && [ -d /mnt/c/Projetos/imp-orchestrator/node_modules ] && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Bruno onda 3: log granular pre-clone + pre-install.
-    ctx.logger.info('step_12', 'clonando kennrick69/imp-orchestrator em /mnt/c/Projetos/imp-orchestrator...');
-    const script = `
-      set -e
-      mkdir -p /mnt/c/Projetos
-      cd /mnt/c/Projetos
-      if [ -d imp-orchestrator/.git ]; then
-        echo "[imp] orchestrator já existe — git pull --ff-only" >&2
-        git -C imp-orchestrator pull --ff-only || true
-      elif [ -d imp-orchestrator ]; then
-        echo "[imp-orchestrator] existe sem .git — abortando" >&2; exit 2
-      else
-        git clone https://github.com/kennrick69/imp-orchestrator.git
-        touch imp-orchestrator/${FOLDER_MARKER}
-      fi
-      cd imp-orchestrator
-      if [ -d node_modules ]; then
-        echo "[imp] node_modules existe — pulando npm install" >&2
-      else
-        echo "[imp] rodando npm install --omit=dev (pode demorar 1-3min)..." >&2
-        npm install --omit=dev
-      fi
-    `;
-    await withRetry(
-      () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 600_000, logger: ctx.logger }),
-      { label: 'clone+install orchestrator', attempts: 3, backoff: [2, 8, 30], logger: ctx.logger }
-    );
-    ctx.logger.info('step_12', 'orchestrator + npm install OK');
-  },
-  async validate(ctx) { return this.detect(ctx); },
-};
-
-// -------- step 13 — Sala 3D (optional release asset) ----------------------
-const step13Sala3D = {
-  id: 'step_13_sala3d',
-  title: 'Sala 3D (escritorio-3d) — opcional',
-  description: 'Baixa release asset .zip e descompacta. Pode ser pulado e instalado depois.',
-  category: 'HYBRID',
-  async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `[ -f /mnt/c/Projetos/escritorio-3d/index.html ] && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
-  },
-  async execute(ctx) {
-    // Patrícia BLOCKER #3: defensiva extra mesmo com state.migrate garantindo
-    // decisions:{}. Se algum executor rodar com ctx.state vindo de origem não
-    // migrada (ex.: testes diretos), não crashar.
-    const strategy = (ctx.state.decisions && ctx.state.decisions.escritorio3dStrategy) || 'release-asset-on-demand';
-    if (strategy === 'skip') {
-      ctx.logger.info('sala3d', 'pulado por decisão do usuário');
-      ctx.state.sala3dSkipped = true;
-      ctx.state.sala3dSkipReason = 'usuario_pulou';
-      ctx.save();
-      return;
-    }
-
-    // Fix #A1: probe a release ANTES de tentar baixar. Release pode não existir
-    // ainda (caso atual: kennrick69/escritorio-3d sem release publicado).
-    // Se a API GitHub retorna 404, marca como skipped (não erro) e segue —
-    // usuário pode instalar depois quando a release for publicada.
-    const releaseUrl = 'https://api.github.com/repos/kennrick69/escritorio-3d/releases/latest';
-    let releaseExists = false;
-    try {
-      const probe = await wsl(
-        `curl -s -o /dev/null -w '%{http_code}' --max-time 15 ${releaseUrl}`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 30_000 }
-      ).catch(() => ({ stdout: '' }));
-      const code = parseInt((probe.stdout || '').trim(), 10);
-      releaseExists = code === 200;
-      if (!releaseExists) {
-        ctx.logger.info('sala3d',
-          `release não publicada ainda (HTTP ${code || 'erro'}). ` +
-          `Sala 3D ainda não disponível — usuário pode instalar depois quando estiver publicada.`
-        );
-      }
-    } catch (e) {
-      ctx.logger.warn('sala3d', `probe release falhou: ${e.message} — assumindo indisponível`);
-      releaseExists = false;
-    }
-
-    if (!releaseExists) {
-      // Graceful skip por default — NÃO é erro.
-      ctx.state.sala3dSkipped = true;
-      ctx.state.sala3dSkipReason = 'sala_3d_release_indisponivel';
-      ctx.save();
-      return;
-    }
-
-    // Release existe — segue download normal.
-    const script = `
-      set -e
-      mkdir -p /mnt/c/Projetos/escritorio-3d
-      cd /tmp
-      curl -fsSL --retry 3 -o escritorio-3d.zip \\
-        https://github.com/kennrick69/escritorio-3d/releases/latest/download/escritorio-3d.zip
-      # unzip pode não estar instalado em Ubuntu mínimo — tenta python3 como fallback
-      if command -v unzip >/dev/null; then
-        unzip -qo escritorio-3d.zip -d /mnt/c/Projetos/escritorio-3d/
-      else
-        python3 -c "import zipfile; zipfile.ZipFile('escritorio-3d.zip').extractall('/mnt/c/Projetos/escritorio-3d/')"
-      fi
-      touch /mnt/c/Projetos/escritorio-3d/${FOLDER_MARKER}
-      rm -f escritorio-3d.zip
-    `;
-    try {
-      await withRetry(
-        () => wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 900_000, logger: ctx.logger }),
-        { label: 'sala 3d download', attempts: 2, backoff: [5, 30], logger: ctx.logger }
-      );
-    } catch (e) {
-      // Mesmo se a probe disse "200" e o download falhou, não bloqueia install — vira skip.
-      ctx.logger.warn('sala3d',
-        `download falhou (${e.message}) — marcando como skipped, instalação principal continua.`
-      );
-      ctx.state.sala3dSkipped = true;
-      ctx.state.sala3dSkipReason = 'download_falhou';
-      ctx.save();
-    }
-  },
-  async validate(ctx) {
-    const strategy = (ctx.state.decisions && ctx.state.decisions.escritorio3dStrategy) || 'release-asset-on-demand';
-    if (strategy === 'skip') return true;
-    if (ctx.state.sala3dSkipped) return true; // skip aceitável (release indisponível)
     return this.detect(ctx);
   },
 };
 
-// -------- step 14 — tmux session imp with 7 panes -------------------------
-const step14TmuxSession = {
-  id: 'step_14_tmux_session',
-  title: 'Sessão tmux `imp` com 7 painéis',
-  description: '6 agentes (lider, arquiteto, criativo, debugger, qa, revisor) + main.',
+// -------- step_X4 — launchTmux --------------------------------------------
+const stepX4LaunchTmux = {
+  id: 'step_x4_launch_tmux',
+  title: 'Iniciar squad tmux (7 painéis claude)',
+  description: 'Cria sessão tmux `imp` com 1 main + 6 personas (lider/arquiteto/criativo/debugger/qa/revisor).',
   category: 'AUTO',
   async detect(ctx) {
-    try {
-      const { stdout } = await wsl(
-        `tmux has-session -t imp 2>/dev/null && [ "$(tmux list-panes -t imp 2>/dev/null | wc -l)" = "7" ] && echo OK || echo MISSING`,
-        { distro: ctx.state.distro, user: ctx.state.ubuntuUser }
-      );
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    const bash = resolveRuntimeBin(versionDir, [['msys64', 'usr', 'bin', 'bash.exe']]);
+    if (!bash) return false;
+    // tmux has-session -t imp
+    return new Promise((resolve) => {
+      const winToPosix = (p) => {
+        const m = p.match(/^([A-Za-z]):[\\/](.*)$/);
+        if (!m) return p.replace(/\\/g, '/');
+        return `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+      };
+      const env = {
+        ...process.env,
+        IMP_RUNTIME_HOME: versionDir,
+        MSYSTEM: 'MSYS',
+        HOME: path.join(versionDir, 'home', os.userInfo().username || 'user'),
+        PATH: [path.join(versionDir, 'msys64', 'usr', 'bin'), process.env.PATH || ''].filter(Boolean).join(';'),
+      };
+      const proc = spawn(bash, ['-lc',
+        'tmux has-session -t imp 2>/dev/null && [ "$(tmux list-panes -t imp 2>/dev/null | wc -l)" -ge 7 ] && echo OK || echo MISSING'
+      ], { env, windowsHide: true, timeout: 10_000 });
+      let out = '';
+      proc.stdout && proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.on('error', () => resolve(false));
+      proc.on('close', () => resolve(/OK/.test(out)));
+    });
   },
   async execute(ctx) {
-    const script = `
-      set -e
-      SESSION="imp"
-      SQUAD_ROOT="/mnt/c/Projetos/_squad"
-      ORCH_ROOT="/mnt/c/Projetos/imp-orchestrator"
-      if tmux has-session -t "$SESSION" 2>/dev/null; then
-        # Per decision D5: respect if healthy (7 panes). Else recreate.
-        if [ "$(tmux list-panes -t "$SESSION" | wc -l)" = "7" ]; then
-          exit 0
-        fi
-        tmux kill-session -t "$SESSION"
-      fi
-      tmux new-session -d -s "$SESSION" -n agents -c "$SQUAD_ROOT/lider"
-      for dir in arquiteto criativo debugger qa revisor; do
-        tmux split-window -t "$SESSION" -c "$SQUAD_ROOT/$dir"
-        tmux select-layout -t "$SESSION" tiled
-      done
-      tmux split-window -t "$SESSION" -c "$ORCH_ROOT"
-      tmux select-layout -t "$SESSION" tiled
-      tmux set -t "$SESSION" -g pane-border-status top
-      PANES=( $(tmux list-panes -t "$SESSION" -F '#{pane_id}') )
-      LABELS=(lider arquiteto criativo debugger qa revisor main)
-      for i in "\${!PANES[@]}"; do
-        tmux select-pane -t "\${PANES[$i]}" -T "\${LABELS[$i]}"
-      done
-      for pid in "\${PANES[@]}"; do
-        tmux send-keys -t "$pid" 'claude' C-m
-      done
-    `;
-    await wsl(script, { distro: ctx.state.distro, user: ctx.state.ubuntuUser, timeout: 60_000, logger: ctx.logger });
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    ctx.logger.info(this.id, 'criando sessão tmux imp com 7 painéis...');
+    await launchTmuxSquadSession(versionDir, { timeout: 60_000 });
+    ctx.logger.info(this.id, 'sessão tmux imp criada');
   },
   async validate(ctx) { return this.detect(ctx); },
 };
 
-// -------- step 15 — download imp-interface portable + shortcut -----------
-const step15DownloadInterface = {
-  id: 'step_15_download_interface',
-  title: 'Baixar IMP-Squad-Comando + atalho Desktop',
-  description: 'Pega o release latest (com fallback v0.3.1) e cria shortcut Squad Comando.lnk.',
+// -------- step_X5 — desktopShortcut ---------------------------------------
+const stepX5DesktopShortcut = {
+  id: 'step_x5_desktop_shortcut',
+  title: 'Atalho Desktop (IMP Squad.lnk)',
+  description: 'Cria shortcut .lnk apontando pra imp-squad.bat — duplo-clique reabre a squad.',
   category: 'AUTO',
-  async detect() {
-    try {
-      const script = `
-        $desktop = [Environment]::GetFolderPath("Desktop")
-        $lnk = Join-Path $desktop 'Squad Comando.lnk'
-        if ((Test-Path $lnk) -and (Test-Path "$env:LOCALAPPDATA\\IMP-Squad\\IMP-Squad.exe")) { 'OK' } else { 'MISSING' }
-      `;
-      const { stdout } = await powershell(script);
-      return /OK/.test(stdout);
-    } catch (_) { return false; }
+  async detect(ctx) {
+    const desktop = path.join(os.homedir(), 'Desktop');
+    const lnk = path.join(desktop, 'IMP Squad.lnk');
+    const cmdFallback = path.join(desktop, 'IMP Squad.cmd');
+    return fs.existsSync(lnk) || fs.existsSync(cmdFallback);
   },
   async execute(ctx) {
-    const ps = `
-      $ErrorActionPreference = 'Stop'
-      $ExeDir  = "$env:LOCALAPPDATA\\IMP-Squad"
-      $ExePath = "$ExeDir\\IMP-Squad.exe"
-      $Desktop = [Environment]::GetFolderPath("Desktop")
-      $LnkPath = Join-Path $Desktop 'Squad Comando.lnk'
-      New-Item -ItemType Directory -Force -Path $ExeDir | Out-Null
+    const version = ctx.state.runtimeVersion || getRuntimeVersion();
+    const versionDir = ctx.state.runtimePath || getRuntimeVersionDir(version);
+    const batPath = path.join(versionDir, 'scripts', 'imp-squad.bat');
 
-      # Resolve latest release URL via GitHub API; fallback to pinned v0.3.1.
-      $UrlLatest = $null
-      try {
-        $api = Invoke-RestMethod -Uri 'https://api.github.com/repos/kennrick69/imp-interface/releases/latest' -Headers @{ 'User-Agent' = 'imp-installer' } -TimeoutSec 15
-        $asset = $api.assets | Where-Object { $_.name -like '*portable*.exe' } | Select-Object -First 1
-        if ($asset) { $UrlLatest = $asset.browser_download_url }
-      } catch {}
-      if (-not $UrlLatest) {
-        $UrlLatest = 'https://github.com/kennrick69/imp-interface/releases/download/v0.3.1/IMP-Squad-Comando-0.3.1-portable.exe'
-      }
-
-      curl.exe -L --fail --retry 3 -o $ExePath $UrlLatest
-      if (-not (Test-Path $ExePath)) { throw "Download falhou: $UrlLatest" }
-
-      $WshShell = New-Object -ComObject WScript.Shell
-      $Shortcut = $WshShell.CreateShortcut($LnkPath)
-      $Shortcut.TargetPath       = $ExePath
-      $Shortcut.WorkingDirectory = $ExeDir
-      $Shortcut.IconLocation     = "$ExePath,0"
-      $Shortcut.Description      = 'IMP Squad - Painel de Comando'
-      $Shortcut.Save()
-      "OK"
-    `;
-    await withRetry(
-      () => powershell(ps, { timeout: 600_000 }),
-      { label: 'download interface', attempts: 3, backoff: [5, 20, 60], logger: ctx.logger }
-    );
-  },
-  async validate() { return this.detect(); },
-};
-
-// -------- step 16 — end-to-end validation ---------------------------------
-const step16ValidateEndToEnd = {
-  id: 'step_16_e2e',
-  title: 'Validação end-to-end',
-  description: 'Confirma que sessão imp tem 7 panes com claude vivo + .exe pronto pra abrir.',
-  category: 'AUTO',
-  async detect() {
-    // E2E is always re-run on demand.
-    return false;
-  },
-  async execute(ctx) {
-    // 1) tmux has 7 panes
-    const { stdout: p } = await wsl(`tmux list-panes -t imp 2>/dev/null | wc -l`,
-      { distro: ctx.state.distro, user: ctx.state.ubuntuUser });
-    if (parseInt(p.trim(), 10) !== 7) throw new Error(`sessão imp não tem 7 panes (achou ${p.trim()})`);
-
-    // 2) At least one pane shows claude prompt activity
-    const { stdout: cap } = await wsl(`tmux capture-pane -t imp.0 -p -S -100 | tail -50`,
-      { distro: ctx.state.distro, user: ctx.state.ubuntuUser });
-    if (!/claude|>|■|│/i.test(cap)) {
-      ctx.logger.warn('e2e', 'pane 0 não mostra prompt do Claude — pode estar carregando ainda');
+    // Garante que o bat existe (idempotência defensiva)
+    if (!fs.existsSync(batPath)) {
+      writeImpSquadBat(versionDir);
     }
 
-    // 3) interface .exe and shortcut exist
-    const { stdout } = await powershell(`
-      $desktop = [Environment]::GetFolderPath("Desktop")
-      $lnk = Join-Path $desktop 'Squad Comando.lnk'
-      if ((Test-Path $lnk) -and (Test-Path "$env:LOCALAPPDATA\\IMP-Squad\\IMP-Squad.exe")) { 'OK' } else { 'MISSING' }
-    `);
-    if (!/OK/.test(stdout)) throw new Error('Squad Comando shortcut/.exe ausente');
+    ctx.logger.info(this.id, `criando shortcut Desktop apontando pra ${batPath}`);
+    const r = await createDesktopShortcut(batPath, 'IMP Squad');
+    ctx.logger.info(this.id, `shortcut: ${r.raw}`);
   },
-  async validate() { return true; },
+  async validate(ctx) { return this.detect(ctx); },
 };
 
-// Ordered list — runner iterates this.
+// ───────────────────────────────────────────────────────────────────────
+// ALL_STEPS — ordem matters. step_00 primeiro, depois os 5 novos.
+// ───────────────────────────────────────────────────────────────────────
 const ALL_STEPS = [
   step00Preflight,
-  step01EnableFeatures,
-  step02SetWslDefaultV2,
-  step03WslInstall,
-  step04UbuntuFirstBoot,
-  step05AptBase,
-  step06NodeViaNvm,
-  step07NpmPrefix,
-  step08ClaudeCli,
-  step09ClaudeLogin,
-  step10GhAuth,
-  step11CloneSquad,
-  step12CloneOrchestrator,
-  step13Sala3D,
-  step14TmuxSession,
-  step15DownloadInterface,
-  step16ValidateEndToEnd,
+  stepX1CopyRuntime,
+  stepX2SetupEnv,
+  stepX3GithubAuth,
+  stepX4LaunchTmux,
+  stepX5DesktopShortcut,
 ];
 
 module.exports = {
   ALL_STEPS,
+  // Steps individuais (export pra tests poderem importar)
   step00Preflight,
-  step01EnableFeatures,
-  step02SetWslDefaultV2,
-  step03WslInstall,
-  step04UbuntuFirstBoot,
-  step05AptBase,
-  step06NodeViaNvm,
-  step07NpmPrefix,
-  step08ClaudeCli,
-  step09ClaudeLogin,
-  step10GhAuth,
-  step11CloneSquad,
-  step12CloneOrchestrator,
-  step13Sala3D,
-  step14TmuxSession,
-  step15DownloadInterface,
-  step16ValidateEndToEnd,
-  // Bruno v0.2.16 — helpers diagnósticos (usados por validate dos 01/02/03)
-  wslIsFunctional,
-  writeWslDiagLog,
-  // Bruno (noturna 2026-05-27) — fluxo WSL legacy→moderno
-  ensureFeatures,
-  wslIsFunctionalLite,
+  stepX1CopyRuntime,
+  stepX2SetupEnv,
+  stepX3GithubAuth,
+  stepX4LaunchTmux,
+  stepX5DesktopShortcut,
+  // Helpers expostos pra main.js (applyAvExclusion handler) e tests
+  copyRuntimeWithProgress,
+  detectAv,
+  detectAppLocker,
+  addDefenderExclusion,
+  launchTmuxSquadSession,
+  createDesktopShortcut,
+  createJunction,
+  checkFreeSpace,
+  writeImpSquadBat,
+  writeSetupSh,
+  ghAuthStatus,
+  // Path helpers (Camila + main.js usam)
+  getLocalAppData,
+  getRuntimeRoot,
+  getRuntimeVersionDir,
+  getRuntimeCurrentDir,
+  getRuntimeVersion,
+  resolveRuntimeBin,
+  findRuntimeArchive,
 };

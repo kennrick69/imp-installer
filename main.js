@@ -8,7 +8,7 @@ const { spawn } = require('node:child_process');
 
 const runner = require('./src/runner');
 const preflight = require('./src/preflight');
-const { ALL_STEPS } = require('./src/executors');
+const { ALL_STEPS, addDefenderExclusion, getRuntimeVersion, getRuntimeVersionDir, getRuntimeCurrentDir } = require('./src/executors');
 const { openInteractiveTerminal, isElevated, relaunchAsAdmin, detectWslState, forceRebootWindows, cancelReboot, scheduleRunOnceAfterReboot } = require('./src/shell');
 const { enrichError } = require('./src/error-catalog');
 
@@ -181,6 +181,13 @@ function buildRunnerEvents() {
     // Eduardo lastmile v0.2.17 — onScreen + onWslUpgradeProgress podem vir do executor
     onScreen: (payload) => sendToRenderer('installer:onScreen', payload),
     onWslUpgradeProgress: (payload) => sendToRenderer('installer:onWslUpgradeProgress', payload),
+    // FASE 2 (Bruno 2026-05-27) — eventos do runtime MSYS2 embarcado.
+    // step_x1 emite onCopyRuntimeProgress; step_x2 emite onNeedsAvExclusion
+    // se Defender ativo (UI mostra modal "Adicionar exclusão?" com botão UAC),
+    // e onAppLockerBlocked se política corporativa detectada.
+    onCopyRuntimeProgress: (payload) => sendToRenderer('installer:onCopyRuntimeProgress', payload),
+    onNeedsAvExclusion: (payload) => sendToRenderer('installer:onNeedsAvExclusion', payload),
+    onAppLockerBlocked: (payload) => sendToRenderer('installer:onAppLockerBlocked', payload),
     onStepUpdate: (upd) => {
       sendToRenderer('installer:onStepUpdate', {
         stepId: upd.id,
@@ -474,10 +481,11 @@ safeHandle('installer:runAll', async () => {
     const allDone = safeResults.length === ALL_STEPS.length && allTerminalPositive;
     if (allDone) {
       const st = runner.getState();
-      const sala3dDone = !!(st && st.steps && st.steps['step_13_sala3d'] === 'done');
+      // FASE 2: Sala 3D foi removida do fluxo principal. Mantemos o campo
+      // sempre `false` por compat com renderer antigo até Camila atualizar UI.
       sendToRenderer('installer:onComplete', {
         durationSeconds: 0,
-        sala3dInstalled: sala3dDone,
+        sala3dInstalled: false,
       });
     }
   }).catch((e) => {
@@ -706,8 +714,11 @@ safeHandle('installer:exportLogs', async () => {
 }, { emitOnError: false });
 
 safeHandle('installer:installSala3D', async () => {
-  return runner.runStep('step_13_sala3d', buildRunnerEvents());
-}, { stepId: 'step_13_sala3d' });
+  // FASE 2: Sala 3D não faz mais parte do fluxo principal. Handler mantido
+  // pra não quebrar UI antiga; retorna `skipped` pra renderer não pendurar.
+  return { ok: true, id: 'step_x_sala3d_deprecated', status: 'skipped',
+           reason: 'sala-3d-removida-na-fase-2' };
+}, { stepId: 'step_x_sala3d_deprecated' });
 
 // Fix Eduardo 2.5: passo 15 cria Desktop/Squad Comando.lnk + %LOCALAPPDATA%\IMP-Squad\IMP-Squad.exe
 safeHandle('installer:openInterface', async () => {
@@ -723,6 +734,50 @@ safeHandle('installer:openInterface', async () => {
     }
   }
   return { ok: false, error: 'imp-interface.exe não encontrado — instale o passo 15 primeiro' };
+}, { emitOnError: false });
+
+// ───────────────────────────────────────────────────────────────────────
+// FASE 2 — runtime MSYS2 embarcado (Bruno 2026-05-27)
+//
+// installer:applyAvExclusion — UI chama com { folder? } quando JOs aceita o
+// modal "Adicionar exclusão Defender". Requer admin; se o EXE não está
+// elevado, devolve { ok: false, needsAdmin: true } pra UI mostrar UAC retry.
+// Folder default = pasta do runtime ativo.
+// ───────────────────────────────────────────────────────────────────────
+safeHandle('installer:applyAvExclusion', async (_e, args = {}) => {
+  const folder = args.folder
+    || getRuntimeVersionDir(getRuntimeVersion())
+    || getRuntimeCurrentDir();
+  if (!folder) {
+    return { ok: false, error: 'pasta do runtime não resolvida' };
+  }
+  if (!(await isElevated())) {
+    return { ok: false, needsAdmin: true,
+      error: 'Add-MpPreference requer admin — clique "Reabrir como administrador"' };
+  }
+  const r = await addDefenderExclusion(folder);
+  if (r.ok) {
+    sendToRenderer('installer:onLog', {
+      ts: new Date().toISOString(), level: 'info', component: 'av',
+      message: `Exclusão Defender adicionada pra ${folder}`,
+    });
+  }
+  return r;
+}, { emitOnError: false });
+
+// installer:getRuntimeInfo — UI usa pra mostrar versão/pasta do runtime
+// ativo no painel "Pronto pra usar".
+safeHandle('installer:getRuntimeInfo', async () => {
+  const version = getRuntimeVersion();
+  const versionDir = getRuntimeVersionDir(version);
+  const currentDir = getRuntimeCurrentDir();
+  return {
+    ok: true,
+    version,
+    versionPath: versionDir,
+    currentPath: currentDir,
+    installed: fs.existsSync(versionDir),
+  };
 }, { emitOnError: false });
 
 safeHandle('installer:pause', async () => {

@@ -12,29 +12,19 @@
   'use strict';
 
   // ───────────────────────────────────────────────────────────
-  // Definição dos 17 passos (espelha o ROTEIRO-INSTALACAO-SQUAD.md)
-  // O backend (Bruno/Claudio) é fonte da verdade — isto aqui é
-  // só pra renderizar a sidebar imediatamente, antes do primeiro
+  // FASE 2 (Camila 2026-05-27): 17 → 5 steps
+  // Sidebar redesenhada pra virada autossuficiente (MSYS2 portable
+  // embarcado, sem WSL). Vide DECISAO-FASE1.md + MARCOS-EMBARCAR.md.
+  // O backend (Bruno) é fonte da verdade — isto aqui é só pra
+  // renderizar a sidebar imediatamente, antes do primeiro
   // onStepUpdate chegar.
   // ───────────────────────────────────────────────────────────
   const STEPS = [
-    { id: 'step_00_preflight',          num: 0,  name: 'Pré-flight check',          cat: 'auto'   },
-    { id: 'step_01_enable_features',    num: 1,  name: 'Habilitar features WSL',    cat: 'auto'   },
-    { id: 'step_02_set_wsl_default_v2', num: 2,  name: 'WSL default version 2',     cat: 'auto'   },
-    { id: 'step_03_wsl_install',        num: 3,  name: 'Instalar WSL2 + Ubuntu',    cat: 'hybrid' },
-    { id: 'step_04_ubuntu_first_boot',  num: 4,  name: '1ª boot do Ubuntu',         cat: 'manual' },
-    { id: 'step_05_apt_base',           num: 5,  name: 'Pacotes apt base',          cat: 'auto'   },
-    { id: 'step_06_node_nvm',           num: 6,  name: 'Node 20 LTS',               cat: 'auto'   },
-    { id: 'step_07_npm_prefix',         num: 7,  name: 'npm global sem sudo',       cat: 'auto'   },
-    { id: 'step_08_claude_cli',         num: 8,  name: 'Claude Code CLI',           cat: 'auto'   },
-    { id: 'step_09_claude_login',       num: 9,  name: 'Login Claude',              cat: 'manual' },
-    { id: 'step_10_gh_auth',            num: 10, name: 'GitHub auth (Device Flow)', cat: 'hybrid' },
-    { id: 'step_11_clone_squad',        num: 11, name: 'Clonar imp-squad',          cat: 'auto'   },
-    { id: 'step_12_clone_orchestrator', num: 12, name: 'Clonar imp-orchestrator',   cat: 'auto'   },
-    { id: 'step_13_sala3d',             num: 13, name: 'Sala 3D (opcional)',        cat: 'auto'   },
-    { id: 'step_14_tmux_session',       num: 14, name: 'Sessão tmux imp (7 painéis)', cat: 'auto' },
-    { id: 'step_15_download_interface', num: 15, name: 'Baixar Squad Comando.exe', cat: 'auto'   },
-    { id: 'step_16_e2e',                num: 16, name: 'Validação end-to-end',      cat: 'auto'   }
+    { id: 'step_x1_copy_runtime',  num: 1, name: 'Instalar runtime',           cat: 'auto'   },
+    { id: 'step_x2_setup_env',     num: 2, name: 'Configurar ambiente',        cat: 'auto'   },
+    { id: 'step_x3_github_auth',   num: 3, name: 'Login GitHub',               cat: 'hybrid' },
+    { id: 'step_x4_launch_tmux',   num: 4, name: 'Iniciar squad (7 painéis)',  cat: 'auto'   },
+    { id: 'step_x5_desktop',       num: 5, name: 'Atalho no Desktop',          cat: 'auto'   }
   ];
 
   const STEP_BY_ID  = Object.fromEntries(STEPS.map(s => [s.id, s]));
@@ -90,7 +80,11 @@
       sudoReply:    async () => ({ ok: true }),
       // Camila noturna 2026-05-27 — handlers e eventos das telas novas
       scheduleRebootAndQuit: noopAsync,
-      onWslUpgradeProgress:  (cb) => { /* noop */ }
+      onWslUpgradeProgress:  (cb) => { /* noop */ },
+      // Camila FASE 2 2026-05-27 — copy runtime + AV exclusion
+      applyAvExclusion:      noopAsync,
+      onCopyRuntimeProgress: (cb) => { /* noop */ },
+      onNeedsAvExclusion:    (cb) => { /* noop */ }
     };
   }
 
@@ -244,25 +238,13 @@
   }
 
   function describeStep(meta) {
-    // descrições humanas curtas pro usuário — espelham o ROTEIRO
+    // descrições humanas curtas pro usuário — FASE 2: 5 steps autossuficientes
     const map = {
-      step_00_preflight:         'Conferindo que seu computador está pronto.',
-      step_01_enable_features:   'Habilitando os componentes do Windows que o WSL precisa.',
-      step_02_set_wsl_default_v2:'Garantindo que novas distros venham na versão 2 (mais rápida).',
-      step_03_wsl_install:       'Baixando o kernel WSL2 e o Ubuntu. Vai precisar reiniciar.',
-      step_04_ubuntu_first_boot: 'Criando seu usuário Linux. Vou abrir o Ubuntu pra você.',
-      step_05_apt_base:          'Instalando tmux, git, curl e ferramentas de build.',
-      step_06_node_nvm:          'Instalando o Node 20 LTS via nvm.',
-      step_07_npm_prefix:        'Configurando o npm pra instalar pacotes sem sudo.',
-      step_08_claude_cli:        'Instalando o Claude Code CLI globalmente.',
-      step_09_claude_login:      'Vou abrir o login do Claude pra você autenticar com sua conta Max.',
-      step_10_gh_auth:           'Conectando ao GitHub com Device Flow (seguro).',
-      step_11_clone_squad:       'Clonando o repositório imp-squad em C:\\Projetos.',
-      step_12_clone_orchestrator: 'Clonando o imp-orchestrator e rodando npm install.',
-      step_13_sala3d:            'A sala 3D é opcional — você pode instalar agora ou depois.',
-      step_14_tmux_session:      'Criando a sessão tmux "imp" com os 7 painéis da squad.',
-      step_15_download_interface: 'Baixando o Squad Comando e criando atalho no Desktop.',
-      step_16_e2e:               'Abrindo o Squad Comando e validando que conecta na squad.'
+      step_x1_copy_runtime: 'Copiando o ambiente Linux pra dentro do seu PC. Só acontece uma vez.',
+      step_x2_setup_env:    'Ajustando paths, HOME e validando tmux, git, node e claude.',
+      step_x3_github_auth:  'Conectando ao GitHub com Device Flow (seguro, sem digitar senha).',
+      step_x4_launch_tmux:  'Criando a sessão tmux "imp" com os 7 painéis da squad.',
+      step_x5_desktop:      'Atalho no Desktop pra reabrir a squad com um clique.'
     };
     return map[meta.id] || '';
   }
@@ -922,17 +904,21 @@
   // ───────────────────────────────────────────────────────────
 
   // Telas que devem mostrar a barra global + log peek
-  const WORK_SCREENS = new Set(['preflight', 'progress', 'manual']);
+  // Camila FASE 2 2026-05-27: + 'copying-runtime' (1 min de cópia precisa de chrome)
+  const WORK_SCREENS = new Set(['preflight', 'progress', 'manual', 'copying-runtime']);
 
-  // Telas em que a sidebar global dos 17 passos deve aparecer
+  // Telas em que a sidebar global dos 5 passos deve aparecer
   // Camila v0.2.11: sidebar virou persistente — visível em preflight, progress,
   // manual e error. Esconde só no welcome e no done.
   // Camila noturna 2026-05-27: + 'reboot' e 'wsl-upgrade' pra sidebar continuar
   // visível durante o gate de reboot e a migração WSL legado.
+  // Camila FASE 2 2026-05-27: + 'copying-runtime' pra JOs ver Step 1/5 destacado
+  // enquanto a barra de cópia anda.
   const SIDEBAR_SCREENS = new Set([
     'preflight', 'progress', 'manual', 'error',
-    'reboot',        // tela de reboot forçado
-    'wsl-upgrade'    // tela de migração WSL legado→moderno
+    'reboot',          // tela de reboot forçado (legado WSL, pode sair na FASE 3)
+    'wsl-upgrade',     // tela de migração WSL legado→moderno (legado)
+    'copying-runtime'  // FASE 2 — cópia MSYS2 portable pra LOCALAPPDATA
   ]);
 
   // Status pill (topbar) — estado global
@@ -1416,6 +1402,156 @@
     }
   }
 
+  // ───────────────────────────────────────────────────────────
+  // Tela COPY RUNTIME — FASE 2 (Camila 2026-05-27)
+  // Cópia do MSYS2 portable (~680MB) pra %LOCALAPPDATA%\IMP-Squad-Runtime
+  // Dura ~1 min e só acontece na 1ª execução. Barra REAL alimentada
+  // pelo backend via api.onCopyRuntimeProgress({pct, bytesDone, totalBytes, eta, dest?}).
+  // Se nada mexer em 60s: mostra aviso AV (#cr-av-warn) sugerindo antivírus.
+  // ───────────────────────────────────────────────────────────
+  let _crStallTimer = null;
+  let _crLastPct = -1;
+
+  function showCopyRuntimeScreen(payload = {}) {
+    // Reseta visual ao entrar
+    const fill = $('#cr-fill');
+    const pct = $('#cr-pct');
+    const bytes = $('#cr-bytes');
+    const eta = $('#cr-eta');
+    const dest = $('#cr-dest');
+    const warn = $('#cr-av-warn');
+    if (fill) fill.style.width = '0%';
+    if (pct) pct.textContent = '0%';
+    if (bytes) bytes.textContent = '0 MB de 680 MB';
+    if (eta) eta.textContent = 'calculando...';
+    if (warn) warn.classList.add('hidden');
+    if (dest && payload.dest) dest.textContent = payload.dest;
+
+    _crLastPct = -1;
+    armCopyRuntimeStallWatch();
+
+    // Marca step 1 como running na sidebar (visual coerente)
+    setStepState('step_x1_copy_runtime', 'running');
+    setCurrentStep('step_x1_copy_runtime', { progress: 0 });
+
+    showScreen('copying-runtime');
+    setStatusPill('working', 'Preparando ambiente (cópia única)…');
+    setGlobalProgress({ text: 'Copiando runtime (uma vez só)…', done: 0, total: STEP_TOTAL, percent: 0 });
+  }
+
+  function updateCopyRuntime({ pct, bytesDone, totalBytes, eta, dest } = {}) {
+    const fillEl = $('#cr-fill');
+    const pctEl = $('#cr-pct');
+    const bytesEl = $('#cr-bytes');
+    const etaEl = $('#cr-eta');
+    const destEl = $('#cr-dest');
+    if (typeof pct === 'number') {
+      const p = Math.max(0, Math.min(100, pct));
+      if (fillEl) fillEl.style.width = p + '%';
+      if (pctEl) pctEl.textContent = Math.round(p) + '%';
+      // se o pct mexeu, esconde o aviso AV e reinicia watchdog
+      if (p !== _crLastPct) {
+        const warn = $('#cr-av-warn');
+        if (warn) warn.classList.add('hidden');
+        _crLastPct = p;
+        armCopyRuntimeStallWatch();
+      }
+      // mantém step bar central em sync
+      if (ui.currentStepId === 'step_x1_copy_runtime') {
+        const stepFill = $('#step-fill');
+        if (stepFill) stepFill.style.width = p + '%';
+      }
+    }
+    if (typeof bytesDone === 'number' && typeof totalBytes === 'number' && bytesEl) {
+      const mbDone = Math.round(bytesDone / (1024 * 1024));
+      const mbTotal = Math.round(totalBytes / (1024 * 1024));
+      bytesEl.textContent = `${mbDone} MB de ${mbTotal} MB`;
+    } else if (typeof bytesDone === 'number' && bytesEl) {
+      bytesEl.textContent = `${Math.round(bytesDone / (1024 * 1024))} MB copiados`;
+    }
+    if (etaEl) {
+      if (typeof eta === 'string') etaEl.textContent = eta;
+      else if (typeof eta === 'number') etaEl.textContent = formatETA(eta);
+    }
+    if (dest && destEl) destEl.textContent = dest;
+
+    // 100% → desarma watchdog (backend vai mandar onScreen pra próxima)
+    if (typeof pct === 'number' && pct >= 100) {
+      clearCopyRuntimeStallWatch();
+    }
+  }
+
+  function armCopyRuntimeStallWatch() {
+    clearCopyRuntimeStallWatch();
+    _crStallTimer = setTimeout(() => {
+      const warn = $('#cr-av-warn');
+      if (warn) warn.classList.remove('hidden');
+    }, 60 * 1000);
+  }
+  function clearCopyRuntimeStallWatch() {
+    if (_crStallTimer) { clearTimeout(_crStallTimer); _crStallTimer = null; }
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // Modal AV EXCLUSION — FASE 2 (Camila 2026-05-27)
+  // Pede ao Windows Defender pra liberar a pasta IMP-Squad-Runtime
+  // como exclusão. Backend dispara api.onNeedsAvExclusion({path}).
+  // Botão primary chama api.applyAvExclusion(path); skip = toast.
+  // ───────────────────────────────────────────────────────────
+  function showAvExclusionModal(payload = {}) {
+    const pathEl = $('#av-exclusion-path');
+    const path = payload.path || '%LOCALAPPDATA%\\IMP-Squad-Runtime';
+    if (pathEl) pathEl.textContent = path;
+    const applyBtn = $('#btn-av-apply');
+    if (applyBtn) {
+      applyBtn.disabled = false;
+      applyBtn.dataset.path = path;
+      applyBtn.innerHTML = '🛡 Liberar pasta agora';
+    }
+    openModal('modal-av-exclusion');
+  }
+
+  function bindAvExclusion() {
+    const applyBtn = $('#btn-av-apply');
+    const skipBtn = $('#btn-av-skip');
+    if (applyBtn) {
+      applyBtn.addEventListener('click', async () => {
+        const path = applyBtn.dataset.path || '%LOCALAPPDATA%\\IMP-Squad-Runtime';
+        applyBtn.disabled = true;
+        applyBtn.innerHTML = '<span class="imp-spinner"></span> Aguardando UAC…';
+        try {
+          const fn = (api && typeof api.applyAvExclusion === 'function')
+            ? api.applyAvExclusion.bind(api)
+            : null;
+          const r = fn ? await fn(path) : { ok: false, error: 'applyAvExclusion não disponível' };
+          if (r && r.ok) {
+            applyBtn.innerHTML = '✓ Liberada';
+            toast('Pasta liberada no Defender. Vai escanear bem mais rápido.', 'success', 6000);
+            setTimeout(() => closeModal('modal-av-exclusion'), 900);
+          } else if (r && r.error === 'UAC_CANCELLED') {
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '🛡 Liberar pasta agora';
+            toast('Você cancelou o UAC. Vai funcionar, só mais lento.', 'warn', 6000);
+          } else {
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '🛡 Liberar pasta agora';
+            toast('Não consegui liberar: ' + ((r && r.error) || 'erro'), 'error', 7000);
+          }
+        } catch (e) {
+          applyBtn.disabled = false;
+          applyBtn.innerHTML = '🛡 Liberar pasta agora';
+          toast('Erro: ' + (e?.message || ''), 'error');
+        }
+      });
+    }
+    if (skipBtn) {
+      skipBtn.addEventListener('click', () => {
+        closeModal('modal-av-exclusion');
+        toast('Vai funcionar, só mais lento.', 'info', 5000);
+      });
+    }
+  }
+
   function bindWslUpgrade() {
     const openLink = $('#btn-wsl-up-open-link');
     const manualDone = $('#btn-wsl-up-manual-done');
@@ -1736,10 +1872,10 @@
         });
         setConnection('ok');
         // status pill + barra global refletem o passo atual
-        setStatusPill('working', `Processando passo ${num}/${STEP_TOTAL - 1}: ${name}`);
+        setStatusPill('working', `Processando passo ${num}/${STEP_TOTAL}: ${name}`);
         const done = Object.values(ui.stepStates).filter(s => s === 'done' || s === 'skipped').length;
         setGlobalProgress({
-          text: `Passo ${num} de ${STEP_TOTAL - 1}: ${name}`,
+          text: `Passo ${num} de ${STEP_TOTAL}: ${name}`,
           done, total: STEP_TOTAL
         });
         armStepWait(update.stepId);
@@ -1824,6 +1960,11 @@
         showWslUpgradeScreen(data);
         return;
       }
+      // Camila FASE 2 2026-05-27 — cópia do runtime MSYS2 portable
+      if (name === 'copying-runtime' || name === 'copy-runtime') {
+        showCopyRuntimeScreen(data);
+        return;
+      }
       showScreen(name);
     });
     api.onToast  && api.onToast(({ message, kind }) => toast(message, kind));
@@ -1832,6 +1973,18 @@
     // payload = { stage, pct, detail, logLine }
     api.onWslUpgradeProgress && api.onWslUpgradeProgress((payload) => {
       updateWslUpgrade(payload || {});
+    });
+
+    // Camila FASE 2 2026-05-27 — progresso da cópia do runtime MSYS2
+    // payload = { pct, bytesDone, totalBytes, eta, dest? }
+    api.onCopyRuntimeProgress && api.onCopyRuntimeProgress((payload) => {
+      updateCopyRuntime(payload || {});
+    });
+
+    // Camila FASE 2 2026-05-27 — backend pede exclusão Defender pra acelerar cópia
+    // payload = { path }
+    api.onNeedsAvExclusion && api.onNeedsAvExclusion((payload) => {
+      showAvExclusionModal(payload || {});
     });
 
     // Fix Eduardo 2.3 — modal de sudo (passos 05, 10 precisam)
@@ -1897,6 +2050,7 @@
     bindElevateModal();
     bindReboot();         // Camila noturna 2026-05-27 — tela #screen-reboot
     bindWslUpgrade();     // Camila noturna 2026-05-27 — tela #screen-wsl-upgrade
+    bindAvExclusion();    // Camila FASE 2 2026-05-27 — modal #modal-av-exclusion
     bindDone();
     bindTopbar();
     bindBackendEvents();

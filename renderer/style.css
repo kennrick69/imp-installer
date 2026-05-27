@@ -2453,3 +2453,168 @@ body {
 }
 .ef-steps li::marker { color: #fbbf24; font-weight: 600; }
 .ef-hint { font-size: 11px; color: var(--text-secondary); font-style: italic; margin: 0; }
+
+/* ════════════════════════════════════════════════════════════
+   TELA — COPYING RUNTIME (FASE 2 — Camila 2026-05-27)
+   Cópia única do MSYS2 portable pra LOCALAPPDATA.
+   Barra teal pulsante, stats em monospace, info card teal-suave,
+   aviso AV em amber só aparece quando barra trava >60s.
+   ════════════════════════════════════════════════════════════ */
+.copy-runtime-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 32px 28px;
+}
+.copy-runtime-wrap .screen-head h2 {
+  font-size: 22px;
+}
+
+.cr-progress-card {
+  background: var(--grad-card);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-card);
+}
+
+.cr-bar {
+  height: 14px;
+  background: var(--bg-darker);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+  position: relative;
+}
+
+.cr-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-radius: 6px;
+  transition: width .5s ease;
+  box-shadow: 0 0 12px var(--accent-glow);
+  position: relative;
+  overflow: hidden;
+}
+/* shimmer pulsante na cópia em andamento */
+.cr-fill::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.30) 50%,
+    transparent 100%);
+  animation: crShimmer 1.6s linear infinite;
+}
+@keyframes crShimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+
+.cr-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.cr-stats #cr-pct {
+  font-weight: 700;
+  color: var(--accent-hover);
+  font-size: 15px;
+}
+.cr-stats #cr-bytes { color: var(--text-secondary); }
+.cr-stats #cr-eta { color: var(--text-secondary); }
+.cr-stats .cr-sep { color: var(--text-muted); }
+
+.cr-info {
+  background: var(--accent-soft);
+  border: 1px solid rgba(13, 148, 136, 0.30);
+  border-radius: 10px;
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.cr-info p { margin: 0; color: var(--text-primary); }
+.cr-info code {
+  background: var(--bg-darker);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--accent-hover);
+  word-break: break-all;
+}
+
+.cr-warn {
+  background: rgba(245, 158, 11, 0.10);
+  border: 1px solid rgba(245, 158, 11, 0.40);
+  border-left: 4px solid var(--warn);
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  animation: slideIn .3s ease-out;
+}
+
+/* ════════════════════════════════════════════════════════════
+   MODAL — AV EXCLUSION (FASE 2 — Camila 2026-05-27)
+   Pedir ao Defender pra liberar pasta IMP-Squad-Runtime.
+   Header com escudo amber, card destacando path, primary teal.
+   ════════════════════════════════════════════════════════════ */
+.modal.modal-av {
+  width: min(560px, 95vw);
+}
+.modal.modal-av header h2 {
+  color: #fbbf24;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.35;
+}
+.modal.modal-av header {
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.10), transparent);
+  border-bottom-color: rgba(245, 158, 11, 0.30);
+}
+.modal.modal-av .av-card {
+  background: var(--accent-soft);
+  border: 1px solid rgba(13, 148, 136, 0.30);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.modal.modal-av .av-card strong {
+  color: var(--accent-hover);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.modal.modal-av .av-card code {
+  display: inline-block;
+  margin-top: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  background: var(--bg-darker);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+.modal.modal-av #btn-av-apply {
+  font-weight: 600;
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
