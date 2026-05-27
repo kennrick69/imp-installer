@@ -389,6 +389,13 @@ async function _markRebootAndScheduleRunOnce(ctx, stepId, reason) {
   // Bruno (noturna 2026-05-27): contador pra detectar loop infinito de reboot.
   ctx.state.rebootCount = (ctx.state.rebootCount || 0) + 1;
   ctx.save();
+  // Eduardo lastmile v0.2.17: emite onScreen('reboot') pra UI MOSTRAR a tela
+  // dedicada da Camila com botão "Salvar e reiniciar". Antes caía no modal
+  // de erro genérico — JOs perdia a tela bonita.
+  if (ctx.events && typeof ctx.events.onScreen === 'function') {
+    try { ctx.events.onScreen({ screen: 'reboot', stepId, reason: reason || ctx.state.rebootBlockingReason }); }
+    catch (_) {}
+  }
   if (ctx.state.rebootCount > 3) {
     ctx.logger.error(stepId, `WSL_TOO_MANY_REBOOTS — ${ctx.state.rebootCount} reboots e ainda não funcional`);
     const err = new Error(`Reinícios excessivos (${ctx.state.rebootCount}). Algo no Windows está impedindo o WSL — peça ajuda manual.`);
@@ -550,7 +557,17 @@ const step01EnableFeatures = {
       ctx.logger.info('step_01', `wslState=${state0.state} → instalando WSL moderno via MSI...`);
       ctx.state.wslMigrationAttempted = true;
       ctx.save && ctx.save();
-      const msi = await installWslModernViaMsi({ logger: ctx.logger });
+      // Eduardo lastmile v0.2.17: navega pra tela #screen-wsl-upgrade da Camila
+      if (ctx.events && typeof ctx.events.onScreen === 'function') {
+        try { ctx.events.onScreen({ screen: 'wsl-upgrade', stage: 'init' }); } catch (_) {}
+      }
+      // Repassa onProgress pro shell helper emitir updates da barra real
+      const onProgress = (p) => {
+        if (ctx.events && typeof ctx.events.onWslUpgradeProgress === 'function') {
+          try { ctx.events.onWslUpgradeProgress(p); } catch (_) {}
+        }
+      };
+      const msi = await installWslModernViaMsi({ logger: ctx.logger, onProgress });
       if (!msi.ok) {
         const err = new Error(`Não consegui instalar o WSL moderno via MSI. ${msi.error || ''}`);
         err.code = 'WSL_MSI_INSTALL_FAILED';

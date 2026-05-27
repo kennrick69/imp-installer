@@ -555,7 +555,17 @@ async function detectWslState(opts = {}) {
 //
 // Retorna: { ok, version, exitCode, msiPath, rebootRequired, error? }
 async function installWslModernViaMsi(opts = {}) {
-  const { logger, timeout = 600_000 } = opts;
+  const { logger, timeout = 600_000, onProgress } = opts;
+  // Eduardo lastmile v0.2.17: emite onProgress pra UI mostrar tela #screen-wsl-upgrade
+  // com barra real. Sem isso, JOs vê tela genérica "processando" por 5-10min e fecha
+  // achando que travou (exata reincidência live-test anterior).
+  const emit = (stage, pct, detail, logLine) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress({ stage, pct, detail, logLine }); } catch (_) {}
+    }
+    if (logger) logger.info('installWslModernViaMsi', `${stage} ${pct != null ? '('+pct+'%)' : ''} ${detail || ''}`);
+  };
+  emit('init', 0, 'Iniciando atualização do WSL...');
   const psScript = `
     $ErrorActionPreference = 'Stop'
     chcp 65001 > $null
@@ -579,16 +589,14 @@ async function installWslModernViaMsi(opts = {}) {
     }
   `;
   try {
+    emit('downloading', 10, 'Consultando catálogo Microsoft...');
     const r = await powershell(psScript, { timeout });
     const out = (r && r.stdout) || '';
     const version = (out.match(/VERSION=(\S+)/) || [])[1] || '?';
     const msiPath = (out.match(/MSI=(.+?)(?:\r|\n|$)/) || [])[1] || '';
     const exitCode = parseInt((out.match(/EXIT=(\d+)/) || [])[1] || '0', 10);
     const rebootRequired = exitCode === 3010;
-    if (logger) {
-      logger.info('installWslModernViaMsi',
-        `MSI ${version} instalado (exit=${exitCode}, reboot=${rebootRequired}, path=${msiPath})`);
-    }
+    emit('done', 100, `WSL ${version} instalado (exit=${exitCode}${rebootRequired ? ', reboot pendente' : ''})`);
     return { ok: true, version, exitCode, msiPath, rebootRequired };
   } catch (e) {
     const stdout = (e.stdout || '').trim();

@@ -1,0 +1,40 @@
+name: Smoke (contract + jsdom)
+
+# Patrícia, QA — noturna 2026-05-27
+#
+# Roda os 2 smoke tests a cada pull_request contra master.
+# Falha → bloqueia merge. Custo: ~30s por run.
+#
+# Cobre ~70% dos bugs históricos do live-test (contratos main↔wizard +
+# DOM responde a eventos do backend). Bugs Windows-only (encoding, UAC,
+# WSL legacy) exigem VM Win / runner Win — outro workflow.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    name: contract-matcher + jsdom-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install jsdom (sem persistir em package.json)
+        run: npm i --no-save jsdom
+
+      - name: contract-matcher (main.js ↔ preload.js ↔ wizard.js)
+        run: node scripts/contract-matcher.js
+
+      - name: jsdom-smoke (renderer responde aos eventos do backend)
+        run: node scripts/jsdom-smoke.js

@@ -178,6 +178,9 @@ function sendToRenderer(channel, payload) {
 function buildRunnerEvents() {
   return {
     onLog: (entry) => sendToRenderer('installer:onLog', entry),
+    // Eduardo lastmile v0.2.17 — onScreen + onWslUpgradeProgress podem vir do executor
+    onScreen: (payload) => sendToRenderer('installer:onScreen', payload),
+    onWslUpgradeProgress: (payload) => sendToRenderer('installer:onWslUpgradeProgress', payload),
     onStepUpdate: (upd) => {
       sendToRenderer('installer:onStepUpdate', {
         stepId: upd.id,
